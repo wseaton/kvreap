@@ -29,6 +29,17 @@ def main() -> int:
         help='JSON merged into the chart values, e.g. \'{"config": {"deletionMaxFilesPerSecond": 200}}\'',
     )
     r.add_argument("--keep", action="store_true", help="leave resources running after collecting")
+    r.add_argument(
+        "--placement",
+        choices=["any", "colocated", "separate"],
+        default="any",
+        help="schedule the evictor on vLLM's node, off it, or anywhere",
+    )
+    r.add_argument(
+        "--share-nfs-client",
+        action="store_true",
+        help="mount like shared-vast (no nosharecache): co-located pods share one NFS client and counters merge",
+    )
 
     a = sub.add_parser("analyze", help="summarize and compare run directories")
     a.add_argument("dirs", type=Path, nargs="+")
@@ -59,6 +70,9 @@ def main() -> int:
         duration_s=args.duration,
         offload_block_tokens=args.offload_block_tokens,
         evictor_values=json.loads(args.evictor_values),
+        placement=args.placement,
+        share_nfs_client=args.share_nfs_client,
+        storage_class="kvreap-bench-vast-shared" if args.share_nfs_client else "kvreap-bench-vast",
     )
     run(cfg, keep=args.keep)
     return 0

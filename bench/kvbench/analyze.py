@@ -62,14 +62,16 @@ class OpStats:
     per_sec: float
     p95_10s_per_sec: float
     mean_rtt_ms: float | None
+    mean_queue_ms: float | None = None
 
 
 def op_stats(samples: list[Sample], op: str) -> OpStats:
     if len(samples) < 2:
-        return OpStats(0, 0.0, 0.0, None)
+        return OpStats(0, 0.0, 0.0, None, None)
     first, last = samples[0], samples[-1]
     count = op_field(last, op, 0) - op_field(first, op, 0)
     rtt = op_field(last, op, 6) - op_field(first, op, 6)
+    queue = op_field(last, op, 5) - op_field(first, op, 5)
     span = last.t - first.t
     rates = []
     for a, b in zip(samples[::10], samples[10::10]):
@@ -77,7 +79,13 @@ def op_stats(samples: list[Sample], op: str) -> OpStats:
         if dt > 0:
             rates.append((op_field(b, op, 0) - op_field(a, op, 0)) / dt)
     p95 = sorted(rates)[int(0.95 * (len(rates) - 1))] if rates else 0.0
-    return OpStats(count, count / span if span > 0 else 0.0, p95, rtt / count if count else None)
+    return OpStats(
+        count,
+        count / span if span > 0 else 0.0,
+        p95,
+        rtt / count if count else None,
+        queue / count if count else None,
+    )
 
 
 def total_rate(samples: list[Sample], include_data: bool) -> tuple[int, float]:
@@ -269,6 +277,13 @@ def report(summaries: list[RunSummary]) -> str:
             f"vLLM {op} RTT ms (deleting / idle)",
             [f"{fmt(s.vllm_rtt_deleting.get(op), 2)} / {fmt(s.vllm_rtt_idle.get(op), 2)}" for s in summaries],
         )
+    for op in VLLM_RTT_OPS:
+        row(
+            f"vLLM {op} client queue ms",
+            [fmt(s.vllm_ops[op].mean_queue_ms, 3) if op in s.vllm_ops else "-" for s in summaries],
+        )
+    for tier_metric, label in (("read", "vLLM FS read s/GiB"), ("write", "vLLM FS write s/GiB")):
+        row(label, [fmt(fs_seconds_per_gib(s, tier_metric), 2) for s in summaries])
     row("vLLM metadata ops/s", [fmt(total_rate_from(s)) for s in summaries])
     row("prune cycles", [fmt(len(s.prune_cycles)) for s in summaries])
     row(
@@ -295,6 +310,14 @@ def report(summaries: list[RunSummary]) -> str:
     for k in metric_names:
         row(f"`{k}` Δ", [fmt(s.metrics.get(k), 0) for s in summaries])
     return "\n".join(lines)
+
+
+def fs_seconds_per_gib(s: RunSummary, kind: str) -> float | None:
+    secs = next((v for k, v in s.metrics.items() if f"tiering_{kind}_time_total" in k), None)
+    nbytes = next((v for k, v in s.metrics.items() if f"tiering_{kind}_bytes_total" in k), None)
+    if not secs or not nbytes:
+        return None
+    return secs / (nbytes / GIB)
 
 
 def total_rate_from(s: RunSummary) -> float:

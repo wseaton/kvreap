@@ -22,7 +22,7 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -33,6 +33,7 @@ KV_MOUNT = "/kv-cache"
 CACHE_DIRECTORY = "kv/model-cache/models"
 
 Manifest = dict[str, Any]
+Placement = Literal["any", "colocated", "separate"]
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,8 @@ class RunConfig:
     hot_prefix_len: int = 2048
     hot_request_rate: float = 2.0
     evictor_values: dict[str, Any] = field(default_factory=dict)
+    placement: Placement = "any"
+    share_nfs_client: bool = False
 
     @property
     def run_id(self) -> str:
@@ -103,12 +106,13 @@ def labels(cfg: RunConfig, role: str) -> dict[str, str]:
     return {"app.kubernetes.io/part-of": PART_OF, "kvreap-bench/run": cfg.variant, "kvreap-bench/role": role}
 
 
-def ensure_storage_class(cluster: Cluster, name: str, source: str = "shared-vast") -> None:
+def ensure_storage_class(cluster: Cluster, name: str, nosharecache: bool, source: str = "shared-vast") -> None:
+    """Clone `source` with reclaimPolicy Delete, optionally adding nosharecache."""
     if cluster.exists("storageclass", name):
         return
     sc = json.loads(cluster.kubectl("get", "storageclass", source, "-o", "json"))
-    options = list(sc.get("mountOptions", []))
-    if "nosharecache" not in options:
+    options = [o for o in sc.get("mountOptions", []) if o != "nosharecache"]
+    if nosharecache:
         options.append("nosharecache")
     cluster.apply(
         [
@@ -385,6 +389,15 @@ def evictor_manifests(cfg: RunConfig) -> list[Manifest]:
         spec["imagePullSecrets"] = [{"name": cfg.pull_secret}]
         spec["volumes"] += [bench_volume(cfg), SAMPLES_VOLUME]
         spec["containers"].append(sampler_container("kv-cache-storage"))
+        if cfg.placement != "any":
+            kind = "podAffinity" if cfg.placement == "colocated" else "podAntiAffinity"
+            spec["affinity"] = {
+                kind: {
+                    "requiredDuringSchedulingIgnoredDuringExecution": [
+                        {"labelSelector": {"matchLabels": labels(cfg, "vllm")}, "topologyKey": "kubernetes.io/hostname"}
+                    ]
+                }
+            }
     return objs
 
 
@@ -432,6 +445,12 @@ def collect(cfg: RunConfig, evictor_pod: str | None, events: dict[str, float]) -
     c.kubectl("cp", f"{cfg.run_id}-loadgen:/results", str(out / "loadgen"), "-c", "loadgen")
     meta = {k: (str(v) if isinstance(v, (Path, Cluster)) else v) for k, v in asdict(cfg).items()}
     meta["events"] = events
+    meta["nodes"] = {
+        "vllm": c.kubectl("get", "pod", vllm, "-o", "jsonpath={.spec.nodeName}").strip(),
+        "evictor": c.kubectl("get", "pod", evictor_pod, "-o", "jsonpath={.spec.nodeName}").strip()
+        if evictor_pod
+        else None,
+    }
     (out / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
 
 
@@ -445,7 +464,7 @@ def teardown(cfg: RunConfig, evictor: list[Manifest]) -> None:
 
 def run(cfg: RunConfig, keep: bool = False) -> None:
     c = cfg.cluster
-    ensure_storage_class(c, cfg.storage_class)
+    ensure_storage_class(c, cfg.storage_class, nosharecache=not cfg.share_nfs_client)
     if not c.exists("pvc", cfg.hf_pvc):
         c.apply([pvc(cfg.hf_pvc, "shared-vast", "50Gi", {"app.kubernetes.io/part-of": PART_OF})])
 
