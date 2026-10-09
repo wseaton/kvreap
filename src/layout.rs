@@ -15,12 +15,19 @@ const HEX_MODULO_BASE: u8 = 16;
 pub struct BlockHash(pub u64);
 
 impl BlockHash {
+    /// Parses `<hash hex>.bin`, where the hash is 8 to 32 bytes (16 to 64 hex
+    /// digits). Keeps the low 64 bits, as the event publishers and indexer do.
     pub fn from_file_name(name: &str) -> Option<Self> {
         let hex = name.strip_suffix(".bin")?;
-        if hex.len() != 16 {
+        let valid = (16..=64).contains(&hex.len())
+            && hex.len() % 2 == 0
+            && hex.bytes().all(|b| b.is_ascii_hexdigit());
+        if !valid {
             return None;
         }
-        u64::from_str_radix(hex, 16).ok().map(Self)
+        u64::from_str_radix(&hex[hex.len() - 16..], 16)
+            .ok()
+            .map(Self)
     }
 }
 
@@ -135,13 +142,30 @@ mod tests {
     }
 
     #[test]
+    fn block_hash_parses_full_sha256_names_from_vllm_fs_tier() {
+        let name = "00112233445566778899aabbccddeeff0011223344556677fedcba9876543210.bin";
+        assert_eq!(
+            BlockHash::from_file_name(name),
+            Some(BlockHash(0xfedcba9876543210))
+        );
+        let xxh128 = "0123456789abcdef0011223344556677.bin";
+        assert_eq!(
+            BlockHash::from_file_name(xxh128),
+            Some(BlockHash(0x0011223344556677))
+        );
+    }
+
+    #[test]
     fn block_hash_rejects_other_names() {
         for name in [
             "abcdef0123456789",
             "abcdef0123456789.txt",
             "abcdef.bin",
             "abcdef01234567890.bin",
+            "00112233445566778899aabbccddeeff0011223344556677fedcba98765432100.bin",
+            "00112233445566778899aabbccddeeff0011223344556677fedcba987654321000.bin",
             "ghijklmnopqrstuv.bin",
+            "00112233445566778899aabbccddeeff0011223344556677fedcba987654321g.bin",
             "abcdef0123456789.bin_123.tmp",
         ] {
             assert_eq!(BlockHash::from_file_name(name), None, "{name}");

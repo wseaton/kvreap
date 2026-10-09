@@ -28,7 +28,7 @@ base = os.path.join(root, "org-model_abcdef012345")
 os.makedirs(base, exist_ok=True)
 json.dump({"model_name": "org/model"}, open(os.path.join(base, "config.json"), "w"))
 for i in range(120):
-    h = f"{((i + 1) * 0x9E3779B97F4A7C15) & (2**64 - 1):016x}"
+    h = f"{((i + 1) * 0x9E3779B97F4A7C15) & (2**64 - 1):016x}" * 4  # sha256-length, like vLLM 0.31
     d = os.path.join(root, "org-model_abcdef012345_r0", h[:3], h[3:5] + "_g0")
     os.makedirs(d, exist_ok=True)
     f = os.path.join(d, h + ".bin")

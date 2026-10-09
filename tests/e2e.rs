@@ -77,8 +77,10 @@ impl Cache {
         self.root().join(format!("{BASE}_r0"))
     }
 
+    /// vLLM 0.31 names files after the full sha256 block hash (64 hex digits);
+    /// `hash` is its low 64 bits, which is what events carry.
     fn block_path(&self, hash: u64) -> PathBuf {
-        let hex = format!("{hash:016x}");
+        let hex = format!("{hash:016x}").repeat(4);
         self.rank()
             .join(&hex[..3])
             .join(format!("{}_g0", &hex[3..5]))
@@ -283,7 +285,10 @@ fn deletes_cold_blocks_spares_hot_and_foreign_files_and_reaps_dirs() {
     let hot = cache.hot_blocks(10, 128);
     let leaf = cold[0].path.parent().expect("leaf").to_path_buf();
     let foreign = [
-        leaf.join(format!("{:016x}.bin_12345.tmp", cold[0].hash)),
+        leaf.join(format!(
+            "{}.bin_12345.tmp",
+            format!("{:016x}", cold[0].hash).repeat(4)
+        )),
         leaf.join("notes.txt"),
         cache.root().join(BASE).join("config.json"),
     ];
