@@ -114,3 +114,23 @@ def test_no_chain_rows_without_a_chains_line(run_dir: Path) -> None:
     s = summarize(run_dir)
     assert s.chains == {}
     assert "chain deletions" not in report([s])
+
+
+def test_agent_records_split_first_and_returning_turns(tmp_path: Path) -> None:
+    from kvbench.analyze import load_bench
+
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    rows = [
+        {"turn": 0, "ttft_ms": 3000.0, "status": "ok", "prompt_tokens": 18000, "t0": 100.0, "tend": 104.0},
+        {"turn": 1, "ttft_ms": 400.0, "status": "ok", "prompt_tokens": 18700, "t0": 104.0, "tend": 105.0},
+        {"turn": 2, "ttft_ms": 600.0, "status": "ok", "prompt_tokens": 19400, "t0": 105.0, "tend": 110.0},
+        {"turn": 3, "ttft_ms": 0.0, "status": "error", "prompt_tokens": 0, "t0": 110.0, "tend": 110.0},
+    ]
+    (agent / "requests_0.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    b = load_bench(tmp_path)
+    assert b["agent_requests"] == 3
+    assert b["agent_failed"] == 1
+    assert b["agent_first_ttft_p50_ms"] == pytest.approx(3000.0)
+    assert b["agent_later_ttft_p50_ms"] == pytest.approx(600.0), "nearest rank"
+    assert b["agent_prompt_tok_per_s"] == pytest.approx((18000 + 18700 + 19400) / 10.0)

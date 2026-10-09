@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import random
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -35,6 +36,8 @@ KV_EVENTS_PORT = 5557
 
 Manifest = dict[str, Any]
 Placement = Literal["any", "colocated", "separate"]
+Workload = Literal["churn-hot", "agent"]
+NYANN_IMAGE = "quay.io/wseaton/nyann-bench:kvbench-edd5f54"
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,16 @@ class RunConfig:
     placement: Placement = "any"
     share_nfs_client: bool = False
     kv_events: bool = False
+    workload: Workload = "churn-hot"
+    agent_concurrency: int = 8
+    agent_pool: int = 64
+    agent_first_isl: int = 16000
+    agent_turn_isl: int = 500
+    agent_osl: int = 200
+    agent_turns: int = 10
+    agent_system_prompt_tokens: int = 2048
+    kv_cache_dtype: str | None = None
+    fs_read_threads: int = 16
     evictor_env: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -157,13 +170,74 @@ def pvc(name: str, storage_class: str, size: str, lbl: dict[str, str]) -> Manife
     }
 
 
+def agent_preamble(tokens: int, seed: int = 42) -> str:
+    """Fixed agent system prompt of roughly `tokens` tokens (about 0.75 words per token)."""
+    words = [
+        "tool",
+        "call",
+        "result",
+        "file",
+        "path",
+        "search",
+        "query",
+        "function",
+        "argument",
+        "return",
+        "value",
+        "error",
+        "retry",
+        "plan",
+        "step",
+        "context",
+        "repository",
+        "branch",
+        "commit",
+        "diff",
+        "test",
+        "build",
+        "deploy",
+        "config",
+        "parameter",
+        "schema",
+        "request",
+        "response",
+    ]
+    rng = random.Random(seed)
+    return " ".join(rng.choice(words) for _ in range(tokens * 3 // 4))
+
+
+def nyann_config(cfg: RunConfig) -> dict[str, Any]:
+    """nyann-bench conversation-pool scenario: agent sessions that share a preamble and come back
+    only after the rest of the pool has had a turn."""
+    return {
+        "load": {
+            "mode": "conversation_pool",
+            "concurrency": cfg.agent_concurrency,
+            "conversation_pool_size": cfg.agent_pool,
+            "rampup": "60s",
+            "duration": f"{cfg.duration_s}s",
+        },
+        "workload": {
+            "type": "synthetic",
+            "isl": cfg.agent_first_isl,
+            "subsequent_isl": cfg.agent_turn_isl,
+            "osl": cfg.agent_osl,
+            "turns": cfg.agent_turns,
+            "system_prompt_file": "agent.txt",
+        },
+    }
+
+
 def sampler_configmap(cfg: RunConfig) -> Manifest:
-    src = (Path(__file__).parent / "sampler.py").read_text()
+    data = {"sampler.py": (Path(__file__).parent / "sampler.py").read_text()}
+    if cfg.workload == "agent":
+        data["nyann.json"] = json.dumps(nyann_config(cfg))
+        data["agent.txt"] = agent_preamble(cfg.agent_system_prompt_tokens)
     return {
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": {"name": f"{cfg.run_id}-sampler", "labels": labels(cfg, "sampler")},
-        "data": {"sampler.py": src},
+        "data": data,
     }
 
 
@@ -204,7 +278,7 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
                 {
                     "type": "fs",
                     "root_dir": f"{KV_MOUNT}/{CACHE_DIRECTORY}",
-                    "n_read_threads": 16,
+                    "n_read_threads": cfg.fs_read_threads,
                     "n_write_threads": 16,
                     **({"enable_kv_events": True} if cfg.kv_events else {}),
                 }
@@ -220,6 +294,8 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
         f"--num-gpu-blocks-override={cfg.gpu_blocks}",
         f"--kv-transfer-config={json.dumps(kv_config)}",
     ]
+    if cfg.kv_cache_dtype:
+        args.append(f"--kv-cache-dtype={cfg.kv_cache_dtype}")
     if cfg.tensor_parallel_size > 1:
         args.append(f"--tensor-parallel-size={cfg.tensor_parallel_size}")
     gpus = str(cfg.tensor_parallel_size)
@@ -341,7 +417,49 @@ sleep infinity
 """
 
 
+AGENT_SCRIPT = r"""
+set -u
+mkdir -p /results/agent
+nyann-bench generate --target "$BASE_URL/v1" --model "$MODEL" --config /bench/nyann.json \
+  --seed 7 --output-dir /results/agent > /results/agent/log.txt 2>&1 || echo "nyann-bench failed" >&2
+touch /results/DONE
+sleep infinity
+"""
+
+
+def agent_loadgen_manifest(cfg: RunConfig) -> Manifest:
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": f"{cfg.run_id}-loadgen", "labels": labels(cfg, "loadgen"), "annotations": NO_ISTIO},
+        "spec": {
+            "restartPolicy": "Never",
+            "securityContext": {"runAsUser": 1000, "runAsGroup": 1000, "fsGroup": 1000},
+            "imagePullSecrets": [{"name": cfg.pull_secret}],
+            "containers": [
+                {
+                    "name": "loadgen",
+                    "image": NYANN_IMAGE,
+                    "command": ["sh", "-c", AGENT_SCRIPT],
+                    "env": [
+                        {"name": "BASE_URL", "value": f"http://{cfg.run_id}-vllm:8000"},
+                        {"name": "MODEL", "value": cfg.model},
+                    ],
+                    "resources": {"requests": {"cpu": "4", "memory": "4Gi"}},
+                    "volumeMounts": [
+                        {"name": "bench", "mountPath": "/bench"},
+                        {"name": "results", "mountPath": "/results"},
+                    ],
+                }
+            ],
+            "volumes": [bench_volume(cfg), {"name": "results", "emptyDir": {}}],
+        },
+    }
+
+
 def loadgen_manifest(cfg: RunConfig) -> Manifest:
+    if cfg.workload == "agent":
+        return agent_loadgen_manifest(cfg)
     env = {
         "DURATION": str(cfg.duration_s),
         "BASE_URL": f"http://{cfg.run_id}-vllm:8000",

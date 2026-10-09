@@ -129,3 +129,32 @@ def test_prompt_lengths_and_context_reach_vllm_and_loadgen() -> None:
     assert env["HOT_PREFIX_LEN"] == "8192"
     default, _ = vllm_parts(cfg())
     assert "--max-model-len=8192" in default["args"]
+
+
+def test_agent_workload_runs_nyann_conversation_pool() -> None:
+    from kvbench.run import NYANN_IMAGE, loadgen_manifest, nyann_config, sampler_configmap
+
+    c = cfg(workload="agent", agent_pool=96, agent_first_isl=12000, duration_s=600)
+    conf = nyann_config(c)
+    assert conf["load"]["mode"] == "conversation_pool"
+    assert conf["load"]["conversation_pool_size"] == 96
+    assert conf["load"]["duration"] == "600s"
+    assert conf["workload"]["isl"] == 12000
+    assert conf["workload"]["system_prompt_file"] == "agent.txt"
+    data = sampler_configmap(c)["data"]
+    assert json.loads(data["nyann.json"]) == conf
+    assert 1000 < len(data["agent.txt"].split()) < 2000
+    lg = loadgen_manifest(c)["spec"]["containers"][0]
+    assert lg["image"] == NYANN_IMAGE
+    assert "/bench/nyann.json" in lg["command"][-1]
+    assert "touch /results/DONE" in lg["command"][-1]
+    assert "nyann.json" not in sampler_configmap(cfg())["data"]
+
+
+def test_fp8_kv_and_read_threads_reach_vllm() -> None:
+    container, _ = vllm_parts(cfg(kv_cache_dtype="fp8", fs_read_threads=64))
+    assert "--kv-cache-dtype=fp8" in container["args"]
+    [kv] = [a for a in container["args"] if a.startswith("--kv-transfer-config=")]
+    assert json.loads(kv.split("=", 1)[1])["kv_connector_extra_config"]["secondary_tiers"][0]["n_read_threads"] == 64
+    plain, _ = vllm_parts(cfg())
+    assert not any(a.startswith("--kv-cache-dtype") for a in plain["args"])

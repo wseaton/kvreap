@@ -33,6 +33,16 @@ CHAIN_COUNTERS = (
     ("event_batches", "KV event batches received"),
     ("decode_errors", "KV event decode errors"),
 )
+AGENT_KEYS = (
+    "agent_requests",
+    "agent_failed",
+    "agent_first_ttft_p50_ms",
+    "agent_first_ttft_p90_ms",
+    "agent_later_ttft_p50_ms",
+    "agent_later_ttft_p90_ms",
+    "agent_later_ttft_p99_ms",
+    "agent_prompt_tok_per_s",
+)
 KV_PAIR = re.compile(r"(\w+)=(\d+)\b")
 TS_PREFIX = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s")
 
@@ -160,7 +170,40 @@ def chain_counters(evictor_log: Path) -> dict[str, int]:
     return {k: int(v) for k, v in KV_PAIR.findall(last)}
 
 
+def load_agent(dir_: Path) -> dict[str, Any]:
+    """nyann-bench `requests_*.jsonl`: TTFT for first turns (cold) and later turns (returning)."""
+    first: list[float] = []
+    later: list[float] = []
+    failed = 0
+    prompt_tokens = 0
+    t0, t1 = float("inf"), 0.0
+    for f in sorted(dir_.glob("requests_*.jsonl")):
+        for line in f.read_text().splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r.get("status") != "ok":
+                failed += 1
+                continue
+            (first if r.get("turn", 0) == 0 else later).append(float(r["ttft_ms"]))
+            prompt_tokens += int(r.get("prompt_tokens", 0))
+            t0, t1 = min(t0, float(r["t0"])), max(t1, float(r["tend"]))
+    span = t1 - t0 if t1 > t0 else 0.0
+    return {
+        "agent_requests": len(first) + len(later),
+        "agent_failed": failed,
+        "agent_first_ttft_p50_ms": percentile(first, 0.5),
+        "agent_first_ttft_p90_ms": percentile(first, 0.9),
+        "agent_later_ttft_p50_ms": percentile(later, 0.5),
+        "agent_later_ttft_p90_ms": percentile(later, 0.9),
+        "agent_later_ttft_p99_ms": percentile(later, 0.99),
+        "agent_prompt_tok_per_s": prompt_tokens / span if span else None,
+    }
+
+
 def load_bench(dir_: Path) -> dict[str, Any]:
+    if (dir_ / "agent").is_dir():
+        return load_agent(dir_ / "agent")
     hot_ttfts: list[float] = []
     hot_failed = 0
     churn_input_tokens = 0
@@ -326,6 +369,9 @@ def report(summaries: list[RunSummary]) -> str:
     row("% time >= cleanup threshold", [fmt(s.pct_time_above_cleanup) for s in summaries])
     for k in ("hot_ttft_p50_ms", "hot_ttft_p90_ms", "hot_ttft_p99_ms"):
         row(k.replace("_", " "), [fmt(s.bench.get(k)) for s in summaries])
+    for k in AGENT_KEYS:
+        if any(k in s.bench for s in summaries):
+            row(k.replace("_", " "), [fmt(s.bench.get(k)) for s in summaries])
     row(
         "hot requests (failed)",
         [f"{fmt(s.bench.get('hot_requests'))} ({fmt(s.bench.get('hot_failed'))})" for s in summaries],

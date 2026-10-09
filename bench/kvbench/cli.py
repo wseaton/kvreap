@@ -48,6 +48,21 @@ def main() -> int:
         help="tokens of system prompt shared by churn prompts (0: fully random prompts)",
     )
     r.add_argument("--churn-shared-prefixes", type=int, default=1, help="distinct shared system prompts")
+    r.add_argument(
+        "--workload",
+        choices=["churn-hot", "agent"],
+        default="churn-hot",
+        help="churn-hot: vllm bench churn + repeated hot prefixes; agent: nyann-bench conversation pool",
+    )
+    r.add_argument("--agent-concurrency", type=int, default=8, help="agent: requests in flight")
+    r.add_argument("--agent-pool", type=int, default=64, help="agent: conversations in rotation")
+    r.add_argument("--agent-first-isl", type=int, default=16000, help="agent: tokens in a session's first turn")
+    r.add_argument("--agent-turn-isl", type=int, default=500, help="agent: new tokens per later turn")
+    r.add_argument("--agent-osl", type=int, default=200)
+    r.add_argument("--agent-turns", type=int, default=10)
+    r.add_argument("--agent-system-prompt-tokens", type=int, default=2048)
+    r.add_argument("--kv-cache-dtype", help="vLLM --kv-cache-dtype, e.g. fp8")
+    r.add_argument("--fs-read-threads", type=int, default=16, help="fs tier n_read_threads")
     r.add_argument("--churn-input-len", type=int, default=4096, help="tokens per churn prompt")
     r.add_argument("--hot-prefix-len", type=int, default=2048, help="tokens per repeated hot prefix")
     r.add_argument("--max-model-len", type=int, default=8192)
@@ -110,6 +125,16 @@ def main() -> int:
         share_nfs_client=args.share_nfs_client,
         kv_events=args.kv_events,
         tensor_parallel_size=args.tensor_parallel_size,
+        workload=args.workload,
+        agent_concurrency=args.agent_concurrency,
+        agent_pool=args.agent_pool,
+        agent_first_isl=args.agent_first_isl,
+        agent_turn_isl=args.agent_turn_isl,
+        agent_osl=args.agent_osl,
+        agent_turns=args.agent_turns,
+        agent_system_prompt_tokens=args.agent_system_prompt_tokens,
+        kv_cache_dtype=args.kv_cache_dtype,
+        fs_read_threads=args.fs_read_threads,
         churn_input_len=args.churn_input_len,
         hot_prefix_len=args.hot_prefix_len,
         max_model_len=args.max_model_len,
