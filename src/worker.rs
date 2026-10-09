@@ -73,10 +73,6 @@ impl Pool {
         }
     }
 
-    fn len(&self) -> usize {
-        self.by_age.len()
-    }
-
     fn insert(&mut self, c: Candidate) {
         if let Some(old) = self.keys.remove(&c.path) {
             self.by_age.remove(&old);
@@ -493,7 +489,7 @@ mod tests {
         pool.insert(candidate("/b", 50));
         pool.insert(candidate("/c", 30));
         pool.insert(candidate("/d", 40));
-        assert_eq!(pool.len(), 3);
+        assert_eq!(pool.by_age.len(), 3);
         let order: Vec<_> = std::iter::from_fn(|| pool.pop_oldest())
             .map(|c| c.path)
             .collect();
@@ -513,7 +509,7 @@ mod tests {
         pool.insert(candidate("/a", 10));
         pool.insert(candidate("/b", 20));
         pool.insert(candidate("/a", 99));
-        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.by_age.len(), 2);
         assert_eq!(pool.pop_oldest().map(|c| c.path), Some(PathBuf::from("/a")));
     }
 

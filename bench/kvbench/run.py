@@ -1,0 +1,484 @@
+"""Run one evictor variant end to end on a Kubernetes cluster.
+
+```text
+ kv PVC (VAST, nosharecache) ──────────────┬──────────────────────────┐
+   │                                       │                          │
+ vLLM pod (1 GPU)                        evictor pod (Helm chart)     │
+   vllm serve + TieringOffloadingSpec      pvc-evictor / kvreap       │
+   sampler sidecar: mountstats,            sampler sidecar:           │
+     statvfs, /metrics                       mountstats               │
+   ▲                                                                  │
+ loadgen pod: churn (unique prompts) + hot (repeated prefixes)        │
+                                                                      │
+ nosharecache gives each pod its own NFS superblock, so each sampler ─┘
+ sees only its own pod's NFS operations.
+```
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+PART_OF = "kvreap-bench"
+NO_ISTIO = {"sidecar.istio.io/inject": "false"}
+SAMPLER_IMAGE = "docker.io/library/python:3.12-slim"
+KV_MOUNT = "/kv-cache"
+CACHE_DIRECTORY = "kv/model-cache/models"
+
+Manifest = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Cluster:
+    context: str
+    namespace: str
+
+    def kubectl(self, *args: str, stdin: str | None = None, check: bool = True) -> str:
+        cmd = ["kubectl", "--context", self.context, "-n", self.namespace, *args]
+        res = subprocess.run(cmd, input=stdin, capture_output=True, text=True, check=False)
+        if check and res.returncode != 0:
+            raise RuntimeError(f"{' '.join(cmd)} failed:\n{res.stderr}")
+        return res.stdout
+
+    def apply(self, objs: list[Manifest]) -> None:
+        self.kubectl("apply", "-f", "-", stdin=json.dumps({"apiVersion": "v1", "kind": "List", "items": objs}))
+
+    def delete(self, objs: list[Manifest]) -> None:
+        self.kubectl(
+            "delete",
+            "--ignore-not-found",
+            "--wait=true",
+            "-f",
+            "-",
+            stdin=json.dumps({"apiVersion": "v1", "kind": "List", "items": objs}),
+            check=False,
+        )
+
+    def exists(self, kind: str, name: str) -> bool:
+        return bool(self.kubectl("get", kind, name, "--ignore-not-found", "-o", "name").strip())
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    variant: str
+    out: Path
+    evictor_image: str | None
+    chart: Path | None
+    cluster: Cluster
+    model: str = "Qwen/Qwen3-0.6B"
+    vllm_image: str = "docker.io/vllm/vllm-openai:v0.31.0"
+    storage_class: str = "kvreap-bench-vast"
+    pvc_size: str = "100Gi"
+    hf_pvc: str = "kvreap-bench-hf"
+    pull_secret: str = "quay-wseaton-pull"
+    duration_s: int = 1200
+    settle_s: int = 60
+    offload_block_tokens: int = 16
+    cpu_tier_bytes: int = 2 * 1024**3
+    gpu_blocks: int = 4096
+    churn_input_len: int = 4096
+    churn_concurrency: int = 8
+    hot_prefixes: int = 64
+    hot_prefix_len: int = 2048
+    hot_request_rate: float = 2.0
+    evictor_values: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def run_id(self) -> str:
+        return f"{PART_OF}-{self.variant}"
+
+    @property
+    def kv_pvc(self) -> str:
+        return f"{self.run_id}-kv"
+
+
+def labels(cfg: RunConfig, role: str) -> dict[str, str]:
+    return {"app.kubernetes.io/part-of": PART_OF, "kvreap-bench/run": cfg.variant, "kvreap-bench/role": role}
+
+
+def ensure_storage_class(cluster: Cluster, name: str, source: str = "shared-vast") -> None:
+    if cluster.exists("storageclass", name):
+        return
+    sc = json.loads(cluster.kubectl("get", "storageclass", source, "-o", "json"))
+    options = list(sc.get("mountOptions", []))
+    if "nosharecache" not in options:
+        options.append("nosharecache")
+    cluster.apply(
+        [
+            {
+                "apiVersion": "storage.k8s.io/v1",
+                "kind": "StorageClass",
+                "metadata": {"name": name, "labels": {"app.kubernetes.io/part-of": PART_OF}},
+                "provisioner": sc["provisioner"],
+                "parameters": sc.get("parameters", {}),
+                "mountOptions": options,
+                "reclaimPolicy": "Delete",
+                "volumeBindingMode": "Immediate",
+                "allowVolumeExpansion": True,
+            }
+        ]
+    )
+
+
+def pvc(name: str, storage_class: str, size: str, lbl: dict[str, str]) -> Manifest:
+    return {
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": name, "labels": lbl},
+        "spec": {
+            "accessModes": ["ReadWriteMany"],
+            "storageClassName": storage_class,
+            "resources": {"requests": {"storage": size}},
+        },
+    }
+
+
+def sampler_configmap(cfg: RunConfig) -> Manifest:
+    src = (Path(__file__).parent / "sampler.py").read_text()
+    return {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": f"{cfg.run_id}-sampler", "labels": labels(cfg, "sampler")},
+        "data": {"sampler.py": src},
+    }
+
+
+def sampler_container(kv_volume: str, scrape_url: str | None = None) -> Manifest:
+    cmd = ["python3", "/bench/sampler.py", "--mount", KV_MOUNT, "--interval", "1"]
+    if scrape_url:
+        cmd += ["--scrape-url", scrape_url]
+    return {
+        "name": "sampler",
+        "image": SAMPLER_IMAGE,
+        "command": cmd,
+        "resources": {"requests": {"cpu": "100m", "memory": "64Mi"}, "limits": {"memory": "256Mi"}},
+        "volumeMounts": [
+            {"name": kv_volume, "mountPath": KV_MOUNT, "readOnly": True},
+            {"name": "bench", "mountPath": "/bench"},
+        ],
+    }
+
+
+def bench_volume(cfg: RunConfig) -> Manifest:
+    return {"name": "bench", "configMap": {"name": f"{cfg.run_id}-sampler"}}
+
+
+def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
+    kv_config = {
+        "kv_connector": "OffloadingConnector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {
+            "spec_name": "TieringOffloadingSpec",
+            "cpu_bytes_to_use": cfg.cpu_tier_bytes,
+            "block_size": cfg.offload_block_tokens,
+            "secondary_tiers": [
+                {
+                    "type": "fs",
+                    "root_dir": f"{KV_MOUNT}/{CACHE_DIRECTORY}",
+                    "n_read_threads": 16,
+                    "n_write_threads": 16,
+                }
+            ],
+        },
+    }
+    lbl = labels(cfg, "vllm")
+    name = f"{cfg.run_id}-vllm"
+    pod = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": name, "labels": lbl, "annotations": NO_ISTIO},
+        "spec": {
+            "restartPolicy": "Never",
+            "securityContext": {
+                "runAsUser": 1000,
+                "runAsGroup": 1000,
+                "fsGroup": 1000,
+                "fsGroupChangePolicy": "OnRootMismatch",
+            },
+            "containers": [
+                {
+                    "name": "vllm",
+                    "image": cfg.vllm_image,
+                    "command": ["vllm", "serve", cfg.model],
+                    "args": [
+                        "--port=8000",
+                        "--max-model-len=8192",
+                        "--gpu-memory-utilization=0.3",
+                        f"--num-gpu-blocks-override={cfg.gpu_blocks}",
+                        f"--kv-transfer-config={json.dumps(kv_config)}",
+                    ],
+                    "env": [
+                        {"name": "HF_HOME", "value": "/models/hf"},
+                        {"name": "HOME", "value": "/tmp"},
+                        {"name": "VLLM_LOGGING_LEVEL", "value": "INFO"},
+                    ],
+                    "ports": [{"containerPort": 8000}],
+                    "readinessProbe": {"httpGet": {"path": "/health", "port": 8000}, "periodSeconds": 5},
+                    "resources": {
+                        "requests": {"nvidia.com/gpu": "1", "cpu": "16", "memory": "64Gi"},
+                        "limits": {"nvidia.com/gpu": "1", "memory": "96Gi"},
+                    },
+                    "volumeMounts": [
+                        {"name": "kv", "mountPath": KV_MOUNT},
+                        {"name": "hf", "mountPath": "/models"},
+                        {"name": "shm", "mountPath": "/dev/shm"},
+                    ],
+                },
+                sampler_container("kv", scrape_url="http://127.0.0.1:8000/metrics"),
+            ],
+            "volumes": [
+                {"name": "kv", "persistentVolumeClaim": {"claimName": cfg.kv_pvc}},
+                {"name": "hf", "persistentVolumeClaim": {"claimName": cfg.hf_pvc}},
+                {"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": "16Gi"}},
+                bench_volume(cfg),
+            ],
+        },
+    }
+    svc = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": name, "labels": lbl},
+        "spec": {"selector": lbl, "ports": [{"port": 8000, "targetPort": 8000}]},
+    }
+    return [pod, svc]
+
+
+LOADGEN_SCRIPT = r"""
+set -u
+end=$((SECONDS + DURATION))
+mkdir -p /results/churn /results/hot
+common="--backend vllm --base-url $BASE_URL --model $MODEL --save-result --save-detailed --ignore-eos"
+(
+  i=0
+  while [ $SECONDS -lt $end ]; do
+    vllm bench serve $common --dataset-name random \
+      --random-input-len $CHURN_INPUT_LEN --random-output-len 8 --num-prompts 64 \
+      --max-concurrency $CHURN_CONCURRENCY --seed $((1000 + i)) \
+      --result-dir /results/churn --result-filename churn-$i.json > /results/churn/log-$i.txt 2>&1 \
+      || echo "churn iteration $i failed" >&2
+    i=$((i + 1))
+  done
+) &
+(
+  i=0
+  while [ $SECONDS -lt $end ]; do
+    vllm bench serve $common --dataset-name prefix_repetition \
+      --prefix-repetition-prefix-len $HOT_PREFIX_LEN --prefix-repetition-suffix-len 32 \
+      --prefix-repetition-num-prefixes $HOT_PREFIXES --prefix-repetition-output-len 8 \
+      --num-prompts $HOT_PREFIXES --request-rate $HOT_RATE --seed 7 \
+      --result-dir /results/hot --result-filename hot-$i.json > /results/hot/log-$i.txt 2>&1 \
+      || echo "hot iteration $i failed" >&2
+    i=$((i + 1))
+  done
+) &
+wait
+touch /results/DONE
+sleep infinity
+"""
+
+
+def loadgen_manifest(cfg: RunConfig) -> Manifest:
+    env = {
+        "DURATION": str(cfg.duration_s),
+        "BASE_URL": f"http://{cfg.run_id}-vllm:8000",
+        "MODEL": cfg.model,
+        "CHURN_INPUT_LEN": str(cfg.churn_input_len),
+        "CHURN_CONCURRENCY": str(cfg.churn_concurrency),
+        "HOT_PREFIXES": str(cfg.hot_prefixes),
+        "HOT_PREFIX_LEN": str(cfg.hot_prefix_len),
+        "HOT_RATE": str(cfg.hot_request_rate),
+        "HF_HOME": "/models/hf",
+        "HF_HUB_OFFLINE": "1",
+        "HOME": "/tmp",
+    }
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": f"{cfg.run_id}-loadgen", "labels": labels(cfg, "loadgen"), "annotations": NO_ISTIO},
+        "spec": {
+            "restartPolicy": "Never",
+            "securityContext": {"runAsUser": 1000, "runAsGroup": 1000, "fsGroup": 1000},
+            "containers": [
+                {
+                    "name": "loadgen",
+                    "image": cfg.vllm_image,
+                    "command": ["bash", "-c", LOADGEN_SCRIPT],
+                    "env": [{"name": k, "value": v} for k, v in env.items()],
+                    "resources": {"requests": {"cpu": "8", "memory": "16Gi"}},
+                    "volumeMounts": [
+                        {"name": "hf", "mountPath": "/models", "readOnly": True},
+                        {"name": "results", "mountPath": "/results"},
+                    ],
+                }
+            ],
+            "volumes": [
+                {"name": "hf", "persistentVolumeClaim": {"claimName": cfg.hf_pvc}},
+                {"name": "results", "emptyDir": {}},
+            ],
+        },
+    }
+
+
+def split_image(ref: str) -> tuple[str, str]:
+    repo, _, tag = ref.rpartition(":")
+    if not repo or "/" in tag:
+        raise ValueError(f"image must be repo:tag, got {ref}")
+    return repo, tag
+
+
+def deep_merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for k, v in extra.items():
+        out[k] = deep_merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def evictor_manifests(cfg: RunConfig) -> list[Manifest]:
+    if cfg.evictor_image is None or cfg.chart is None:
+        return []
+    repo, tag = split_image(cfg.evictor_image)
+    values = deep_merge(
+        {
+            "image": {"repository": repo, "tag": tag, "pullPolicy": "IfNotPresent"},
+            "pvc": {"name": cfg.kv_pvc, "mountPath": KV_MOUNT, "readOnly": False},
+            "securityContext": {
+                "pod": {"fsGroup": 1000, "seLinuxOptions": {"level": "s0"}},
+                "container": {"runAsUser": 1000},
+            },
+            "config": {
+                "cacheDirectory": CACHE_DIRECTORY,
+                "fileAccessTimeThresholdMinutes": 2,
+                "logFilePath": "",
+            },
+            "labels": labels(cfg, "evictor"),
+        },
+        cfg.evictor_values,
+    )
+    rendered = subprocess.run(
+        ["helm", "template", f"{cfg.run_id}-evictor", str(cfg.chart), "-f", "-"],
+        input=yaml.safe_dump(values),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    objs: list[Manifest] = [d for d in yaml.safe_load_all(rendered) if d]
+    for obj in objs:
+        obj.setdefault("metadata", {}).pop("namespace", None)
+        if obj["kind"] != "Deployment":
+            continue
+        tmpl = obj["spec"]["template"]
+        tmpl.setdefault("metadata", {}).setdefault("annotations", {}).update(NO_ISTIO)
+        spec = tmpl["spec"]
+        spec["imagePullSecrets"] = [{"name": cfg.pull_secret}]
+        spec["volumes"].append(bench_volume(cfg))
+        spec["containers"].append(sampler_container("kv-cache-storage"))
+    return objs
+
+
+def wait_pod_ready(cluster: Cluster, name: str, timeout_s: int) -> None:
+    cluster.kubectl("wait", f"pod/{name}", "--for=condition=Ready", f"--timeout={timeout_s}s")
+
+
+def wait_loadgen_done(cfg: RunConfig, timeout_s: int) -> None:
+    name = f"{cfg.run_id}-loadgen"
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        res = subprocess.run(
+            [
+                "kubectl",
+                "--context",
+                cfg.cluster.context,
+                "-n",
+                cfg.cluster.namespace,
+                "exec",
+                name,
+                "--",
+                "test",
+                "-f",
+                "/results/DONE",
+            ],
+            capture_output=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            return
+        time.sleep(30)
+    raise TimeoutError(f"loadgen did not finish within {timeout_s}s")
+
+
+def collect(cfg: RunConfig, evictor_pod: str | None, events: dict[str, float]) -> None:
+    c = cfg.cluster
+    out = cfg.out
+    out.mkdir(parents=True, exist_ok=True)
+    vllm = f"{cfg.run_id}-vllm"
+    (out / "vllm-sampler.jsonl").write_text(c.kubectl("logs", vllm, "-c", "sampler"))
+    (out / "vllm.log").write_text(c.kubectl("logs", vllm, "-c", "vllm", "--timestamps"))
+    if evictor_pod:
+        (out / "evictor-sampler.jsonl").write_text(c.kubectl("logs", evictor_pod, "-c", "sampler"))
+        (out / "evictor.log").write_text(c.kubectl("logs", evictor_pod, "-c", "evictor", "--timestamps"))
+    c.kubectl("cp", f"{cfg.run_id}-loadgen:/results", str(out / "loadgen"), "-c", "loadgen")
+    meta = {k: (str(v) if isinstance(v, (Path, Cluster)) else v) for k, v in asdict(cfg).items()}
+    meta["events"] = events
+    (out / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
+
+
+def teardown(cfg: RunConfig, evictor: list[Manifest]) -> None:
+    c = cfg.cluster
+    c.delete([loadgen_manifest(cfg)])
+    c.delete(evictor)
+    c.delete(vllm_manifests(cfg))
+    c.delete([sampler_configmap(cfg), pvc(cfg.kv_pvc, cfg.storage_class, cfg.pvc_size, {})])
+
+
+def run(cfg: RunConfig, keep: bool = False) -> None:
+    c = cfg.cluster
+    ensure_storage_class(c, cfg.storage_class)
+    if not c.exists("pvc", cfg.hf_pvc):
+        c.apply([pvc(cfg.hf_pvc, "shared-vast", "50Gi", {"app.kubernetes.io/part-of": PART_OF})])
+
+    evictor = evictor_manifests(cfg)
+    print(f"[{cfg.variant}] cleaning up any previous run", flush=True)
+    teardown(cfg, evictor)
+
+    events: dict[str, float] = {}
+    c.apply([pvc(cfg.kv_pvc, cfg.storage_class, cfg.pvc_size, labels(cfg, "kv")), sampler_configmap(cfg)])
+    c.apply(vllm_manifests(cfg))
+    print(f"[{cfg.variant}] waiting for vLLM", flush=True)
+    wait_pod_ready(c, f"{cfg.run_id}-vllm", timeout_s=1800)
+    events["vllm_ready"] = time.time()
+
+    evictor_pod = None
+    try:
+        if evictor:
+            c.apply(evictor)
+            c.kubectl("rollout", "status", f"deployment/{cfg.run_id}-evictor-pvc-evictor", "--timeout=300s")
+            evictor_pod = c.kubectl(
+                "get",
+                "pods",
+                "-l",
+                f"kvreap-bench/run={cfg.variant},kvreap-bench/role=evictor",
+                "-o",
+                "jsonpath={.items[0].metadata.name}",
+            ).strip()
+        events["evictor_ready"] = time.time()
+
+        c.apply([loadgen_manifest(cfg)])
+        wait_pod_ready(c, f"{cfg.run_id}-loadgen", timeout_s=600)
+        events["load_start"] = time.time()
+        print(f"[{cfg.variant}] load running for {cfg.duration_s}s", flush=True)
+        wait_loadgen_done(cfg, timeout_s=cfg.duration_s + 900)
+        events["load_end"] = time.time()
+        time.sleep(cfg.settle_s)
+        events["collect"] = time.time()
+        collect(cfg, evictor_pod, events)
+        print(f"[{cfg.variant}] results in {cfg.out}", flush=True)
+    finally:
+        if not keep:
+            teardown(cfg, evictor)
