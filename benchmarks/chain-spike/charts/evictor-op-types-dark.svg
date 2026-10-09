@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 372" width="640" height="372" font-family="system-ui, -apple-system, Segoe UI, sans-serif" role="img" aria-label="Evictor NFS ops by type (mean ops/s)">
+<rect width="640" height="372" rx="8" fill="#1a1a19"/>
+<text x="48" y="18" font-size="13" font-weight="600" fill="#ffffff">Evictor NFS ops by type (mean ops/s)</text>
+<line x1="599" x2="613" y1="14" y2="14" stroke="#199e70" stroke-width="2"/>
+<text x="617" y="18" font-size="11" fill="#c3c2b7">e</text>
+<line x1="570" x2="584" y1="14" y2="14" stroke="#d95926" stroke-width="2"/>
+<text x="588" y="18" font-size="11" fill="#c3c2b7">d</text>
+<line x1="541" x2="555" y1="14" y2="14" stroke="#3987e5" stroke-width="2"/>
+<text x="559" y="18" font-size="11" fill="#c3c2b7">c</text>
+<text x="102" y="52.0" text-anchor="end" font-size="11" fill="#898781">GETATTR</text>
+<rect x="110" y="30" width="434.6" height="10" rx="2" fill="#3987e5"/>
+<text x="548.6" y="39" font-size="10" fill="#c3c2b7">c 617/s</text>
+<rect x="110" y="42" width="458.0" height="10" rx="2" fill="#d95926"/>
+<text x="572.0" y="51" font-size="10" fill="#c3c2b7">d 651/s</text>
+<rect x="110" y="54" width="34.0" height="10" rx="2" fill="#199e70"/>
+<text x="148.0" y="63" font-size="10" fill="#c3c2b7">e 48.3/s</text>
+<text x="102" y="100.0" text-anchor="end" font-size="11" fill="#898781">READDIRPLUS</text>
+<rect x="110" y="78" width="134.0" height="10" rx="2" fill="#3987e5"/>
+<text x="248.0" y="87" font-size="10" fill="#c3c2b7">c 190/s</text>
+<rect x="110" y="90" width="137.5" height="10" rx="2" fill="#d95926"/>
+<text x="251.5" y="99" font-size="10" fill="#c3c2b7">d 195/s</text>
+<rect x="110" y="102" width="9.8" height="10" rx="2" fill="#199e70"/>
+<text x="123.8" y="111" font-size="10" fill="#c3c2b7">e 14.0/s</text>
+<text x="102" y="148.0" text-anchor="end" font-size="11" fill="#898781">LOOKUP</text>
+<rect x="110" y="126" width="1.0" height="10" rx="2" fill="#3987e5"/>
+<text x="114.2" y="135" font-size="10" fill="#c3c2b7">c 0.3/s</text>
+<rect x="110" y="138" width="1.0" height="10" rx="2" fill="#d95926"/>
+<text x="114.2" y="147" font-size="10" fill="#c3c2b7">d 0.27/s</text>
+<rect x="110" y="150" width="124.4" height="10" rx="2" fill="#199e70"/>
+<text x="238.4" y="159" font-size="10" fill="#c3c2b7">e 177/s</text>
+<text x="102" y="196.0" text-anchor="end" font-size="11" fill="#898781">ACCESS</text>
+<rect x="110" y="174" width="87.2" height="10" rx="2" fill="#3987e5"/>
+<text x="201.2" y="183" font-size="10" fill="#c3c2b7">c 124/s</text>
+<rect x="110" y="186" width="89.1" height="10" rx="2" fill="#d95926"/>
+<text x="203.1" y="195" font-size="10" fill="#c3c2b7">d 127/s</text>
+<rect x="110" y="198" width="80.3" height="10" rx="2" fill="#199e70"/>
+<text x="194.3" y="207" font-size="10" fill="#c3c2b7">e 114/s</text>
+<text x="102" y="244.0" text-anchor="end" font-size="11" fill="#898781">REMOVE</text>
+<rect x="110" y="222" width="66.1" height="10" rx="2" fill="#3987e5"/>
+<text x="180.1" y="231" font-size="10" fill="#c3c2b7">c 94.0/s</text>
+<rect x="110" y="234" width="67.9" height="10" rx="2" fill="#d95926"/>
+<text x="181.9" y="243" font-size="10" fill="#c3c2b7">d 96.4/s</text>
+<rect x="110" y="246" width="63.8" height="10" rx="2" fill="#199e70"/>
+<text x="177.8" y="255" font-size="10" fill="#c3c2b7">e 90.6/s</text>
+<text x="102" y="292.0" text-anchor="end" font-size="11" fill="#898781">RMDIR</text>
+<rect x="110" y="270" width="33.3" height="10" rx="2" fill="#3987e5"/>
+<text x="147.3" y="279" font-size="10" fill="#c3c2b7">c 47.3/s</text>
+<rect x="110" y="282" width="33.9" height="10" rx="2" fill="#d95926"/>
+<text x="147.9" y="291" font-size="10" fill="#c3c2b7">d 48.1/s</text>
+<rect x="110" y="294" width="3.7" height="10" rx="2" fill="#199e70"/>
+<text x="117.7" y="303" font-size="10" fill="#c3c2b7">e 5.21/s</text>
+<text x="102" y="340.0" text-anchor="end" font-size="11" fill="#898781">FSSTAT</text>
+<rect x="110" y="318" width="2.1" height="10" rx="2" fill="#3987e5"/>
+<text x="116.1" y="327" font-size="10" fill="#c3c2b7">c 3.01/s</text>
+<rect x="110" y="330" width="2.1" height="10" rx="2" fill="#d95926"/>
+<text x="116.1" y="339" font-size="10" fill="#c3c2b7">d 3.01/s</text>
+<rect x="110" y="342" width="2.1" height="10" rx="2" fill="#199e70"/>
+<text x="116.1" y="351" font-size="10" fill="#c3c2b7">e 3.01/s</text>
+</svg>

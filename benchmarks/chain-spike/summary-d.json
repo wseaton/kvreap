@@ -1,0 +1,319 @@
+{
+  "variant": "d",
+  "duration_s": 1249.5183999538422,
+  "evictor_ops": {
+    "ACCESS": {
+      "count": 157993,
+      "per_sec": 126.59695539424177,
+      "p95_10s_per_sec": 803.6011112419236,
+      "mean_rtt_ms": 0.2463400277227472,
+      "mean_queue_ms": 0.0024811225813801876
+    },
+    "CREATE": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "FSINFO": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "FSSTAT": {
+      "count": 3753,
+      "per_sec": 3.0072115447810304,
+      "p95_10s_per_sec": 3.099999334812307,
+      "mean_rtt_ms": 0.6794564348521183,
+      "mean_queue_ms": 0.013589128697042365
+    },
+    "GETATTR": {
+      "count": 812050,
+      "per_sec": 650.6810911109608,
+      "p95_10s_per_sec": 4324.200721678854,
+      "mean_rtt_ms": 0.3035354965827227,
+      "mean_queue_ms": 0.003509636106151099
+    },
+    "LOOKUP": {
+      "count": 341,
+      "per_sec": 0.2732371800613726,
+      "p95_10s_per_sec": 0.39999999046325707,
+      "mean_rtt_ms": 0.6011730205278593,
+      "mean_queue_ms": 0.002932551319648094
+    },
+    "NULL": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "PATHCONF": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "READ": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "READDIRPLUS": {
+      "count": 243717,
+      "per_sec": 195.28605810269076,
+      "p95_10s_per_sec": 1278.1996952534448,
+      "mean_rtt_ms": 1.0546986874120394,
+      "mean_queue_ms": 0.0030363085053566226
+    },
+    "REMOVE": {
+      "count": 120304,
+      "per_sec": 96.39743610000988,
+      "p95_10s_per_sec": 642.4998468160994,
+      "mean_rtt_ms": 2.1720641042691846,
+      "mean_queue_ms": 0.004380569224630935
+    },
+    "RMDIR": {
+      "count": 60044,
+      "per_sec": 48.112179588284626,
+      "p95_10s_per_sec": 367.9999298095837,
+      "mean_rtt_ms": 1.9998667643727932,
+      "mean_queue_ms": 0.003713943108387183
+    },
+    "SETATTR": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "WRITE": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    }
+  },
+  "evictor_total": [
+    1398202,
+    1120.3541690210302
+  ],
+  "vllm_ops": {
+    "ACCESS": {
+      "count": 511762,
+      "per_sec": 410.0657047365093,
+      "p95_10s_per_sec": 995.7000712180188,
+      "mean_rtt_ms": 0.35496773890988387,
+      "mean_queue_ms": 0.002249092351522778
+    },
+    "CREATE": {
+      "count": 160265,
+      "per_sec": 128.41746782605324,
+      "p95_10s_per_sec": 294.9000421857894,
+      "mean_rtt_ms": 1.4447633606838672,
+      "mean_queue_ms": 0.0013852057529716408
+    },
+    "FSINFO": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "FSSTAT": {
+      "count": 1262,
+      "per_sec": 1.0112179477520307,
+      "p95_10s_per_sec": 1.1000000262260443,
+      "mean_rtt_ms": 0.7305863708399366,
+      "mean_queue_ms": 0.006339144215530904
+    },
+    "GETATTR": {
+      "count": 492441,
+      "per_sec": 394.5841342384768,
+      "p95_10s_per_sec": 819.0998632979621,
+      "mean_rtt_ms": 0.3794667787613135,
+      "mean_queue_ms": 0.0028754713762663953
+    },
+    "LOOKUP": {
+      "count": 1186054,
+      "per_sec": 950.363781143492,
+      "p95_10s_per_sec": 2259.9993534089986,
+      "mean_rtt_ms": 0.3720058277279112,
+      "mean_queue_ms": 0.002029418559357331
+    },
+    "MKDIR": {
+      "count": 136617,
+      "per_sec": 109.46874989543517,
+      "p95_10s_per_sec": 275.80001972675467,
+      "mean_rtt_ms": 1.9113067919805002,
+      "mean_queue_ms": 0.0014493071872460968
+    },
+    "NULL": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "PATHCONF": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "READ": {
+      "count": 305510,
+      "per_sec": 244.7996792533462,
+      "p95_10s_per_sec": 624.8000297927871,
+      "mean_rtt_ms": 2.02468986285228,
+      "mean_queue_ms": 0.008654381198651435
+    },
+    "REMOVE": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "RENAME": {
+      "count": 160265,
+      "per_sec": 128.41746782605324,
+      "p95_10s_per_sec": 295.2000422287048,
+      "mean_rtt_ms": 2.2576108320594015,
+      "mean_queue_ms": 0.009141110036502044
+    },
+    "SETATTR": {
+      "count": 160265,
+      "per_sec": 128.41746782605324,
+      "p95_10s_per_sec": 294.9000421857894,
+      "mean_rtt_ms": 0.6592456244345303,
+      "mean_queue_ms": 0.0025270645493401553
+    },
+    "WRITE": {
+      "count": 320530,
+      "per_sec": 256.8349356521065,
+      "p95_10s_per_sec": 590.000084400189,
+      "mean_rtt_ms": 4.570848282532056,
+      "mean_queue_ms": 0.08562693039653074
+    }
+  },
+  "vllm_rtt_deleting": {
+    "LOOKUP": 0.37854557772191616,
+    "GETATTR": 0.3718819525275891,
+    "CREATE": 1.4408326934561897,
+    "RENAME": 2.249455849088814,
+    "WRITE": 4.551385718247957,
+    "READ": 1.8887519460300985
+  },
+  "vllm_rtt_idle": {
+    "LOOKUP": 0.3709245898675648,
+    "GETATTR": 0.3806792755022729,
+    "CREATE": 1.4454368052154973,
+    "RENAME": 2.2590072642764225,
+    "WRITE": 4.574181737125401,
+    "READ": 2.0399485943541165
+  },
+  "prune_cycles": [
+    {
+      "start": 1791576405.362038,
+      "seconds": 60.59196615219116,
+      "usage_start": 83.3369140625,
+      "usage_end": 66.0703125
+    },
+    {
+      "start": 1791576556.101316,
+      "seconds": 30.544414043426514,
+      "usage_start": 87.23828125,
+      "usage_end": 64.015625
+    },
+    {
+      "start": 1791576697.325955,
+      "seconds": 30.04234504699707,
+      "usage_start": 87.0927734375,
+      "usage_end": 63.17773437500001
+    },
+    {
+      "start": 1791576827.533187,
+      "seconds": 20.529229164123535,
+      "usage_start": 83.8798828125,
+      "usage_end": 66.0927734375
+    },
+    {
+      "start": 1791576938.208369,
+      "seconds": 20.028815031051636,
+      "usage_start": 87.875,
+      "usage_end": 76.333984375
+    },
+    {
+      "start": 1791577038.867487,
+      "seconds": 20.02885413169861,
+      "usage_start": 85.0380859375,
+      "usage_end": 63.015625
+    },
+    {
+      "start": 1791577149.54825,
+      "seconds": 20.02782702445984,
+      "usage_start": 82.890625,
+      "usage_end": 74.3095703125
+    }
+  ],
+  "max_usage_pct": 87.875,
+  "pct_time_above_cleanup": 6.405124099279424,
+  "errors": {
+    "quota_exceeded": 0,
+    "store_failed": 0,
+    "load_failed": 186
+  },
+  "bench": {
+    "hot_requests": 1600,
+    "hot_failed": 0,
+    "hot_ttft_p50_ms": 476.1761789850425,
+    "hot_ttft_p90_ms": 1219.8456189944409,
+    "hot_ttft_p99_ms": 1637.8470089985058,
+    "churn_input_tok_per_s": 34512.95204019994
+  },
+  "metrics": {
+    "vllm:external_prefix_cache_hits_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 1127824.0,
+    "vllm:external_prefix_cache_queries_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 15910937.0,
+    "vllm:kv_offload_allocation_failure_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 25368.0,
+    "vllm:kv_offload_load_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 129347878912.0,
+    "vllm:kv_offload_load_time_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 3.50036109021305,
+    "vllm:kv_offload_store_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 446444601344.0,
+    "vllm:kv_offload_store_time_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 12.20950874373317,
+    "vllm:kv_offload_tiering_chunk_hits_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 79897.0,
+    "vllm:kv_offload_tiering_chunk_queries_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"0:primary\"}": 994432.0,
+    "vllm:kv_offload_tiering_chunk_queries_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 84001.0,
+    "vllm:kv_offload_tiering_promotion_allocation_failures_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 2451.0,
+    "vllm:kv_offload_tiering_promotion_job_failures_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 186.0,
+    "vllm:kv_offload_tiering_read_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 142967308288.0,
+    "vllm:kv_offload_tiering_read_time_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 297.5036979148863,
+    "vllm:kv_offload_tiering_write_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 446444601344.0,
+    "vllm:kv_offload_tiering_write_time_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 1983.4439650087443,
+    "vllm:kv_offload_total_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",transfer_type=\"CPU_to_GPU\"}": 129347878912.0,
+    "vllm:kv_offload_total_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",transfer_type=\"GPU_to_CPU\"}": 446444601344.0,
+    "vllm:kv_offload_total_time_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",transfer_type=\"CPU_to_GPU\"}": 3.50036109021305,
+    "vllm:kv_offload_total_time_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",transfer_type=\"GPU_to_CPU\"}": 12.20950874373317,
+    "vllm:prefix_cache_queries_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 15910937.0
+  },
+  "chains": {
+    "index_blocks": 742407,
+    "event_batches": 14734,
+    "decode_errors": 0,
+    "blocks_stored": 243293,
+    "deleted_heads": 49790,
+    "deleted_root": 549,
+    "deleted_orphan": 49241,
+    "deleted_internal": 49349,
+    "deleted_leaf": 21165,
+    "deleted_untracked": 0,
+    "deferrals": 456841
+  }
+}
