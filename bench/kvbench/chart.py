@@ -173,6 +173,9 @@ def line_chart(
         return H - M_B - (v - y0) / (y1 - y0) * (H - M_T - M_B)
 
     for a, b in bands or []:
+        a, b = max(a, x0), min(b, x1)
+        if b <= a:
+            continue
         out.append(
             f'<rect x="{sx(a):.1f}" y="{M_T}" width="{max(1.0, sx(b) - sx(a)):.1f}" height="{H - M_T - M_B}" fill="{theme.band}"/>'
         )
@@ -352,7 +355,7 @@ def charts(runs: list[RunSeries], theme: Theme) -> dict[str, str]:
     out = {
         "usage": line_chart(
             theme,
-            "PVC usage (% of quota)" + (" — shaded: deleting" if len(runs) == 1 else ""),
+            "PVC usage (% of quota)" + (" — shaded: deleting" if len(runs) == 1 and first.deleting else ""),
             ser(lambda r: r.usage),
             y_unit="%",
             y_max=100,

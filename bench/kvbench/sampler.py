@@ -82,25 +82,31 @@ def main() -> int:
     p.add_argument("--interval", type=float, default=1.0)
     p.add_argument("--scrape-url")
     p.add_argument("--scrape-every", type=int, default=5, help="scrape every N intervals")
-    p.add_argument("--scrape-keep", default=r"^vllm:")
+    p.add_argument("--scrape-keep", default=r"^vllm:(kv_offload|external_prefix_cache|prefix_cache)")
+    p.add_argument("--output", help="append JSON lines to this file instead of stdout")
     args = p.parse_args()
 
     keep = re.compile(args.scrape_keep)
+    sink = open(args.output, "a", buffering=1) if args.output else sys.stdout  # noqa: SIM115
     tick = 0
     next_at = time.monotonic()
     while True:
         rec: dict[str, object] = {"t": time.time()}
         try:
             rec["ops"] = read_mountstats(args.mount)
+        except OSError as e:
+            rec["ops_error"] = str(e)
+        try:
             rec["usage"] = read_usage(args.mount)
         except OSError as e:
-            rec["error"] = str(e)
+            rec["usage_error"] = str(e)
         if args.scrape_url and tick % args.scrape_every == 0:
             try:
                 rec["metrics"] = scrape(args.scrape_url, keep)
             except OSError as e:
                 rec["scrape_error"] = str(e)
-        print(json.dumps(rec, separators=(",", ":")), flush=True)
+        sink.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        sink.flush()
         tick += 1
         next_at += args.interval
         time.sleep(max(0.0, next_at - time.monotonic()))

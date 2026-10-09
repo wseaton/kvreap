@@ -151,7 +151,7 @@ def sampler_configmap(cfg: RunConfig) -> Manifest:
 
 
 def sampler_container(kv_volume: str, scrape_url: str | None = None) -> Manifest:
-    cmd = ["python3", "/bench/sampler.py", "--mount", KV_MOUNT, "--interval", "1"]
+    cmd = ["python3", "/bench/sampler.py", "--mount", KV_MOUNT, "--interval", "1", "--output", SAMPLES_FILE]
     if scrape_url:
         cmd += ["--scrape-url", scrape_url]
     return {
@@ -162,8 +162,13 @@ def sampler_container(kv_volume: str, scrape_url: str | None = None) -> Manifest
         "volumeMounts": [
             {"name": kv_volume, "mountPath": KV_MOUNT, "readOnly": True},
             {"name": "bench", "mountPath": "/bench"},
+            {"name": "samples", "mountPath": "/out"},
         ],
     }
+
+
+SAMPLES_FILE = "/out/samples.jsonl"
+SAMPLES_VOLUME: Manifest = {"name": "samples", "emptyDir": {}}
 
 
 def bench_volume(cfg: RunConfig) -> Manifest:
@@ -238,6 +243,7 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
                 {"name": "hf", "persistentVolumeClaim": {"claimName": cfg.hf_pvc}},
                 {"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": "16Gi"}},
                 bench_volume(cfg),
+                SAMPLES_VOLUME,
             ],
         },
     }
@@ -377,7 +383,7 @@ def evictor_manifests(cfg: RunConfig) -> list[Manifest]:
         tmpl.setdefault("metadata", {}).setdefault("annotations", {}).update(NO_ISTIO)
         spec = tmpl["spec"]
         spec["imagePullSecrets"] = [{"name": cfg.pull_secret}]
-        spec["volumes"].append(bench_volume(cfg))
+        spec["volumes"] += [bench_volume(cfg), SAMPLES_VOLUME]
         spec["containers"].append(sampler_container("kv-cache-storage"))
     return objs
 
@@ -418,10 +424,10 @@ def collect(cfg: RunConfig, evictor_pod: str | None, events: dict[str, float]) -
     out = cfg.out
     out.mkdir(parents=True, exist_ok=True)
     vllm = f"{cfg.run_id}-vllm"
-    (out / "vllm-sampler.jsonl").write_text(c.kubectl("logs", vllm, "-c", "sampler"))
+    c.kubectl("cp", f"{vllm}:{SAMPLES_FILE}", str(out / "vllm-sampler.jsonl"), "-c", "sampler")
     (out / "vllm.log").write_text(c.kubectl("logs", vllm, "-c", "vllm", "--timestamps"))
     if evictor_pod:
-        (out / "evictor-sampler.jsonl").write_text(c.kubectl("logs", evictor_pod, "-c", "sampler"))
+        c.kubectl("cp", f"{evictor_pod}:{SAMPLES_FILE}", str(out / "evictor-sampler.jsonl"), "-c", "sampler")
         (out / "evictor.log").write_text(c.kubectl("logs", evictor_pod, "-c", "evictor", "--timestamps"))
     c.kubectl("cp", f"{cfg.run_id}-loadgen:/results", str(out / "loadgen"), "-c", "loadgen")
     meta = {k: (str(v) if isinstance(v, (Path, Cluster)) else v) for k, v in asdict(cfg).items()}
