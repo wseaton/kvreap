@@ -44,9 +44,25 @@ metadata operation that competes with vLLM's own lookups and writes. kvreap:
 | `DELETION_BATCH_SIZE` | `100` | `BlockRemoved` events per message |
 | `ENABLE_DIR_CLEANUP` / `DIR_CLEANUP_TTL_SECONDS` | `true` / `120` | rmdir empty buckets older than the TTL |
 | `HEX_BUCKET_LEN` | `3` | |
-| `STORAGE_EVENTS_ENDPOINT` | unset | ZMQ PUB bind address for `BlockRemoved` events |
+| `STORAGE_EVENTS_ENDPOINT` | unset | ZMQ PUB bind address for `BlockRemoved` events; needs the `events` build, otherwise logged and ignored |
 | `DRY_RUN`, `LOG_LEVEL`, `LOG_FILE_PATH` | | as in the Python evictor |
 | `FILE_QUEUE_MAXSIZE`, `FILE_QUEUE_MIN_SIZE` | | accepted and ignored |
+
+## `BlockRemoved` events
+
+Events are behind the `events` Cargo feature and are off by default, so the
+default build links no cryptographic code: libzmq compiles in its own SHA-1
+for the WebSocket transport. A test scans the default binary for crypto and
+zmq symbols.
+
+```bash
+cargo build --release --features=events
+```
+
+Against vLLM 0.31's built-in FS tier the events have no effect: vLLM
+publishes storage-tier stores under the vLLM pod's identity with medium
+`STORAGE`, while evictor removals go to the `SHARED_STORAGE` topic, which
+only the old `llmd_fs_backend` (<= 0.23) used for its stores.
 
 ## Development
 

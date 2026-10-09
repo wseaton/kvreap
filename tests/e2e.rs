@@ -14,11 +14,15 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::Read;
+#[cfg(feature = "events")]
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(feature = "events")]
+use std::sync::Arc;
+use std::sync::Mutex;
+#[cfg(feature = "events")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 const CACHE_DIR: &str = "kv/model-cache/models";
@@ -350,12 +354,14 @@ fn respects_max_files_per_second() {
     assert!(ev.sigterm().success());
 }
 
+#[cfg(feature = "events")]
 struct Subscriber {
     stop: Arc<AtomicBool>,
     handle: std::thread::JoinHandle<()>,
     frames: Arc<Mutex<Vec<Vec<Vec<u8>>>>>,
 }
 
+#[cfg(feature = "events")]
 impl Subscriber {
     fn connect(endpoint: &str) -> Self {
         let ctx = zmq::Context::new();
@@ -393,6 +399,7 @@ impl Subscriber {
     }
 }
 
+#[cfg(feature = "events")]
 /// Decodes a payload `[ts, [bin(event)...]]` into the hashes of its BlockRemoved events.
 fn decode_removed(payload: &[u8]) -> Vec<u64> {
     let mut rd = payload;
@@ -430,6 +437,7 @@ fn decode_removed(payload: &[u8]) -> Vec<u64> {
     hashes
 }
 
+#[cfg(feature = "events")]
 #[test]
 fn publishes_block_removed_events_for_every_deletion() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -762,4 +770,53 @@ fn threshold_never_deletes_hot_files_even_if_target_is_unreachable() {
     assert!(ev.sigterm().success());
     assert_eq!(existing(&hot).len(), hot.len());
     assert!(!ev.log().contains("DELETION_END"));
+}
+
+#[cfg(not(feature = "events"))]
+#[test]
+fn storage_events_endpoint_without_events_feature_warns_and_still_evicts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(tmp.path());
+    let cold = cache.cold_blocks(10, 64);
+    let mut env = always_evicting();
+    env.push(("STORAGE_EVENTS_ENDPOINT", "tcp://127.0.0.1:5559".into()));
+    let mut ev = Evictor::start(tmp.path(), &env);
+    assert!(
+        ev.wait_for_log("this build has no events support", Duration::from_secs(10)),
+        "{}",
+        ev.log()
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || existing(&cold).is_empty()),
+        "{}",
+        ev.log()
+    );
+    assert!(ev.sigterm().success());
+}
+
+/// The default build must not link any cryptographic code (FIPS).
+#[cfg(not(feature = "events"))]
+#[test]
+fn default_build_links_no_crypto() {
+    let bin = fs::read(BIN).expect("read kvreap binary");
+    let needles: [&[u8]; 9] = [
+        b"sha1_init",
+        b"sha1_loop",
+        b"tweetnacl",
+        b"crypto_box",
+        b"curve_client",
+        b"chacha",
+        b"zmq_ctx_new",
+        b"sodium_init",
+        b"EVP_",
+    ];
+    let found: Vec<String> = needles
+        .iter()
+        .filter(|n| bin.windows(n.len()).any(|w| w == **n))
+        .map(|n| String::from_utf8_lossy(n).into_owned())
+        .collect();
+    assert!(
+        found.is_empty(),
+        "crypto or zmq symbols in the default build: {found:?}"
+    );
 }

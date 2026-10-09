@@ -1,6 +1,7 @@
 mod budget;
 mod config;
 mod controller;
+#[cfg(feature = "events")]
 mod events;
 mod fsops;
 mod layout;
@@ -25,7 +26,7 @@ use crate::controller::{Hysteresis, Mode, SharedState, disk_usage};
 use crate::layout::Shard;
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
-use crate::worker::{Context, Worker};
+use crate::worker::{Context, Removed, Worker};
 
 const MOUNT_WAIT: Duration = Duration::from_secs(60);
 const MOUNT_POLL: Duration = Duration::from_secs(2);
@@ -145,6 +146,39 @@ fn spawn<F: FnOnce() + Send + 'static>(name: String, f: F) -> anyhow::Result<Joi
         .with_context(|| format!("spawning {name}"))
 }
 
+type EventsHandle = (Option<mpsc::Sender<Removed>>, Option<JoinHandle<()>>);
+
+#[cfg(feature = "events")]
+fn start_events(config: &Config) -> anyhow::Result<EventsHandle> {
+    let Some(endpoint) = &config.storage_events_endpoint else {
+        return Ok((None, None));
+    };
+    match events::Publisher::bind(endpoint) {
+        Ok(publisher) => {
+            tracing::info!(endpoint, "storage event publisher bound");
+            let (tx, rx) = mpsc::channel();
+            let batch = config.event_batch_size;
+            let handle = spawn("events".into(), move || events::run(publisher, rx, batch))?;
+            Ok((Some(tx), Some(handle)))
+        }
+        Err(e) => {
+            tracing::warn!(endpoint, error = %e, "failed to create storage event publisher");
+            Ok((None, None))
+        }
+    }
+}
+
+#[cfg(not(feature = "events"))]
+fn start_events(config: &Config) -> anyhow::Result<EventsHandle> {
+    if let Some(endpoint) = &config.storage_events_endpoint {
+        tracing::warn!(
+            endpoint,
+            "STORAGE_EVENTS_ENDPOINT is set but this build has no events support; BlockRemoved events are not published"
+        );
+    }
+    Ok((None, None))
+}
+
 fn run(config: Config) -> anyhow::Result<()> {
     let config = Arc::new(config);
     let shutdown = Arc::new(Shutdown::default());
@@ -175,26 +209,7 @@ fn run(config: Config) -> anyhow::Result<()> {
     let stats = Arc::new(Stats::default());
     let budget = Arc::new(Budget::new(config.max_files_per_second));
 
-    let (events_tx, events_thread) = match &config.storage_events_endpoint {
-        Some(endpoint) => match events::Publisher::bind(endpoint) {
-            Ok(publisher) => {
-                tracing::info!(endpoint, "storage event publisher bound");
-                let (tx, rx) = mpsc::channel();
-                let batch = config.event_batch_size;
-                (
-                    Some(tx),
-                    Some(spawn("events".into(), move || {
-                        events::run(publisher, rx, batch)
-                    })?),
-                )
-            }
-            Err(e) => {
-                tracing::warn!(endpoint, error = %e, "failed to create storage event publisher");
-                (None, None)
-            }
-        },
-        None => (None, None),
-    };
+    let (events_tx, events_thread) = start_events(&config)?;
 
     let controller = {
         let (config, shared, shutdown) = (

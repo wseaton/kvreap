@@ -8,19 +8,22 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["", "--features=events"]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy --all --benches --tests --examples --all-features -- -D warnings
+      - run: cargo clippy --all --benches --tests --examples ${{ matrix.features }} -- -D warnings
       - name: Mount a dedicated 64 MiB tmpfs for the threshold e2e tests
         run: |
           sudo mkdir -p /mnt/kvreap-e2e
           sudo mount -t tmpfs -o size=64m tmpfs /mnt/kvreap-e2e
           sudo chown "$(id -u):$(id -g)" /mnt/kvreap-e2e
-      - run: cargo test --locked --all-targets -- --include-ignored
+      - run: cargo test --locked --all-targets ${{ matrix.features }} -- --include-ignored
         env:
           KVREAP_E2E_DIR: /mnt/kvreap-e2e
 

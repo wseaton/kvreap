@@ -11,17 +11,12 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::layout::BlockHash;
+use crate::worker::Removed;
 
 const MEDIUM: &str = "SHARED_STORAGE";
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const SNDHWM: i32 = 100_000;
 const LINGER_MS: i32 = 1000;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Removed {
-    pub model_base: PathBuf,
-    pub hash: BlockHash,
-}
 
 pub fn encode_block_removed(hashes: &[BlockHash]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(32 + hashes.len() * 9);

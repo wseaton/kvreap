@@ -21,7 +21,6 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::budget::{Budget, OpKind};
 use crate::config::Config;
 use crate::controller::{Mode, SharedState};
-use crate::events::Removed;
 use crate::fsops::{self, EntryKind, Meta};
 use crate::layout::{BlockHash, Shard, discover_rank_dirs, model_base_dir};
 use crate::shutdown::Shutdown;
@@ -36,6 +35,13 @@ const EMPTY_INDEX_RETRY: Duration = Duration::from_secs(5);
 const FRUITLESS_ROUNDS_BEFORE_BACKOFF: u32 = 16;
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// A deleted block, reported to the events publisher when the `events` feature is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removed {
+    pub model_base: PathBuf,
+    pub hash: BlockHash,
+}
 
 #[derive(Debug)]
 struct RankDir {
@@ -461,11 +467,10 @@ mod tests {
     use crate::budget::Budget;
     use crate::config::Config;
     use crate::controller::{Mode, SharedState};
-    use crate::events::Removed;
     use crate::layout::{BlockHash, Shard};
     use crate::shutdown::Shutdown;
     use crate::stats::Stats;
-    use crate::worker::{Candidate, Context, Pool, RankDir, Worker};
+    use crate::worker::{Candidate, Context, Pool, RankDir, Removed, Worker};
 
     fn candidate(path: &str, age_secs: u64) -> Candidate {
         Candidate {
