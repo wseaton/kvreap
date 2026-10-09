@@ -52,8 +52,12 @@ retrans=2, forcerdirplus, acregmin=3, acregmax=60, acdirmin=30, acdirmax=60`.
   - per-pod NFS counters need the `nosharecache` mount option (kvbench uses a
     StorageClass clone with it);
   - an evictor scheduled on the same node as vLLM shares vLLM's NFS client,
-    its 32 connections and its RPC slots (inferred). Keep the evictor off vLLM
-    nodes (pod anti-affinity) or give its mount `nosharecache`.
+    its 32 connections and its RPC slots. This cost nothing measurable
+    (measured, [placement benchmark](../benchmarks/placement/README.md)):
+    with the Python evictor at ~17k GETATTR/s on vLLM's node, vLLM's NFS
+    client queue time and FS-tier read/write s/GiB were within 4% of a run
+    with the evictor on another node. vLLM's mountstats then include the
+    evictor's ops (19.6k ops/s).
 - **`lookupcache=pos` caches positive lookups for up to `acdirmax` (60 s)** and
   never caches negative ones. vLLM checks block existence with `stat`, so a
   block the evictor just unlinked can still look present to vLLM until the
@@ -170,8 +174,13 @@ In rough priority order.
    `statvfs` timestamp from a heartbeat file in `/tmp`, so a hung NFS mount
    shows up as unhealthy instead of a probe that never returns. This needs a
    chart change to use it, so it is opt-in.
-7. **Document scheduling** (proposed). Recommend pod anti-affinity against
-   vLLM pods on NFS-backed volumes, since co-located pods share one NFS client.
+7. **Document scheduling** (proposed). Pod anti-affinity against vLLM is not
+   needed on VAST at this load (measured, see the
+   [placement benchmark](../benchmarks/placement/README.md)). It only matters
+   if you want per-pod NFS counters: co-located pods on `shared-vast` share
+   one superblock and their mountstats merge (vLLM's counters showed the
+   evictor's 19.6k ops/s). Untested on NFS servers with fewer connections or
+   with several heavy pods per node.
 
 ## Changes outside kvreap
 
