@@ -707,7 +707,7 @@ fn capacity_bytes_drives_thresholds_instead_of_statvfs() {
         ev.log()
     );
     assert!(
-        ev.wait_for_log("DELETION_END", Duration::from_secs(60)),
+        ev.wait_for_log("DELETION_END", Duration::from_secs(120)),
         "{}",
         ev.log()
     );
@@ -1056,8 +1056,9 @@ fn threshold_evicts_from_cleanup_down_to_target_then_idles() {
         "{}",
         ev.log()
     );
+    // Prunes are paced to reach target in about 60 s.
     assert!(
-        ev.wait_for_log("DELETION_END", Duration::from_secs(60)),
+        ev.wait_for_log("DELETION_END", Duration::from_secs(120)),
         "{}",
         ev.log()
     );

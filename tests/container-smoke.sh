@@ -53,7 +53,8 @@ hot = [b for b in bins if time.time() - os.stat(b).st_atime < 3600]
 print(len(bins), len(hot))"
 }
 
-for _ in $(seq 1 120); do
+# Prunes are paced to reach target in about 60 s; allow 120 s.
+for _ in $(seq 1 240); do
   read -r total hot < <(count_bins)
   [ "$total" -eq 20 ] && break
   sleep 0.5
