@@ -19,10 +19,11 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::budget::{Budget, OpKind};
+use crate::capacity::{BucketSample, Samples};
 use crate::config::Config;
 use crate::controller::{Mode, SharedState};
 use crate::fsops::{self, EntryKind, Meta};
-use crate::layout::{BlockHash, Shard, discover_rank_dirs, model_base_dir};
+use crate::layout::{BlockHash, Shard, block_files, discover_rank_dirs, model_base_dir};
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
 
@@ -117,6 +118,7 @@ pub struct Context {
     pub shared: Arc<SharedState>,
     pub budget: Arc<Budget>,
     pub stats: Arc<Stats>,
+    pub samples: Arc<Samples>,
     pub shutdown: Arc<Shutdown>,
     pub events: Option<Sender<Removed>>,
 }
@@ -296,6 +298,8 @@ impl Worker {
         Ok(Some(RoundResult { sampled, evicted }))
     }
 
+    /// Stats every block in `bucket` into the pool and, if the walk finished,
+    /// records the bucket's size for the usage estimate. Returns files sampled.
     fn sample_bucket(&mut self, rank: &Arc<RankDir>, bucket: &CStr) -> io::Result<usize> {
         let bucket_path = rank.path.join(bucket.to_string_lossy().as_ref());
         let bucket_fd = fsops::open_dir(&bucket_path)?;
@@ -304,20 +308,21 @@ impl Worker {
         }
         let leaves = self.timed(OpKind::Readdir, || fsops::list(&bucket_fd))?;
         if leaves.is_empty() {
+            self.ctx.samples.record(BucketSample::default());
             self.reap_if_stale(&bucket_path);
             return Ok(0);
         }
-        let mut sampled = 0;
+        let mut sample = BucketSample::default();
         for leaf in leaves.iter().filter(|e| e.kind == EntryKind::Dir) {
             if self.ctx.shutdown.is_set() {
-                break;
+                return Ok(0);
             }
             let leaf_path = bucket_path.join(leaf.name.to_string_lossy().as_ref());
             let Ok(leaf_fd) = fsops::open_dir_at(&bucket_fd, &leaf.name) else {
                 continue;
             };
             if !self.acquire() {
-                break;
+                return Ok(0);
             }
             let Ok(files) = self.timed(OpKind::Readdir, || fsops::list(&leaf_fd)) else {
                 continue;
@@ -326,14 +331,9 @@ impl Worker {
                 self.reap_if_stale(&leaf_path);
                 continue;
             }
-            let bins: Vec<(&CString, BlockHash)> = files
-                .iter()
-                .filter(|f| f.kind == EntryKind::File)
-                .filter_map(|f| Some((&f.name, BlockHash::from_file_name(f.name.to_str().ok()?)?)))
-                .collect();
-            for (name, hash) in &bins {
+            for (name, hash) in block_files(&files) {
                 if !self.acquire() {
-                    return Ok(sampled);
+                    return Ok(0);
                 }
                 let meta: Meta = match self.timed(OpKind::Stat, || fsops::stat_at(&leaf_fd, name)) {
                     Ok(m) => m,
@@ -344,7 +344,9 @@ impl Worker {
                         continue;
                     }
                 };
-                sampled += 1;
+                sample.files += 1;
+                sample.bytes = sample.bytes.saturating_add(meta.size);
+                Stats::add(&self.ctx.stats.files_sampled, 1);
                 if self.is_hot(meta.atime) {
                     Stats::add(&self.ctx.stats.files_skipped_hot, 1);
                     continue;
@@ -352,7 +354,7 @@ impl Worker {
                 self.pool.insert(Candidate {
                     path: leaf_path.join(name.to_string_lossy().as_ref()),
                     rank: Arc::clone(rank),
-                    hash: *hash,
+                    hash,
                     size: meta.size,
                     atime: meta.atime,
                     sampled_at: Instant::now(),
@@ -360,8 +362,8 @@ impl Worker {
                 });
             }
         }
-        Stats::add(&self.ctx.stats.files_sampled, sampled as u64);
-        Ok(sampled)
+        self.ctx.samples.record(sample);
+        Ok(usize::try_from(sample.files).unwrap_or(usize::MAX))
     }
 
     fn evict(&mut self, quota: usize) -> usize {
@@ -465,6 +467,7 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime};
 
     use crate::budget::Budget;
+    use crate::capacity::{BucketSample, Samples};
     use crate::config::Config;
     use crate::controller::{Mode, SharedState};
     use crate::layout::{BlockHash, Shard};
@@ -575,18 +578,21 @@ mod tests {
         worker: Worker,
         shared: Arc<SharedState>,
         stats: Arc<Stats>,
+        samples: Arc<Samples>,
         rx: mpsc::Receiver<Removed>,
     }
 
     fn harness(cfg: Config) -> Harness {
         let shared = Arc::new(SharedState::default());
         let stats = Arc::new(Stats::default());
+        let samples = Arc::new(Samples::default());
         let (tx, rx) = mpsc::channel();
         let ctx = Context {
             budget: Arc::new(Budget::new(cfg.max_files_per_second)),
             config: Arc::new(cfg),
             shared: Arc::clone(&shared),
             stats: Arc::clone(&stats),
+            samples: Arc::clone(&samples),
             shutdown: Arc::new(Shutdown::default()),
             events: Some(tx),
         };
@@ -594,6 +600,7 @@ mod tests {
             worker: Worker::new(0, Shard::split(1)[0], ctx),
             shared,
             stats,
+            samples,
             rx,
         }
     }
@@ -847,6 +854,34 @@ mod tests {
         h.shared.set_mode(Mode::Evicting);
         assert_eq!(h.worker.round().expect("round"), None);
         assert_eq!(bins(&fx.cache).len(), 4);
+    }
+
+    #[test]
+    fn sampled_buckets_feed_the_usage_estimate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("cache");
+        let leaf = cache.join("m_abcdef012345_r0/abc/de_g0");
+        fs::create_dir_all(&leaf).expect("mkdir");
+        for (i, size) in [(1, 100usize), (2, 250), (3, 50)] {
+            fs::write(
+                leaf.join(format!("abcde0000000000{i}.bin")),
+                vec![0u8; size],
+            )
+            .expect("write");
+        }
+        fs::write(leaf.join("notes.txt"), vec![0u8; 999]).expect("write");
+
+        let mut h = harness(config(&cache, &[]));
+        h.shared.set_mode(Mode::Evicting);
+        h.samples.set_bucket_count(10);
+        run_rounds(&mut h, 15);
+        assert_eq!(h.samples.estimated_used_bytes(), None, "15 samples");
+        h.worker.round().expect("round");
+        assert_eq!(h.samples.estimated_used_bytes(), Some(4000));
+        assert_eq!(bins(&cache).len(), 3, "all files are hot");
+
+        h.samples.record(BucketSample::default());
+        assert!(h.samples.estimated_used_bytes().is_some_and(|b| b < 4000));
     }
 
     #[test]

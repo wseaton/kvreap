@@ -1,3 +1,4 @@
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -39,6 +40,32 @@ impl Percent {
 
     pub fn get(self) -> f64 {
         self.0
+    }
+}
+
+/// Size of the volume in bytes, for filesystems whose `statvfs` does not report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityBytes(NonZeroU64);
+
+impl CapacityBytes {
+    fn parse(var: &'static str, raw: &str) -> Result<Self, ConfigError> {
+        let n = raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| ConfigError::NotANumber {
+                var,
+                value: raw.to_string(),
+            })?;
+        NonZeroU64::new(n).map(Self).ok_or(ConfigError::OutOfRange {
+            var,
+            value: 0.0,
+            min: 1.0,
+            max: u64::MAX as f64,
+        })
+    }
+
+    pub fn get(self) -> u64 {
+        self.0.get()
     }
 }
 
@@ -109,6 +136,8 @@ pub struct Config {
     pub dir_cleanup_ttl: Duration,
     pub log_file_path: Option<PathBuf>,
     pub storage_events_endpoint: Option<String>,
+    /// When set, usage is estimated from bucket samples against this size instead of `statvfs`.
+    pub capacity_bytes: Option<CapacityBytes>,
 }
 
 const IGNORED_VARS: [&str; 2] = ["FILE_QUEUE_MAXSIZE", "FILE_QUEUE_MIN_SIZE"];
@@ -223,6 +252,9 @@ impl Config {
             )?),
             log_file_path: optional("LOG_FILE_PATH").map(PathBuf::from),
             storage_events_endpoint: optional("STORAGE_EVENTS_ENDPOINT"),
+            capacity_bytes: optional("CAPACITY_BYTES")
+                .map(|raw| CapacityBytes::parse("CAPACITY_BYTES", &raw))
+                .transpose()?,
         })
     }
 }
@@ -263,6 +295,7 @@ mod tests {
         assert_eq!(c.dir_cleanup_ttl.as_secs(), 120);
         assert_eq!(c.log_file_path, None);
         assert_eq!(c.storage_events_endpoint, None);
+        assert_eq!(c.capacity_bytes, None);
     }
 
     #[test]
@@ -379,6 +412,37 @@ mod tests {
             cfg(&[("CLEANUP_THRESHOLD", "101")]),
             Err(ConfigError::OutOfRange { .. })
         ));
+    }
+
+    #[test]
+    fn capacity_bytes_parses_plain_byte_counts() {
+        let c = cfg(&[("CAPACITY_BYTES", " 21474836480 ")]).expect("parse");
+        assert_eq!(c.capacity_bytes.map(|b| b.get()), Some(21_474_836_480));
+        let c = cfg(&[("CAPACITY_BYTES", "")]).expect("parse");
+        assert_eq!(c.capacity_bytes, None);
+    }
+
+    #[test]
+    fn capacity_bytes_rejects_zero_fractions_and_suffixes() {
+        assert!(matches!(
+            cfg(&[("CAPACITY_BYTES", "0")]),
+            Err(ConfigError::OutOfRange {
+                var: "CAPACITY_BYTES",
+                ..
+            })
+        ));
+        for raw in ["20Gi", "1.5", "-1", "lots"] {
+            assert!(
+                matches!(
+                    cfg(&[("CAPACITY_BYTES", raw)]),
+                    Err(ConfigError::NotANumber {
+                        var: "CAPACITY_BYTES",
+                        ..
+                    })
+                ),
+                "{raw}"
+            );
+        }
     }
 
     #[test]

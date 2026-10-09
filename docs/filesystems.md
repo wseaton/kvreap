@@ -123,16 +123,17 @@ mounted with `prjquota`.
 
 In rough priority order.
 
-1. **Pluggable capacity source** (proposed). Keep `statvfs` as the default and
-   add:
-   - `CAPACITY_BYTES`: the volume size (e.g. the PVC request) when the
-     filesystem can't report it. Used bytes then come from a sampled
-     estimate: kvreap already reads whole buckets, so mean bytes per bucket
-     × bucket count gives the cache size without a full scan, refreshed while
-     idle at a very low rate.
-   - A startup sanity check that warns when `statvfs` total is more than 10×
-     `CAPACITY_BYTES` (catches VAST before the first write, hostPath and
-     emptyDir).
+1. **Pluggable capacity source** (implemented). `statvfs` stays the default;
+   `CAPACITY_BYTES` sets the volume size (e.g. the PVC request) when the
+   filesystem can't report it. Used bytes then come from a sampled estimate:
+   mean block bytes over the last 64 sampled buckets x bucket count. Workers
+   record every bucket they sample while evicting; a sampler thread lists the
+   buckets every 60 s and samples one bucket per second (back to back until
+   16 are in), so the estimate keeps up with vLLM while idle. Eviction waits
+   for the first estimate. At startup kvreap warns when `statvfs` total is
+   more than 10x `CAPACITY_BYTES` (VAST before the first write, hostPath,
+   emptyDir). The estimate counts only block files, not temp files or other
+   data on the volume, so leave headroom below 100%.
 2. **Detect missing atime and say so** (proposed). At startup, create a probe
    file, back-date its atime, read it, and `statx` it again. If atime didn't
    move, log that hot protection is effectively "recently written" and

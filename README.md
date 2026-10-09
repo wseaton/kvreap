@@ -15,7 +15,8 @@ The Python evictor finds candidates by crawling the whole cache tree. On
 ReadWriteMany storage (CephFS, NFS, ...) every `readdir`/`stat`/`unlink` is a
 metadata operation that competes with vLLM's own lookups and writes. kvreap:
 
-- **Does nothing while usage is below `CLEANUP_THRESHOLD`** beyond `statvfs`.
+- **Does nothing while usage is below `CLEANUP_THRESHOLD`** beyond `statvfs`
+  (or, with `CAPACITY_BYTES`, sampling one bucket per second).
 - **Samples instead of crawling.** Block files are hash-distributed, so a
   random `<rank>/<hhh>/` bucket is a uniform sample. Each round `statx`es one
   bucket into a pool of the oldest cold files and unlinks the oldest half as
@@ -44,6 +45,7 @@ metadata operation that competes with vLLM's own lookups and writes. kvreap:
 | `DELETION_BATCH_SIZE` | `100` | `BlockRemoved` events per message |
 | `ENABLE_DIR_CLEANUP` / `DIR_CLEANUP_TTL_SECONDS` | `true` / `120` | rmdir empty buckets older than the TTL |
 | `HEX_BUCKET_LEN` | `3` | |
+| `CAPACITY_BYTES` | unset | volume size in bytes (e.g. the PVC request). When set, used bytes are estimated from bucket samples (mean block bytes per bucket x bucket count) instead of `statvfs`; for volumes whose `statvfs` reports the wrong filesystem. Warns at startup if `statvfs` reports more than 10x this |
 | `STORAGE_EVENTS_ENDPOINT` | unset | ZMQ PUB bind address for `BlockRemoved` events; needs the `events` build, otherwise logged and ignored |
 | `DRY_RUN`, `LOG_LEVEL`, `LOG_FILE_PATH` | | as in the Python evictor |
 | `FILE_QUEUE_MAXSIZE`, `FILE_QUEUE_MIN_SIZE` | | accepted and ignored |

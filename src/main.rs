@@ -1,4 +1,5 @@
 mod budget;
+mod capacity;
 mod config;
 mod controller;
 #[cfg(feature = "events")]
@@ -21,8 +22,9 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 use crate::budget::Budget;
+use crate::capacity::{Sampler, Samples, statvfs_overreports};
 use crate::config::Config;
-use crate::controller::{Hysteresis, Mode, SharedState, disk_usage};
+use crate::controller::{Hysteresis, Mode, SharedState, UsageSource, disk_usage};
 use crate::layout::Shard;
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
@@ -75,13 +77,30 @@ fn unix_now() -> f64 {
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-fn controller_loop(config: Arc<Config>, shared: Arc<SharedState>, shutdown: Arc<Shutdown>) {
+fn controller_loop(
+    config: Arc<Config>,
+    source: UsageSource,
+    shared: Arc<SharedState>,
+    shutdown: Arc<Shutdown>,
+) {
     let hysteresis = Hysteresis::new(config.cleanup_threshold, config.target_threshold);
     let mut mode = Mode::Idle;
+    let mut have_usage = false;
     loop {
-        match disk_usage(&config.pvc_mount_path) {
-            Ok(usage) => {
+        match source.read() {
+            Ok(Some(usage)) => {
                 let pct = usage.percent();
+                if !have_usage {
+                    have_usage = true;
+                    if let UsageSource::Sampled { .. } = source {
+                        tracing::info!(
+                            usage = format!("{pct:.2}%"),
+                            used_gb = format!("{:.2}", usage.used_bytes as f64 / GIB),
+                            capacity_gb = format!("{:.2}", usage.total_bytes as f64 / GIB),
+                            "sampled usage estimate ready"
+                        );
+                    }
+                }
                 shared.set_usage(pct);
                 let next = hysteresis.next(mode, pct);
                 if next != mode {
@@ -111,6 +130,7 @@ fn controller_loop(config: Arc<Config>, shared: Arc<SharedState>, shutdown: Arc<
                     }
                 }
             }
+            Ok(None) => {}
             Err(e) => tracing::warn!(error = %e, "statvfs failed"),
         }
         if shutdown.wait(config.usage_poll_interval) {
@@ -118,6 +138,46 @@ fn controller_loop(config: Arc<Config>, shared: Arc<SharedState>, shutdown: Arc<
         }
     }
     shared.set_mode(Mode::Idle);
+}
+
+/// Picks the usage source and, for `CAPACITY_BYTES`, starts the sampler thread.
+fn start_usage_source(
+    config: &Config,
+    samples: &Arc<Samples>,
+    stats: &Arc<Stats>,
+    shutdown: &Arc<Shutdown>,
+) -> anyhow::Result<(UsageSource, Option<JoinHandle<()>>)> {
+    let Some(capacity) = config.capacity_bytes else {
+        return Ok((UsageSource::Statvfs(config.pvc_mount_path.clone()), None));
+    };
+    match disk_usage(&config.pvc_mount_path) {
+        Ok(u) if statvfs_overreports(u.total_bytes, capacity) => tracing::warn!(
+            statvfs_total_gb = format!("{:.2}", u.total_bytes as f64 / GIB),
+            capacity_gb = format!("{:.2}", capacity.get() as f64 / GIB),
+            "statvfs reports more than 10x CAPACITY_BYTES: the filesystem does not report this volume's size (VAST before the first write, hostPath, emptyDir); using sampled usage"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "statvfs failed"),
+    }
+    tracing::info!(
+        capacity_bytes = capacity.get(),
+        "CAPACITY_BYTES set: usage is estimated from bucket samples, not statvfs"
+    );
+    let sampler = Sampler {
+        cache: config.cache_path(),
+        bucket_len: config.hex_bucket_len,
+        samples: Arc::clone(samples),
+        stats: Arc::clone(stats),
+        shutdown: Arc::clone(shutdown),
+    };
+    let handle = spawn("sampler".into(), move || sampler.run())?;
+    Ok((
+        UsageSource::Sampled {
+            capacity,
+            samples: Arc::clone(samples),
+        },
+        Some(handle),
+    ))
 }
 
 fn log_status(shared: &SharedState, budget: &Budget, stats: &Stats) {
@@ -207,9 +267,11 @@ fn run(config: Config) -> anyhow::Result<()> {
 
     let shared = Arc::new(SharedState::default());
     let stats = Arc::new(Stats::default());
+    let samples = Arc::new(Samples::default());
     let budget = Arc::new(Budget::new(config.max_files_per_second));
 
     let (events_tx, events_thread) = start_events(&config)?;
+    let (source, sampler) = start_usage_source(&config, &samples, &stats, &shutdown)?;
 
     let controller = {
         let (config, shared, shutdown) = (
@@ -218,7 +280,7 @@ fn run(config: Config) -> anyhow::Result<()> {
             Arc::clone(&shutdown),
         );
         spawn("controller".into(), move || {
-            controller_loop(config, shared, shutdown)
+            controller_loop(config, source, shared, shutdown)
         })?
     };
 
@@ -229,6 +291,7 @@ fn run(config: Config) -> anyhow::Result<()> {
             shared: Arc::clone(&shared),
             budget: Arc::clone(&budget),
             stats: Arc::clone(&stats),
+            samples: Arc::clone(&samples),
             shutdown: Arc::clone(&shutdown),
             events: events_tx.clone(),
         };
@@ -246,6 +309,9 @@ fn run(config: Config) -> anyhow::Result<()> {
         let _ = w.join();
     }
     let _ = controller.join();
+    if let Some(t) = sampler {
+        let _ = t.join();
+    }
     if let Some(t) = events_thread {
         let _ = t.join();
     }
@@ -277,6 +343,7 @@ fn main() -> ExitCode {
         max_files_per_second = config.max_files_per_second,
         hot_threshold_secs = config.hot_threshold.as_secs(),
         dry_run = config.dry_run,
+        capacity_bytes = config.capacity_bytes.map(|c| c.get()),
         version = env!("CARGO_PKG_VERSION"),
         "kvreap starting"
     );

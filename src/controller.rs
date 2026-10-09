@@ -1,8 +1,10 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use crate::config::Percent;
+use crate::capacity::Samples;
+use crate::config::{CapacityBytes, Percent};
 
 pub const EMERGENCY_FLOOR: f64 = 97.0;
 
@@ -63,6 +65,32 @@ pub fn disk_usage(path: &Path) -> io::Result<DiskUsage> {
     })
 }
 
+/// Where the controller gets used and total bytes from.
+#[derive(Debug, Clone)]
+pub enum UsageSource {
+    Statvfs(PathBuf),
+    /// Sampled cache size against a configured capacity (`CAPACITY_BYTES`).
+    Sampled {
+        capacity: CapacityBytes,
+        samples: Arc<Samples>,
+    },
+}
+
+impl UsageSource {
+    /// `Ok(None)` while a sampled estimate is not available yet.
+    pub fn read(&self) -> io::Result<Option<DiskUsage>> {
+        match self {
+            Self::Statvfs(path) => disk_usage(path).map(Some),
+            Self::Sampled { capacity, samples } => {
+                Ok(samples.estimated_used_bytes().map(|used| DiskUsage {
+                    total_bytes: capacity.get(),
+                    used_bytes: used,
+                }))
+            }
+        }
+    }
+}
+
 /// Starts evicting at `cleanup`, stops at `target`, and drops pacing at or above `emergency`.
 #[derive(Debug, Clone, Copy)]
 pub struct Hysteresis {
@@ -120,8 +148,11 @@ impl SharedState {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::Percent;
-    use crate::controller::{DiskUsage, Hysteresis, Mode, SharedState, disk_usage};
+    use std::sync::Arc;
+
+    use crate::capacity::{BucketSample, Samples};
+    use crate::config::{Config, Percent};
+    use crate::controller::{DiskUsage, Hysteresis, Mode, SharedState, UsageSource, disk_usage};
 
     fn h(cleanup: f64, target: f64) -> Hysteresis {
         Hysteresis::new(
@@ -180,6 +211,50 @@ mod tests {
         let u = disk_usage(tmp.path()).expect("statvfs");
         assert!(u.total_bytes > 0);
         assert!(u.used_bytes <= u.total_bytes);
+    }
+
+    #[test]
+    fn statvfs_source_reads_the_mount() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let got = UsageSource::Statvfs(tmp.path().to_path_buf())
+            .read()
+            .expect("statvfs")
+            .expect("always available");
+        assert_eq!(
+            got.total_bytes,
+            disk_usage(tmp.path()).expect("statvfs").total_bytes
+        );
+        assert!(got.used_bytes <= got.total_bytes);
+    }
+
+    #[test]
+    fn sampled_source_uses_capacity_and_estimate() {
+        let capacity = Config::from_lookup(|k| (k == "CAPACITY_BYTES").then(|| "4000".into()))
+            .expect("config")
+            .capacity_bytes
+            .expect("capacity");
+        let samples = Arc::new(Samples::default());
+        let source = UsageSource::Sampled {
+            capacity,
+            samples: Arc::clone(&samples),
+        };
+        assert_eq!(source.read().expect("read"), None);
+        samples.set_bucket_count(10);
+        for _ in 0..64 {
+            samples.record(BucketSample {
+                files: 3,
+                bytes: 300,
+            });
+        }
+        let usage = source.read().expect("read").expect("estimate");
+        assert_eq!(
+            usage,
+            DiskUsage {
+                total_bytes: 4000,
+                used_bytes: 3000
+            }
+        );
+        assert_eq!(usage.percent(), 75.0);
     }
 
     #[test]

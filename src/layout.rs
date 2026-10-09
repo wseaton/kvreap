@@ -6,8 +6,11 @@
 //!         \_______ rank dir ______/ \bucket/ \_ leaf _/
 //! ```
 
+use std::ffi::CStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::fsops::{Entry, EntryKind};
 
 const HEX_MODULO_BASE: u8 = 16;
 
@@ -31,6 +34,19 @@ impl BlockHash {
     }
 }
 
+/// Regular files in a leaf listing that are named like block files.
+pub fn block_files(entries: &[Entry]) -> impl Iterator<Item = (&CStr, BlockHash)> {
+    entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::File)
+        .filter_map(|e| {
+            Some((
+                e.name.as_c_str(),
+                BlockHash::from_file_name(e.name.to_str().ok()?)?,
+            ))
+        })
+}
+
 /// The `[min, max]` range of `bucket % 16` values a worker owns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shard {
@@ -51,7 +67,7 @@ impl Shard {
     }
 
     pub fn owns_bucket(self, name: &str, bucket_len: usize) -> bool {
-        if name.len() != bucket_len {
+        if !is_bucket_name(name, bucket_len) {
             return false;
         }
         match u32::from_str_radix(name, 16) {
@@ -68,6 +84,10 @@ impl std::fmt::Display for Shard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:x}-{:x}", self.min, self.max)
     }
+}
+
+pub fn is_bucket_name(name: &str, bucket_len: usize) -> bool {
+    name.len() == bucket_len && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn is_hex_name(name: &str) -> bool {

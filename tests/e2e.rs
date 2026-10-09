@@ -141,6 +141,11 @@ fn usage_percent(path: &Path) -> f64 {
     (total - free) as f64 / total as f64 * 100.0
 }
 
+fn usage_total(path: &Path) -> u64 {
+    let st = rustix::fs::statvfs(path).expect("statvfs");
+    st.f_blocks * st.f_frsize
+}
+
 /// Tests that rely on pacing would be invalidated by the >=97% emergency band.
 fn assert_not_in_emergency_band(path: &Path) {
     let usage = usage_percent(path);
@@ -609,6 +614,98 @@ fn invalid_config_exits_nonzero_with_reason() {
         assert_eq!(status.code(), Some(1), "{env:?}: {stderr}");
         assert!(stderr.contains(needle), "{env:?}: {stderr}");
     }
+}
+
+#[test]
+fn capacity_bytes_drives_thresholds_instead_of_statvfs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(tmp.path());
+    let block_size = 64 * 1024;
+    let cold = cache.cold_blocks(60, block_size);
+    let hot = cache.hot_blocks(5, block_size);
+    // 65 blocks of 64 KiB against 5 MB is 85% used, whatever statvfs says.
+    let env = vec![
+        ("CAPACITY_BYTES", "5000000".to_string()),
+        ("CLEANUP_THRESHOLD", "50".to_string()),
+        ("TARGET_THRESHOLD", "30".to_string()),
+        ("LOGGER_INTERVAL_SECONDS", "0.05".to_string()),
+    ];
+    let mut ev = Evictor::start(tmp.path(), &env);
+    assert!(
+        ev.wait_for_log("sampled usage estimate ready", Duration::from_secs(10)),
+        "{}",
+        ev.log()
+    );
+    assert!(
+        ev.wait_for_log("DELETION_END", Duration::from_secs(60)),
+        "{}",
+        ev.log()
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let after_end = existing(&cold).len();
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        existing(&cold).len(),
+        after_end,
+        "deletions continued after DELETION_END\n{}",
+        ev.log()
+    );
+    assert!(ev.sigterm().success());
+
+    assert_eq!(existing(&hot).len(), hot.len(), "hot blocks must survive");
+    // 30% of 5 MB is 23 blocks; the estimate is sampled, so allow slack.
+    let left = after_end + hot.len();
+    assert!(
+        (10..=35).contains(&left),
+        "{left} blocks left, expected about 23\n{}",
+        ev.log()
+    );
+}
+
+#[test]
+fn capacity_bytes_ignores_statvfs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(tmp.path());
+    let cold = cache.cold_blocks(20, 64);
+    // statvfs on any real filesystem is far above 0.001% used; the estimate against 1 PB is not.
+    let mut env = always_evicting();
+    env.push(("CAPACITY_BYTES", "1000000000000000".into()));
+    let mut ev = Evictor::start(tmp.path(), &env);
+    assert!(
+        ev.wait_for_log("sampled usage estimate ready", Duration::from_secs(10)),
+        "{}",
+        ev.log()
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(ev.sigterm().success());
+    assert_eq!(existing(&cold).len(), cold.len());
+    let log = ev.log();
+    assert!(!log.contains("DELETION_START"), "{log}");
+    assert!(
+        !log.contains("more than 10x CAPACITY_BYTES"),
+        "statvfs is smaller than 1 PB\n{log}"
+    );
+}
+
+#[test]
+fn capacity_bytes_far_below_statvfs_warns_at_startup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    Cache::new(tmp.path());
+    assert!(usage_total(tmp.path()) > 10 * 1024 * 1024);
+    let env = vec![("CAPACITY_BYTES", "1048576".to_string())];
+    let mut ev = Evictor::start(tmp.path(), &env);
+    assert!(
+        ev.wait_for_log("more than 10x CAPACITY_BYTES", Duration::from_secs(10)),
+        "{}",
+        ev.log()
+    );
+    assert!(
+        ev.wait_for_log("sampled usage estimate ready", Duration::from_secs(10)),
+        "an empty cache is a known 0 bytes\n{}",
+        ev.log()
+    );
+    assert!(ev.sigterm().success());
+    assert!(!ev.log().contains("DELETION_START"));
 }
 
 static E2E_DIR_LOCK: Mutex<()> = Mutex::new(());
