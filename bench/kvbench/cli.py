@@ -48,6 +48,10 @@ def main() -> int:
         help="tokens of system prompt shared by churn prompts (0: fully random prompts)",
     )
     r.add_argument("--churn-shared-prefixes", type=int, default=1, help="distinct shared system prompts")
+    r.add_argument("--churn-input-len", type=int, default=4096, help="tokens per churn prompt")
+    r.add_argument("--hot-prefix-len", type=int, default=2048, help="tokens per repeated hot prefix")
+    r.add_argument("--max-model-len", type=int, default=8192)
+    r.add_argument("--gpu-blocks", type=int, default=4096, help="vLLM --num-gpu-blocks-override")
     r.add_argument("--gpu-memory-utilization", type=float, default=0.3)
     r.add_argument("--cpu-tier-gib", type=float, default=2.0, help="vLLM CPU offload tier size in GiB")
     r.add_argument("--tensor-parallel-size", type=int, default=1, help="vLLM TP size; requests that many GPUs")
@@ -106,6 +110,10 @@ def main() -> int:
         share_nfs_client=args.share_nfs_client,
         kv_events=args.kv_events,
         tensor_parallel_size=args.tensor_parallel_size,
+        churn_input_len=args.churn_input_len,
+        hot_prefix_len=args.hot_prefix_len,
+        max_model_len=args.max_model_len,
+        gpu_blocks=args.gpu_blocks,
         churn_shared_prefix_len=args.churn_shared_prefix_len,
         churn_shared_prefixes=args.churn_shared_prefixes,
         gpu_memory_utilization=args.gpu_memory_utilization,

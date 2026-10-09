@@ -115,3 +115,17 @@ def test_shared_prefix_settings_reach_the_loadgen() -> None:
     assert "--skip-chat-template" in script
     plain = {e["name"]: e["value"] for e in loadgen_manifest(cfg())["spec"]["containers"][0]["env"]}
     assert plain["SHARED_PREFIX_LEN"] == "0"
+
+
+def test_prompt_lengths_and_context_reach_vllm_and_loadgen() -> None:
+    from kvbench.run import loadgen_manifest
+
+    c = cfg(churn_input_len=16384, hot_prefix_len=8192, max_model_len=20480, gpu_blocks=12288)
+    container, _ = vllm_parts(c)
+    assert "--max-model-len=20480" in container["args"]
+    assert "--num-gpu-blocks-override=12288" in container["args"]
+    env = {e["name"]: e["value"] for e in loadgen_manifest(c)["spec"]["containers"][0]["env"]}
+    assert env["CHURN_INPUT_LEN"] == "16384"
+    assert env["HOT_PREFIX_LEN"] == "8192"
+    default, _ = vllm_parts(cfg())
+    assert "--max-model-len=8192" in default["args"]

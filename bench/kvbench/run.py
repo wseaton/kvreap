@@ -88,6 +88,7 @@ class RunConfig:
     offload_block_tokens: int = 16
     cpu_tier_bytes: int = 2 * 1024**3
     gpu_blocks: int = 4096
+    max_model_len: int = 8192
     churn_input_len: int = 4096
     churn_concurrency: int = 8
     churn_shared_prefix_len: int = 0
@@ -214,7 +215,7 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
     name = f"{cfg.run_id}-vllm"
     args = [
         "--port=8000",
-        "--max-model-len=8192",
+        f"--max-model-len={cfg.max_model_len}",
         f"--gpu-memory-utilization={cfg.gpu_memory_utilization}",
         f"--num-gpu-blocks-override={cfg.gpu_blocks}",
         f"--kv-transfer-config={json.dumps(kv_config)}",
