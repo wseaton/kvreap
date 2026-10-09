@@ -15,6 +15,7 @@ use crate::layout::BlockHash;
 const MEDIUM: &str = "SHARED_STORAGE";
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const SNDHWM: i32 = 100_000;
+const LINGER_MS: i32 = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Removed {
@@ -110,7 +111,7 @@ impl Publisher {
     pub fn bind(endpoint: &str) -> Result<Self, zmq::Error> {
         let ctx = zmq::Context::new();
         let socket = ctx.socket(zmq::PUB)?;
-        socket.set_linger(0)?;
+        socket.set_linger(LINGER_MS)?;
         socket.set_sndhwm(SNDHWM)?;
         socket.bind(endpoint)?;
         Ok(Self {

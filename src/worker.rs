@@ -4,7 +4,7 @@
 //!  loop while evicting:
 //!    bucket <- random <rank>/<hhh> owned by this worker's shard
 //!    statx every *.bin under bucket/*/  ──►  pool (oldest POOL_CAP cold files)
-//!    unlink the oldest ceil(sampled x EVICT_FRACTION) from the pool
+//!    unlink the oldest sampled x EVICT_FRACTION from the pool (fractions carry over)
 //! ```
 //!
 //! Work scales with the bytes to free, not with the size of the tree, and every
@@ -127,6 +127,7 @@ pub struct Worker {
     index: BucketIndex,
     fruitless_rounds: u32,
     backoff: Duration,
+    evict_credit: f64,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -145,6 +146,7 @@ impl Worker {
             index: BucketIndex::default(),
             fruitless_rounds: 0,
             backoff: BACKOFF_MIN,
+            evict_credit: 0.0,
         }
     }
 
@@ -153,13 +155,24 @@ impl Worker {
         while !self.ctx.shutdown.is_set() {
             if !self.ctx.shared.mode().is_evicting() {
                 self.pool.clear();
+                self.evict_credit = 0.0;
+                self.index.refreshed_at = None;
                 self.fruitless_rounds = 0;
                 self.backoff = BACKOFF_MIN;
                 self.ctx.shutdown.wait(IDLE_POLL);
                 continue;
             }
             match self.round() {
-                Ok(Some(r)) => self.after_round(&r),
+                Ok(Some(r)) => {
+                    if let Some(wait) = self.after_round(&r) {
+                        tracing::debug!(
+                            worker = self.id,
+                            ?wait,
+                            "no cold files found, backing off"
+                        );
+                        self.ctx.shutdown.wait(wait);
+                    }
+                }
                 Ok(None) => {
                     self.ctx.shutdown.wait(EMPTY_INDEX_RETRY);
                 }
@@ -172,18 +185,21 @@ impl Worker {
         tracing::info!(worker = self.id, "worker stopped");
     }
 
-    fn after_round(&mut self, r: &RoundResult) {
+    /// Updates backoff state; returns how long to back off, if at all.
+    fn after_round(&mut self, r: &RoundResult) -> Option<Duration> {
         if r.evicted > 0 {
             self.fruitless_rounds = 0;
             self.backoff = BACKOFF_MIN;
-            return;
+            return None;
         }
         self.fruitless_rounds += 1;
-        if self.fruitless_rounds >= FRUITLESS_ROUNDS_BEFORE_BACKOFF {
-            tracing::debug!(worker = self.id, backoff = ?self.backoff, "no cold files found, backing off");
-            self.ctx.shutdown.wait(self.backoff);
-            self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
+        if self.fruitless_rounds < FRUITLESS_ROUNDS_BEFORE_BACKOFF {
+            return None;
         }
+        self.index.refreshed_at = None;
+        let wait = self.backoff;
+        self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
+        Some(wait)
     }
 
     fn unpaced(&self) -> bool {
@@ -271,12 +287,10 @@ impl Worker {
             }
             Err(e) => return Err(e),
         };
-        let quota = if self.pool.len() == 0 {
-            0
-        } else {
-            ((sampled as f64 * EVICT_FRACTION).ceil() as usize).max(1)
-        };
-        let evicted = self.evict(quota);
+        self.evict_credit += sampled as f64 * EVICT_FRACTION;
+        let quota = self.evict_credit.floor();
+        self.evict_credit -= quota;
+        let evicted = self.evict(quota as usize);
         Ok(Some(RoundResult { sampled, evicted }))
     }
 
@@ -383,7 +397,7 @@ impl Worker {
             Stats::add(&self.ctx.stats.files_deleted, 1);
             return true;
         }
-        if !self.acquire() {
+        if !self.acquire() || !self.ctx.shared.mode().is_evicting() {
             return false;
         }
         match self.timed(OpKind::Unlink, || fsops::unlink_path(&c.path)) {
@@ -634,7 +648,7 @@ mod tests {
         let mut h = harness(config(&cache, &[]));
         h.shared.set_mode(Mode::Evicting);
 
-        // One round samples 4 files and evicts ceil(4 * 0.5) = 2: the two oldest.
+        // One round samples 4 files and evicts 4 * 0.5 = 2: the two oldest.
         h.worker.round().expect("round");
         assert_eq!(
             bins(&cache),
@@ -798,6 +812,30 @@ mod tests {
         run_rounds(&mut h, 10);
         assert_eq!(fs::read_dir(&leaf).expect("read").count(), 3);
         assert_eq!(Stats::get(&h.stats.files_deleted), 0);
+    }
+
+    #[test]
+    fn buckets_created_after_index_build_are_found() {
+        let fx = fixture(1, 3);
+        let mut h = harness(config(&fx.cache, &[]));
+        h.shared.set_mode(Mode::Evicting);
+        run_rounds(&mut h, 5);
+        assert_eq!(bins(&fx.cache).len(), 3, "the single cold block is gone");
+
+        let late = fx.cache.join("org-model_abcdef012345_r0/fff/ff_g0");
+        fs::create_dir_all(&late).expect("mkdir");
+        let f = late.join("fffff00000000000.bin");
+        fs::write(&f, b"x").expect("write");
+        age(&f, 7200);
+
+        for _ in 0..200 {
+            let r = h.worker.round().expect("round").expect("buckets");
+            let _ = h.worker.after_round(&r);
+            if !f.exists() {
+                return;
+            }
+        }
+        panic!("block in a bucket created after the index was built was never evicted");
     }
 
     #[test]

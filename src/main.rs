@@ -84,11 +84,14 @@ fn controller_loop(config: Arc<Config>, shared: Arc<SharedState>, shutdown: Arc<
                 shared.set_usage(pct);
                 let next = hysteresis.next(mode, pct);
                 if next != mode {
+                    let previous = mode;
+                    mode = next;
+                    shared.set_mode(mode);
                     let (used, total) = (
                         usage.used_bytes as f64 / GIB,
                         usage.total_bytes as f64 / GIB,
                     );
-                    match (mode.is_evicting(), next.is_evicting()) {
+                    match (previous.is_evicting(), next.is_evicting()) {
                         (false, true) => tracing::info!(
                             "DELETION_START: timestamp={:.3}, usage={pct:.2}%, used={used:.2}GB, total={total:.2}GB",
                             unix_now()
@@ -105,8 +108,6 @@ fn controller_loop(config: Arc<Config>, shared: Arc<SharedState>, shutdown: Arc<
                             "usage in emergency band, deleting without pacing"
                         );
                     }
-                    mode = next;
-                    shared.set_mode(mode);
                 }
             }
             Err(e) => tracing::warn!(error = %e, "statvfs failed"),
