@@ -82,6 +82,9 @@ def test_explicit_endpoint_wins_and_default_has_none() -> None:
 def test_tensor_parallel_requests_gpus_and_passes_the_flag() -> None:
     container, _ = vllm_parts(cfg(tensor_parallel_size=4))
     assert "--tensor-parallel-size=4" in container["args"]
+    assert "--gpu-memory-utilization=0.3" in container["args"]
+    tuned, _ = vllm_parts(cfg(gpu_memory_utilization=0.6))
+    assert "--gpu-memory-utilization=0.6" in tuned["args"]
     assert container["resources"]["requests"]["nvidia.com/gpu"] == "4"
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "4"
     single, _ = vllm_parts(cfg())

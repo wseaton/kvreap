@@ -81,6 +81,7 @@ class RunConfig:
     hf_pvc: str = "kvreap-bench-hf"
     hf_pvc_size: str = "50Gi"
     tensor_parallel_size: int = 1
+    gpu_memory_utilization: float = 0.3
     pull_secret: str = "quay-wseaton-pull"
     duration_s: int = 1200
     settle_s: int = 60
@@ -212,7 +213,7 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
     args = [
         "--port=8000",
         "--max-model-len=8192",
-        "--gpu-memory-utilization=0.3",
+        f"--gpu-memory-utilization={cfg.gpu_memory_utilization}",
         f"--num-gpu-blocks-override={cfg.gpu_blocks}",
         f"--kv-transfer-config={json.dumps(kv_config)}",
     ]
