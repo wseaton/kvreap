@@ -1,0 +1,859 @@
+//! Prefix-chain index built from vLLM's KV cache events.
+//!
+//! A prefix-cache lookup stops at the first missing block, so deleting block k
+//! of a chain makes every later block useless. vLLM publishes `BlockStored`
+//! events with each block's parent; this module keeps `block -> parent` and a
+//! per-block count of children still on disk, so the worker can delete dead and
+//! childless blocks before the heads that the rest of a chain depends on.
+//!
+//! ```text
+//!  root ──► b1 ──► b2 ──► b3        evict b3 (leaf) first: b2 becomes a leaf
+//!                    └──► b2'       evict b1 first: b2, b3, b2' are dead weight
+//! ```
+//!
+//! Wire format (vLLM `ZmqEventPublisher`): frames `[topic, seq u64 BE, payload]`,
+//! payload = msgpack `EventBatch` `[ts, [event, ...], dp_rank?]`. Events are
+//! msgspec tagged structs: maps keyed by field name with `"type"` as the tag
+//! (vLLM >= 0.12), or arrays with the tag first (older releases).
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use crate::config::ChainPolicy;
+use crate::layout::BlockHash;
+use crate::shutdown::Shutdown;
+use crate::stats::Stats;
+
+pub const INDEX_CAP: usize = 4 << 20;
+const RECV_TIMEOUT_MS: i32 = 500;
+const MAX_DEPTH: usize = 16;
+const MEDIUM_STORAGE: &str = "STORAGE";
+
+/// Where a block sat in its chain when it was deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Position {
+    /// No events seen for this block.
+    Untracked,
+    /// First block of a prompt (no parent).
+    Root,
+    /// Parent known but no longer on disk: unreachable by a prefix lookup.
+    Orphan,
+    /// Parent on disk and at least one child on disk.
+    Internal,
+    /// Parent on disk and no children on disk.
+    Leaf,
+}
+
+/// Eviction preference within the oldest pool candidates, best first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rank {
+    Dead,
+    Childless,
+    Overdue,
+    Interior,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Node {
+    parent: Option<BlockHash>,
+    children_on_disk: u32,
+    on_disk: bool,
+    generation: u64,
+}
+
+/// Bounded `block -> parent` map with on-disk child counts. When over `cap`,
+/// the oldest-inserted blocks are forgotten first.
+#[derive(Debug)]
+pub struct ChainIndex {
+    cap: usize,
+    nodes: HashMap<BlockHash, Node>,
+    order: VecDeque<(BlockHash, u64)>,
+    next_generation: u64,
+}
+
+impl ChainIndex {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            nodes: HashMap::new(),
+            order: VecDeque::new(),
+            next_generation: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn node_mut(&mut self, hash: BlockHash) -> &mut Node {
+        let generation = self.next_generation;
+        let created = !self.nodes.contains_key(&hash);
+        if created {
+            self.next_generation += 1;
+            self.order.push_back((hash, generation));
+        }
+        self.nodes.entry(hash).or_insert(Node {
+            parent: None,
+            children_on_disk: 0,
+            on_disk: false,
+            generation,
+        })
+    }
+
+    fn adjust_children(&mut self, parent: Option<BlockHash>, up: bool) {
+        let Some(p) = parent else {
+            return;
+        };
+        if up {
+            let n = self.node_mut(p);
+            n.children_on_disk = n.children_on_disk.saturating_add(1);
+        } else if let Some(n) = self.nodes.get_mut(&p) {
+            n.children_on_disk = n.children_on_disk.saturating_sub(1);
+            if !n.on_disk && n.children_on_disk == 0 {
+                self.nodes.remove(&p);
+            }
+        }
+    }
+
+    /// Records `hashes` as a chain hanging off `parent`, all now on disk.
+    pub fn store(&mut self, parent: Option<BlockHash>, hashes: &[BlockHash]) {
+        let mut parent = parent;
+        for &hash in hashes {
+            self.store_one(hash, parent);
+            parent = Some(hash);
+        }
+        self.enforce_cap();
+    }
+
+    fn store_one(&mut self, hash: BlockHash, parent: Option<BlockHash>) {
+        let node = *self.node_mut(hash);
+        if node.on_disk {
+            if node.parent.is_none() && parent.is_some() {
+                self.node_mut(hash).parent = parent;
+                self.adjust_children(parent, true);
+            }
+            return;
+        }
+        let parent = node.parent.or(parent);
+        let n = self.node_mut(hash);
+        n.on_disk = true;
+        n.parent = parent;
+        self.adjust_children(parent, true);
+    }
+
+    /// Marks `hash` gone from disk and returns where it sat in its chain.
+    pub fn remove(&mut self, hash: BlockHash) -> Position {
+        let position = self.position(hash);
+        let Some(node) = self.nodes.get_mut(&hash) else {
+            return position;
+        };
+        if !node.on_disk {
+            return position;
+        }
+        node.on_disk = false;
+        let (parent, children) = (node.parent, node.children_on_disk);
+        if children == 0 {
+            self.nodes.remove(&hash);
+        }
+        self.adjust_children(parent, false);
+        position
+    }
+
+    fn on_disk(&self, hash: BlockHash) -> bool {
+        self.nodes.get(&hash).is_some_and(|n| n.on_disk)
+    }
+
+    pub fn position(&self, hash: BlockHash) -> Position {
+        let Some(node) = self.nodes.get(&hash).filter(|n| n.on_disk) else {
+            return Position::Untracked;
+        };
+        match node.parent {
+            None => Position::Root,
+            Some(p) if !self.on_disk(p) => Position::Orphan,
+            Some(_) if node.children_on_disk > 0 => Position::Internal,
+            Some(_) => Position::Leaf,
+        }
+    }
+
+    pub fn rank(&self, hash: BlockHash, deferrals: u32, max_deferrals: u32) -> Rank {
+        let Some(node) = self.nodes.get(&hash).filter(|n| n.on_disk) else {
+            return Rank::Childless;
+        };
+        if node.parent.is_some_and(|p| !self.on_disk(p)) {
+            Rank::Dead
+        } else if node.children_on_disk == 0 {
+            Rank::Childless
+        } else if deferrals >= max_deferrals {
+            Rank::Overdue
+        } else {
+            Rank::Interior
+        }
+    }
+
+    fn enforce_cap(&mut self) {
+        while self.nodes.len() > self.cap {
+            let Some((hash, generation)) = self.order.pop_front() else {
+                break;
+            };
+            let current = self.nodes.get(&hash).filter(|n| n.generation == generation);
+            if let Some(node) = current.copied() {
+                self.nodes.remove(&hash);
+                if node.on_disk {
+                    self.adjust_children(node.parent, false);
+                }
+            }
+        }
+        if self.order.len() > self.cap.saturating_mul(2) {
+            let nodes = &self.nodes;
+            self.order
+                .retain(|(h, g)| nodes.get(h).is_some_and(|n| n.generation == *g));
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ChainStats {
+    pub batches: AtomicU64,
+    pub decode_errors: AtomicU64,
+    pub blocks_stored: AtomicU64,
+    pub deleted_untracked: AtomicU64,
+    pub deleted_root: AtomicU64,
+    pub deleted_orphan: AtomicU64,
+    pub deleted_internal: AtomicU64,
+    pub deleted_leaf: AtomicU64,
+    pub deferrals: AtomicU64,
+}
+
+/// The index shared by the subscriber and every worker.
+#[derive(Debug)]
+pub struct Chains {
+    index: Mutex<ChainIndex>,
+    pub policy: ChainPolicy,
+    pub max_deferrals: u32,
+    pub stats: ChainStats,
+}
+
+impl Chains {
+    pub fn new(cap: usize, policy: ChainPolicy, max_deferrals: u32) -> Self {
+        Self {
+            index: Mutex::new(ChainIndex::new(cap)),
+            policy,
+            max_deferrals,
+            stats: ChainStats::default(),
+        }
+    }
+
+    fn index(&self) -> MutexGuard<'_, ChainIndex> {
+        self.index.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn rank(&self, hash: BlockHash, deferrals: u32) -> Rank {
+        self.index().rank(hash, deferrals, self.max_deferrals)
+    }
+
+    /// Records a deletion by kvreap and counts its chain position.
+    pub fn deleted(&self, hash: BlockHash) -> Position {
+        let position = self.index().remove(hash);
+        let counter = match position {
+            Position::Untracked => &self.stats.deleted_untracked,
+            Position::Root => &self.stats.deleted_root,
+            Position::Orphan => &self.stats.deleted_orphan,
+            Position::Internal => &self.stats.deleted_internal,
+            Position::Leaf => &self.stats.deleted_leaf,
+        };
+        Stats::add(counter, 1);
+        position
+    }
+
+    pub fn apply(&self, events: &[KvEvent]) {
+        let mut index = self.index();
+        for event in events {
+            match event {
+                KvEvent::Stored { parent, hashes, .. } => {
+                    index.store(*parent, hashes);
+                    Stats::add(&self.stats.blocks_stored, hashes.len() as u64);
+                }
+                KvEvent::Removed { hashes, medium }
+                    if medium.as_deref() == Some(MEDIUM_STORAGE) =>
+                {
+                    for &h in hashes {
+                        index.remove(h);
+                    }
+                }
+                KvEvent::Removed { .. } | KvEvent::Other => {}
+            }
+        }
+    }
+
+    pub fn log_status(&self) {
+        let s = &self.stats;
+        let (root, orphan) = (Stats::get(&s.deleted_root), Stats::get(&s.deleted_orphan));
+        tracing::info!(
+            policy = ?self.policy,
+            index_blocks = self.index().len(),
+            event_batches = Stats::get(&s.batches),
+            decode_errors = Stats::get(&s.decode_errors),
+            blocks_stored = Stats::get(&s.blocks_stored),
+            deleted_heads = root + orphan,
+            deleted_root = root,
+            deleted_orphan = orphan,
+            deleted_internal = Stats::get(&s.deleted_internal),
+            deleted_leaf = Stats::get(&s.deleted_leaf),
+            deleted_untracked = Stats::get(&s.deleted_untracked),
+            deferrals = Stats::get(&s.deferrals),
+            "chains"
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KvEvent {
+    Stored {
+        parent: Option<BlockHash>,
+        hashes: Vec<BlockHash>,
+        medium: Option<String>,
+    },
+    Removed {
+        hashes: Vec<BlockHash>,
+        medium: Option<String>,
+    },
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DecodeError {
+    #[error("truncated msgpack")]
+    Truncated,
+    #[error("unsupported msgpack marker 0x{0:02x}")]
+    Marker(u8),
+    #[error("msgpack nested too deep")]
+    TooDeep,
+    #[error("payload is not an EventBatch")]
+    Shape,
+}
+
+/// The subset of msgpack values the event decoder needs.
+#[derive(Debug, Clone, PartialEq)]
+enum Value<'a> {
+    UInt(u64),
+    Int(i64),
+    Str(&'a [u8]),
+    Bin(&'a [u8]),
+    Array(Vec<Value<'a>>),
+    Map(Vec<(Value<'a>, Value<'a>)>),
+    /// nil, booleans, floats and extension types: skipped, never inspected.
+    Other,
+}
+
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+        let end = self.pos.checked_add(n).ok_or(DecodeError::Truncated)?;
+        let out = self.buf.get(self.pos..end).ok_or(DecodeError::Truncated)?;
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn be<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+        self.take(N)?.try_into().map_err(|_| DecodeError::Truncated)
+    }
+
+    fn len(&mut self, bytes: usize) -> Result<usize, DecodeError> {
+        let n = match bytes {
+            1 => u64::from(u8::from_be_bytes(self.be()?)),
+            2 => u64::from(u16::from_be_bytes(self.be()?)),
+            _ => u64::from(u32::from_be_bytes(self.be()?)),
+        };
+        let n = usize::try_from(n).map_err(|_| DecodeError::Truncated)?;
+        if n > self.buf.len() {
+            return Err(DecodeError::Truncated);
+        }
+        Ok(n)
+    }
+
+    fn array(&mut self, n: usize, depth: usize) -> Result<Value<'a>, DecodeError> {
+        (0..n)
+            .map(|_| self.value(depth + 1))
+            .collect::<Result<_, _>>()
+            .map(Value::Array)
+    }
+
+    fn map(&mut self, n: usize, depth: usize) -> Result<Value<'a>, DecodeError> {
+        (0..n)
+            .map(|_| Ok((self.value(depth + 1)?, self.value(depth + 1)?)))
+            .collect::<Result<_, _>>()
+            .map(Value::Map)
+    }
+
+    fn ext(&mut self, n: usize) -> Result<Value<'a>, DecodeError> {
+        self.take(n + 1).map(|_| Value::Other)
+    }
+
+    fn value(&mut self, depth: usize) -> Result<Value<'a>, DecodeError> {
+        if depth > MAX_DEPTH {
+            return Err(DecodeError::TooDeep);
+        }
+        let [m] = self.be::<1>()?;
+        Ok(match m {
+            0x00..=0x7f => Value::UInt(u64::from(m)),
+            0x80..=0x8f => self.map(usize::from(m & 0x0f), depth)?,
+            0x90..=0x9f => self.array(usize::from(m & 0x0f), depth)?,
+            0xa0..=0xbf => Value::Str(self.take(usize::from(m & 0x1f))?),
+            0xc0 | 0xc2 | 0xc3 => Value::Other,
+            0xc4..=0xc6 => {
+                let n = self.len(1 << (m - 0xc4))?;
+                Value::Bin(self.take(n)?)
+            }
+            0xc7..=0xc9 => {
+                let n = self.len(1 << (m - 0xc7))?;
+                self.ext(n)?
+            }
+            0xca => self.take(4).map(|_| Value::Other)?,
+            0xcb => self.take(8).map(|_| Value::Other)?,
+            0xcc => Value::UInt(u64::from(u8::from_be_bytes(self.be()?))),
+            0xcd => Value::UInt(u64::from(u16::from_be_bytes(self.be()?))),
+            0xce => Value::UInt(u64::from(u32::from_be_bytes(self.be()?))),
+            0xcf => Value::UInt(u64::from_be_bytes(self.be()?)),
+            0xd0 => Value::Int(i64::from(i8::from_be_bytes(self.be()?))),
+            0xd1 => Value::Int(i64::from(i16::from_be_bytes(self.be()?))),
+            0xd2 => Value::Int(i64::from(i32::from_be_bytes(self.be()?))),
+            0xd3 => Value::Int(i64::from_be_bytes(self.be()?)),
+            0xd4..=0xd8 => self.ext(1 << (m - 0xd4))?,
+            0xd9..=0xdb => {
+                let n = self.len(1 << (m - 0xd9))?;
+                Value::Str(self.take(n)?)
+            }
+            0xdc | 0xdd => {
+                let n = self.len(2 << (m - 0xdc))?;
+                self.array(n, depth)?
+            }
+            0xde | 0xdf => {
+                let n = self.len(2 << (m - 0xde))?;
+                self.map(n, depth)?
+            }
+            0xe0..=0xff => Value::Int(i64::from(i8::from_be_bytes([m]))),
+            other => return Err(DecodeError::Marker(other)),
+        })
+    }
+}
+
+fn parse(buf: &[u8]) -> Result<Value<'_>, DecodeError> {
+    Reader { buf, pos: 0 }.value(0)
+}
+
+/// Low 64 bits of a block hash, matching `BlockHash::from_file_name`.
+fn block_hash(v: &Value<'_>) -> Option<BlockHash> {
+    match v {
+        Value::UInt(n) => Some(BlockHash(*n)),
+        Value::Int(n) => Some(BlockHash(u64::from_ne_bytes(n.to_ne_bytes()))),
+        Value::Bin(b) => {
+            let tail = &b[b.len().saturating_sub(8)..];
+            Some(BlockHash(
+                tail.iter().fold(0u64, |acc, &x| (acc << 8) | u64::from(x)),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn hashes(v: Option<&Value<'_>>) -> Vec<BlockHash> {
+    match v {
+        Some(Value::Array(items)) => items.iter().filter_map(block_hash).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn string(v: Option<&Value<'_>>) -> Option<String> {
+    match v {
+        Some(Value::Str(s)) => std::str::from_utf8(s).ok().map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// A tagged struct's fields: by name when map-encoded, by position when array-encoded.
+enum Fields<'v, 'a> {
+    Map(&'v [(Value<'a>, Value<'a>)]),
+    Array(&'v [Value<'a>]),
+}
+
+impl<'v, 'a> Fields<'v, 'a> {
+    fn get(&self, name: &str, index: usize) -> Option<&'v Value<'a>> {
+        match self {
+            Self::Map(entries) => entries
+                .iter()
+                .find(|(k, _)| matches!(k, Value::Str(s) if *s == name.as_bytes()))
+                .map(|(_, v)| v),
+            Self::Array(items) => items.get(index),
+        }
+    }
+}
+
+fn event(v: &Value<'_>) -> KvEvent {
+    let fields = match v {
+        Value::Map(entries) => Fields::Map(entries),
+        Value::Array(items) => Fields::Array(items),
+        _ => return KvEvent::Other,
+    };
+    match string(fields.get("type", 0)).as_deref() {
+        Some("BlockStored") => KvEvent::Stored {
+            hashes: hashes(fields.get("block_hashes", 1)),
+            parent: fields.get("parent_block_hash", 2).and_then(block_hash),
+            medium: string(fields.get("medium", 6)),
+        },
+        Some("BlockRemoved") => KvEvent::Removed {
+            hashes: hashes(fields.get("block_hashes", 1)),
+            medium: string(fields.get("medium", 2)),
+        },
+        _ => KvEvent::Other,
+    }
+}
+
+/// Decodes an `EventBatch` payload. Events wrapped as msgpack bin (the
+/// llm-d storage publisher's format) are unwrapped.
+pub fn decode_batch(payload: &[u8]) -> Result<Vec<KvEvent>, DecodeError> {
+    let Value::Array(batch) = parse(payload)? else {
+        return Err(DecodeError::Shape);
+    };
+    let Some(Value::Array(events)) = batch.get(1) else {
+        return Err(DecodeError::Shape);
+    };
+    events
+        .iter()
+        .map(|e| match e {
+            Value::Bin(inner) => parse(inner).map(|v| event(&v)),
+            other => Ok(event(other)),
+        })
+        .collect()
+}
+
+/// Subscribes to every endpoint and feeds decoded batches into `chains` until shutdown.
+pub fn subscribe(
+    endpoints: &[String],
+    chains: &Arc<Chains>,
+    shutdown: &Shutdown,
+) -> Result<(), zmq::Error> {
+    let ctx = zmq::Context::new();
+    let sub = ctx.socket(zmq::SUB)?;
+    sub.set_subscribe(b"")?;
+    sub.set_rcvtimeo(RECV_TIMEOUT_MS)?;
+    sub.set_rcvhwm(0)?;
+    for endpoint in endpoints {
+        sub.connect(endpoint)?;
+        tracing::info!(endpoint, "subscribed to KV cache events");
+    }
+    while !shutdown.is_set() {
+        let frames = match sub.recv_multipart(0) {
+            Ok(f) => f,
+            Err(zmq::Error::EAGAIN) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, "KV events receive failed");
+                shutdown.wait(Duration::from_millis(100));
+                continue;
+            }
+        };
+        let Some(payload) = frames.last() else {
+            continue;
+        };
+        match decode_batch(payload) {
+            Ok(events) => {
+                Stats::add(&chains.stats.batches, 1);
+                chains.apply(&events);
+            }
+            Err(e) => {
+                Stats::add(&chains.stats.decode_errors, 1);
+                tracing::debug!(error = %e, "undecodable KV events batch");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use crate::chains::{
+        ChainIndex, Chains, DecodeError, KvEvent, Position, Rank, decode_batch, subscribe,
+    };
+    use crate::config::ChainPolicy;
+    use crate::layout::BlockHash;
+    use crate::shutdown::Shutdown;
+    use crate::stats::Stats;
+
+    fn h(n: u64) -> BlockHash {
+        BlockHash(n)
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    // Generated with msgspec from vLLM v0.31.0's kv_events.py structs: one
+    // BlockStored of [0x11, 0x12] (root), one of [0x13] with parent 0x12, a GPU
+    // BlockRemoved of 0x12, a STORAGE BlockRemoved of 0x13, AllBlocksCleared.
+    // Hashes are 32 bytes (0xaa * 24 + the u64).
+    const GOLDEN_V031: &str = "93cb41da39de00200000958aa474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657392c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000011c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000012b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473dc0020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1faa626c6f636b5f73697a6510a76c6f72615f6964c0a66d656469756da3475055a96c6f72615f6e616d65c0a967726f75705f69647800b26b765f63616368655f737065635f6b696e64ae66756c6c5f617474656e74696f6e88a474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657391c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000013b1706172656e745f626c6f636b5f68617368c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000012a9746f6b656e5f696473dc0010000102030405060708090a0b0c0d0e0faa626c6f636b5f73697a6510a76c6f72615f6964c0a66d656469756da3475055a96c6f72615f6e616d65c083a474797065ac426c6f636b52656d6f766564ac626c6f636b5f68617368657391c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000012a66d656469756da347505584a474797065ac426c6f636b52656d6f766564ac626c6f636b5f68617368657391c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000013a66d656469756da753544f52414745a967726f75705f6964780081a474797065b0416c6c426c6f636b73436c656172656400";
+    // Same, with array_like tagged events (vLLM <= 0.11) and int hashes.
+    const GOLDEN_LEGACY: &str = "93cb41da39de002000009297ab426c6f636b53746f7265649221222092010210c0a347505593ac426c6f636b52656d6f7665649122a753544f52414745c0";
+
+    fn stored(parent: Option<u64>, hashes: &[u64], medium: &str) -> KvEvent {
+        KvEvent::Stored {
+            parent: parent.map(BlockHash),
+            hashes: hashes.iter().copied().map(BlockHash).collect(),
+            medium: Some(medium.to_string()),
+        }
+    }
+
+    fn removed(hashes: &[u64], medium: &str) -> KvEvent {
+        KvEvent::Removed {
+            hashes: hashes.iter().copied().map(BlockHash).collect(),
+            medium: Some(medium.to_string()),
+        }
+    }
+
+    #[test]
+    fn decodes_vllm_031_map_encoded_batch() {
+        let events = decode_batch(&unhex(GOLDEN_V031)).expect("decode");
+        assert_eq!(
+            events,
+            vec![
+                stored(None, &[0x11, 0x12], "GPU"),
+                stored(Some(0x12), &[0x13], "GPU"),
+                removed(&[0x12], "GPU"),
+                removed(&[0x13], "STORAGE"),
+                KvEvent::Other,
+            ]
+        );
+    }
+
+    #[test]
+    fn decodes_legacy_array_encoded_batch() {
+        let events = decode_batch(&unhex(GOLDEN_LEGACY)).expect("decode");
+        assert_eq!(
+            events,
+            vec![
+                stored(Some(0x20), &[0x21, 0x22], "GPU"),
+                removed(&[0x22], "STORAGE"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bin_wrapped_events_are_unwrapped() {
+        // [ts, [bin(["BlockRemoved", [7], "STORAGE"])]], the llm-d storage publisher format.
+        let inner = unhex("93ac426c6f636b52656d6f7665649107a753544f52414745");
+        let mut payload = unhex("92cb41da39de0020000091c4");
+        payload.push(u8::try_from(inner.len()).expect("small"));
+        payload.extend(&inner);
+        assert_eq!(
+            decode_batch(&payload).expect("decode"),
+            vec![removed(&[7], "STORAGE")]
+        );
+    }
+
+    #[test]
+    fn truncated_and_malformed_payloads_are_errors() {
+        let full = unhex(GOLDEN_V031);
+        for cut in [1, 10, full.len() / 2, full.len() - 1] {
+            assert!(decode_batch(&full[..cut]).is_err(), "cut at {cut}");
+        }
+        assert_eq!(decode_batch(&unhex("c0")), Err(DecodeError::Shape));
+        assert_eq!(
+            decode_batch(&unhex("92cb41da39de00200000c0")),
+            Err(DecodeError::Shape)
+        );
+        assert_eq!(decode_batch(&unhex("c1")), Err(DecodeError::Marker(0xc1)));
+        let deep: Vec<u8> = std::iter::repeat_n(0x91, 64).chain([0xc0]).collect();
+        assert_eq!(decode_batch(&deep), Err(DecodeError::TooDeep));
+        // A bin length far past the end must not allocate or panic.
+        assert_eq!(
+            decode_batch(&unhex("c6ffffffff")),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    #[test]
+    fn chain_positions_follow_the_tree() {
+        let mut ix = ChainIndex::new(100);
+        ix.store(None, &[h(1), h(2), h(3)]);
+        ix.store(Some(h(2)), &[h(4)]);
+        assert_eq!(ix.position(h(1)), Position::Root);
+        assert_eq!(ix.position(h(2)), Position::Internal);
+        assert_eq!(ix.position(h(3)), Position::Leaf);
+        assert_eq!(ix.position(h(4)), Position::Leaf);
+        assert_eq!(ix.position(h(99)), Position::Untracked);
+
+        assert_eq!(ix.remove(h(3)), Position::Leaf);
+        assert_eq!(ix.position(h(2)), Position::Internal, "4 is still on disk");
+        assert_eq!(ix.remove(h(4)), Position::Leaf);
+        assert_eq!(ix.position(h(2)), Position::Leaf);
+        assert_eq!(ix.remove(h(2)), Position::Leaf);
+        assert_eq!(ix.position(h(1)), Position::Root);
+        assert_eq!(ix.remove(h(1)), Position::Root);
+        assert_eq!(ix.len(), 0, "fully deleted chains leave nothing behind");
+    }
+
+    #[test]
+    fn head_first_deletion_orphans_the_rest() {
+        let mut ix = ChainIndex::new(100);
+        ix.store(None, &[h(1), h(2), h(3)]);
+        assert_eq!(ix.remove(h(1)), Position::Root);
+        assert_eq!(ix.position(h(2)), Position::Orphan);
+        assert_eq!(ix.rank(h(2), 0, 3), Rank::Dead);
+        assert_eq!(ix.remove(h(2)), Position::Orphan);
+        assert_eq!(ix.remove(h(3)), Position::Orphan);
+        assert_eq!(ix.len(), 0);
+    }
+
+    #[test]
+    fn duplicate_stores_do_not_inflate_child_counts() {
+        let mut ix = ChainIndex::new(100);
+        ix.store(None, &[h(1), h(2)]);
+        ix.store(None, &[h(1), h(2)]);
+        ix.store(Some(h(1)), &[h(2)]);
+        assert_eq!(ix.remove(h(2)), Position::Leaf);
+        assert_eq!(ix.rank(h(1), 0, 3), Rank::Childless);
+    }
+
+    #[test]
+    fn restore_after_deletion_counts_again() {
+        let mut ix = ChainIndex::new(100);
+        ix.store(None, &[h(1), h(2)]);
+        ix.remove(h(2));
+        ix.store(Some(h(1)), &[h(2)]);
+        assert_eq!(ix.rank(h(1), 0, 3), Rank::Interior);
+        assert_eq!(ix.remove(h(1)), Position::Root);
+        assert_eq!(ix.position(h(2)), Position::Orphan);
+        ix.store(None, &[h(1)]);
+        assert_eq!(ix.position(h(2)), Position::Leaf, "parent rewritten");
+        assert_eq!(ix.position(h(1)), Position::Root);
+        assert_eq!(ix.rank(h(1), 0, 3), Rank::Interior);
+    }
+
+    #[test]
+    fn late_parent_fills_in_a_placeholder_store() {
+        let mut ix = ChainIndex::new(100);
+        ix.store(None, &[h(1)]);
+        ix.store(None, &[h(2)]);
+        assert_eq!(ix.position(h(2)), Position::Root);
+        ix.store(Some(h(1)), &[h(2)]);
+        assert_eq!(ix.position(h(2)), Position::Leaf);
+        assert_eq!(ix.position(h(1)), Position::Root);
+        assert_eq!(ix.rank(h(1), 0, 3), Rank::Interior);
+    }
+
+    #[test]
+    fn rank_orders_dead_childless_overdue_interior() {
+        let mut ix = ChainIndex::new(100);
+        ix.store(None, &[h(1), h(2), h(3)]);
+        assert_eq!(ix.rank(h(3), 0, 2), Rank::Childless);
+        assert_eq!(ix.rank(h(2), 0, 2), Rank::Interior);
+        assert_eq!(ix.rank(h(2), 1, 2), Rank::Interior);
+        assert_eq!(ix.rank(h(2), 2, 2), Rank::Overdue);
+        assert_eq!(ix.rank(h(77), 0, 2), Rank::Childless, "untracked");
+        ix.remove(h(1));
+        assert_eq!(ix.rank(h(2), 0, 2), Rank::Dead);
+        assert!(Rank::Dead < Rank::Childless);
+        assert!(Rank::Childless < Rank::Overdue);
+        assert!(Rank::Overdue < Rank::Interior);
+    }
+
+    #[test]
+    fn cap_forgets_oldest_blocks_and_releases_their_parents() {
+        let mut ix = ChainIndex::new(3);
+        ix.store(None, &[h(1), h(2)]);
+        ix.store(None, &[h(10), h(11)]);
+        assert!(ix.len() <= 3);
+        assert_eq!(ix.position(h(1)), Position::Untracked);
+        assert_eq!(ix.position(h(11)), Position::Leaf);
+        // 2 was forgotten too or its parent is gone; either way it is not Internal.
+        assert_ne!(ix.position(h(2)), Position::Internal);
+
+        let mut ix = ChainIndex::new(1000);
+        for i in 0..10_000u64 {
+            ix.store(None, &[h(i)]);
+            ix.remove(h(i));
+        }
+        assert_eq!(ix.len(), 0);
+        let mut ix = ChainIndex::new(10);
+        for i in 0..10_000u64 {
+            ix.store(Some(h(i)), &[h(i + 1)]);
+        }
+        assert!(ix.len() <= 10);
+        assert!(ix.order.len() <= 21, "stale order entries are compacted");
+    }
+
+    #[test]
+    fn chains_counts_deletions_and_ignores_non_storage_removals() {
+        let chains = Chains::new(100, ChainPolicy::TailFirst, 2);
+        chains.apply(&[stored(None, &[1, 2, 3], "GPU"), removed(&[3], "GPU")]);
+        assert_eq!(
+            chains.rank(h(2), 0),
+            Rank::Interior,
+            "GPU removal is not a disk removal"
+        );
+        chains.apply(&[removed(&[3], "STORAGE")]);
+        assert_eq!(chains.rank(h(2), 0), Rank::Childless);
+        assert_eq!(chains.deleted(h(1)), Position::Root);
+        assert_eq!(chains.deleted(h(2)), Position::Orphan);
+        assert_eq!(chains.deleted(h(9)), Position::Untracked);
+        let s = &chains.stats;
+        assert_eq!(Stats::get(&s.blocks_stored), 3);
+        assert_eq!(Stats::get(&s.deleted_root), 1);
+        assert_eq!(Stats::get(&s.deleted_orphan), 1);
+        assert_eq!(Stats::get(&s.deleted_untracked), 1);
+        assert_eq!(Stats::get(&s.deleted_leaf), 0);
+    }
+
+    #[test]
+    fn subscriber_applies_batches_from_a_real_pub_socket() {
+        let ctx = zmq::Context::new();
+        let publisher = ctx.socket(zmq::PUB).expect("pub");
+        publisher.bind("tcp://127.0.0.1:*").expect("bind");
+        let endpoint = publisher
+            .get_last_endpoint()
+            .expect("endpoint")
+            .expect("utf8");
+        let chains = Arc::new(Chains::new(100, ChainPolicy::TailFirst, 2));
+        let shutdown = Arc::new(Shutdown::default());
+        let handle = {
+            let (chains, shutdown) = (Arc::clone(&chains), Arc::clone(&shutdown));
+            std::thread::spawn(move || subscribe(&[endpoint], &chains, &shutdown))
+        };
+        let payload = unhex(GOLDEN_V031);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Stats::get(&chains.stats.batches) == 0 && Instant::now() < deadline {
+            publisher
+                .send_multipart([b"".as_slice(), &1u64.to_be_bytes(), &payload], 0)
+                .expect("send");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        publisher
+            .send_multipart([b"".as_slice(), &2u64.to_be_bytes(), b"\xc1"], 0)
+            .expect("send");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Stats::get(&chains.stats.decode_errors) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        shutdown.trigger();
+        handle.join().expect("join").expect("subscribe");
+        assert!(Stats::get(&chains.stats.batches) >= 1);
+        assert_eq!(Stats::get(&chains.stats.decode_errors), 1);
+        assert_eq!(
+            chains.rank(h(0x12), 0),
+            Rank::Childless,
+            "0x13 removed from STORAGE"
+        );
+        assert_eq!(chains.deleted(h(0x11)), Position::Root);
+    }
+}

@@ -497,6 +497,151 @@ fn publishes_block_removed_events_for_every_deletion() {
     assert_eq!(got, want);
 }
 
+#[cfg(feature = "events")]
+/// A vLLM 0.31 `EventBatch` with one map-encoded `BlockStored` for `chain`
+/// (root first), hashes as 32-byte digests whose low 64 bits are the block hash.
+fn block_stored_batch(chain: &[u64]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let w = &mut buf;
+    rmp::encode::write_array_len(w, 3).expect("encode");
+    rmp::encode::write_f64(w, 1_760_000_000.5).expect("encode");
+    rmp::encode::write_array_len(w, 1).expect("encode");
+    rmp::encode::write_map_len(w, 4).expect("encode");
+    rmp::encode::write_str(w, "type").expect("encode");
+    rmp::encode::write_str(w, "BlockStored").expect("encode");
+    rmp::encode::write_str(w, "block_hashes").expect("encode");
+    rmp::encode::write_array_len(w, u32::try_from(chain.len()).expect("len")).expect("encode");
+    for h in chain {
+        let mut digest = [0xaau8; 32];
+        digest[24..].copy_from_slice(&h.to_be_bytes());
+        rmp::encode::write_bin(w, &digest).expect("encode");
+    }
+    rmp::encode::write_str(w, "parent_block_hash").expect("encode");
+    rmp::encode::write_nil(w).expect("encode");
+    rmp::encode::write_str(w, "medium").expect("encode");
+    rmp::encode::write_str(w, "GPU").expect("encode");
+    rmp::encode::write_uint(w, 0).expect("encode");
+    buf
+}
+
+#[cfg(feature = "events")]
+/// Runs kvreap over one 40-block chain in a single bucket, head oldest, with
+/// the chain announced over a real ZMQ PUB; returns the final `chains` status line.
+fn evict_announced_chain(policy: &str) -> String {
+    const LEN: u64 = 40;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(tmp.path());
+    // Built and aged out of kvreap's sight, then renamed in, so no round sees a half-aged chain.
+    let staging = Cache::new(&tmp.path().join("staging"));
+    let chain: Vec<u64> = (0..LEN).map(|i| 0xabc0_0000_0000_0000 + i).collect();
+    for (i, &h) in chain.iter().enumerate() {
+        staging.write_block(h, 64, Some(COLD_AGE + Duration::from_secs(LEN - i as u64)));
+    }
+    let blocks: Vec<Block> = chain
+        .iter()
+        .map(|&hash| Block {
+            hash,
+            path: cache.block_path(hash),
+        })
+        .collect();
+
+    let ctx = zmq::Context::new();
+    let publisher = ctx.socket(zmq::PUB).expect("pub socket");
+    publisher.bind("tcp://127.0.0.1:*").expect("bind");
+    let endpoint = publisher
+        .get_last_endpoint()
+        .expect("endpoint")
+        .expect("utf8");
+    let mut env = always_evicting();
+    env.push(("KV_EVENTS_ENDPOINTS", endpoint));
+    env.push(("CHAIN_EVICTION", policy.into()));
+    env.push(("CHAIN_MAX_DEFERRALS", "1000".into()));
+    env.push(("NUM_CRAWLER_PROCESSES", "1".into()));
+    let mut ev = Evictor::start(tmp.path(), &env);
+    assert!(
+        ev.wait_for_log("subscribed to KV cache events", Duration::from_secs(10)),
+        "{}",
+        ev.log()
+    );
+    // PUB drops messages until the subscription propagates; stores are idempotent.
+    let batch = block_stored_batch(&chain);
+    for seq in 0u64..50 {
+        publisher
+            .send_multipart([b"".as_slice(), &seq.to_be_bytes(), &batch], 0)
+            .expect("publish");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    fs::rename(staging.rank(), cache.rank()).expect("move chain into the cache");
+    assert!(
+        wait_until(Duration::from_secs(90), || existing(&blocks).is_empty()),
+        "left: {}\n{}",
+        existing(&blocks).len(),
+        ev.log()
+    );
+    assert!(ev.sigterm().success());
+    ev.log()
+        .lines()
+        .rev()
+        .find(|l| l.contains(" chains "))
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("no chains status line\n{}", ev.log()))
+}
+
+#[cfg(feature = "events")]
+fn counter(line: &str, name: &str) -> u64 {
+    line.split_whitespace()
+        .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("{name} missing from {line}"))
+}
+
+#[cfg(feature = "events")]
+#[test]
+fn tail_first_eviction_deletes_announced_chain_from_the_leaf() {
+    let line = evict_announced_chain("tail-first");
+    assert!(counter(&line, "event_batches") > 0, "{line}");
+    assert_eq!(counter(&line, "decode_errors"), 0, "{line}");
+    assert_eq!(counter(&line, "deleted_leaf"), 39, "{line}");
+    assert_eq!(counter(&line, "deleted_root"), 1, "{line}");
+    assert_eq!(counter(&line, "deleted_orphan"), 0, "{line}");
+    assert_eq!(counter(&line, "deleted_untracked"), 0, "{line}");
+}
+
+#[cfg(feature = "events")]
+#[test]
+fn observe_eviction_deletes_announced_chain_head_first() {
+    let line = evict_announced_chain("observe");
+    assert_eq!(counter(&line, "deleted_root"), 1, "{line}");
+    assert_eq!(counter(&line, "deleted_orphan"), 39, "{line}");
+    assert_eq!(counter(&line, "deleted_leaf"), 0, "{line}");
+    assert_eq!(counter(&line, "deferrals"), 0, "{line}");
+}
+
+#[cfg(not(feature = "events"))]
+#[test]
+fn kv_events_endpoints_without_events_feature_warns_and_evicts_oldest_first() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(tmp.path());
+    let cold = cache.cold_blocks(10, 64);
+    let mut env = always_evicting();
+    env.push(("KV_EVENTS_ENDPOINTS", "tcp://127.0.0.1:5557".into()));
+    let mut ev = Evictor::start(tmp.path(), &env);
+    assert!(
+        ev.wait_for_log(
+            "KV_EVENTS_ENDPOINTS is set but this build has no events support",
+            Duration::from_secs(10)
+        ),
+        "{}",
+        ev.log()
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || existing(&cold).is_empty()),
+        "{}",
+        ev.log()
+    );
+    assert!(ev.sigterm().success());
+}
+
 #[test]
 fn dry_run_deletes_nothing() {
     let tmp = tempfile::tempdir().expect("tempdir");

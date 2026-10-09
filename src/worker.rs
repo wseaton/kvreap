@@ -9,6 +9,12 @@
 //!
 //! Work scales with the bytes to free, not with the size of the tree, and every
 //! metadata op goes through the shared `Budget`.
+//!
+//! With a prefix-chain index (`events` feature, `KV_EVENTS_ENDPOINTS`) and
+//! `CHAIN_EVICTION=tail-first`, each round takes the oldest
+//! `quota * CHAIN_WINDOW` candidates and deletes, best first: dead blocks
+//! (parent gone), childless blocks, interiors deferred `CHAIN_MAX_DEFERRALS`
+//! times, then the remaining interiors. The rest go back to the pool.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString};
@@ -20,6 +26,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::budget::{Budget, OpKind};
 use crate::capacity::{BucketSample, Samples};
+#[cfg(feature = "events")]
+use crate::chains::{Chains, Rank};
+#[cfg(feature = "events")]
+use crate::config::ChainPolicy;
 use crate::config::Config;
 use crate::controller::{Mode, SharedState};
 use crate::fsops::{self, EntryKind, Meta};
@@ -36,6 +46,8 @@ const EMPTY_INDEX_RETRY: Duration = Duration::from_secs(5);
 const FRUITLESS_ROUNDS_BEFORE_BACKOFF: u32 = 16;
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+#[cfg(feature = "events")]
+const CHAIN_WINDOW: usize = 8;
 
 /// A deleted block, reported to the events publisher when the `events` feature is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +70,7 @@ struct Candidate {
     size: u64,
     atime: SystemTime,
     sampled_at: Instant,
+    deferrals: u32,
 }
 
 /// Cold files ordered by atime, capped at `cap` by evicting the youngest.
@@ -79,9 +92,12 @@ impl Pool {
         }
     }
 
-    fn insert(&mut self, c: Candidate) {
-        if let Some(old) = self.keys.remove(&c.path) {
-            self.by_age.remove(&old);
+    /// Inserts or replaces `c`; a replaced entry's deferral count carries over.
+    fn insert(&mut self, mut c: Candidate) {
+        if let Some(old) = self.keys.remove(&c.path)
+            && let Some(prev) = self.by_age.remove(&old)
+        {
+            c.deferrals = c.deferrals.max(prev.deferrals);
         }
         self.seq += 1;
         let key = (c.atime, self.seq);
@@ -120,6 +136,8 @@ pub struct Context {
     pub samples: Arc<Samples>,
     pub shutdown: Arc<Shutdown>,
     pub events: Option<Sender<Removed>>,
+    #[cfg(feature = "events")]
+    pub chains: Option<Arc<Chains>>,
 }
 
 pub struct Worker {
@@ -357,6 +375,7 @@ impl Worker {
                     size: meta.size,
                     atime: meta.atime,
                     sampled_at: Instant::now(),
+                    deferrals: 0,
                 });
             }
         }
@@ -365,6 +384,10 @@ impl Worker {
     }
 
     fn evict(&mut self, quota: usize) -> usize {
+        #[cfg(feature = "events")]
+        if let Some(chains) = self.tail_first_chains() {
+            return self.evict_tail_first(quota, &chains);
+        }
         let mut evicted = 0;
         while evicted < quota && self.ctx.shared.mode().is_evicting() && !self.ctx.shutdown.is_set()
         {
@@ -374,6 +397,49 @@ impl Worker {
             if self.evict_one(c) {
                 evicted += 1;
             }
+        }
+        evicted
+    }
+
+    #[cfg(feature = "events")]
+    fn tail_first_chains(&self) -> Option<Arc<Chains>> {
+        self.ctx
+            .chains
+            .as_ref()
+            .filter(|c| c.policy == ChainPolicy::TailFirst && !self.unpaced())
+            .cloned()
+    }
+
+    /// Ranks are recomputed after every deletion: removing a leaf can turn
+    /// its parent into one. Interiors with deferrals left are never deleted;
+    /// the round evicts less instead.
+    #[cfg(feature = "events")]
+    fn evict_tail_first(&mut self, quota: usize, chains: &Chains) -> usize {
+        let mut window: Vec<Candidate> = std::iter::from_fn(|| self.pool.pop_oldest())
+            .take(quota.saturating_mul(CHAIN_WINDOW))
+            .collect();
+        let mut evicted = 0;
+        while evicted < quota && self.ctx.shared.mode().is_evicting() && !self.ctx.shutdown.is_set()
+        {
+            let best = window
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (chains.rank(c.hash, c.deferrals), i))
+                .min();
+            let Some((rank, i)) = best.filter(|(rank, _)| *rank != Rank::Interior) else {
+                break;
+            };
+            tracing::trace!(?rank, path = %window[i].path.display(), "chain-ordered eviction");
+            if self.evict_one(window.remove(i)) {
+                evicted += 1;
+            }
+        }
+        for mut c in window {
+            if chains.rank(c.hash, c.deferrals) == Rank::Interior {
+                c.deferrals += 1;
+                Stats::add(&chains.stats.deferrals, 1);
+            }
+            self.pool.insert(c);
         }
         evicted
     }
@@ -413,6 +479,10 @@ impl Worker {
         }
         Stats::add(&self.ctx.stats.files_deleted, 1);
         Stats::add(&self.ctx.stats.bytes_freed, c.size);
+        #[cfg(feature = "events")]
+        if let Some(chains) = &self.ctx.chains {
+            chains.deleted(c.hash);
+        }
         if let (Some(tx), Some(base)) = (&self.ctx.events, &c.rank.model_base) {
             let _ = tx.send(Removed {
                 model_base: base.clone(),
@@ -474,6 +544,7 @@ mod tests {
             size: 1,
             atime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - age_secs),
             sampled_at: Instant::now(),
+            deferrals: 0,
         }
     }
 
@@ -582,6 +653,8 @@ mod tests {
             samples: Arc::clone(&samples),
             shutdown: Arc::new(Shutdown::default()),
             events: Some(tx),
+            #[cfg(feature = "events")]
+            chains: None,
         };
         Harness {
             worker: Worker::new(0, Shard::split(1)[0], ctx),
@@ -907,5 +980,216 @@ mod tests {
         shutdown.trigger();
         handle.join().expect("join");
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(feature = "events")]
+    mod chain_fixtures {
+        use std::fs;
+        use std::path::{Path, PathBuf};
+        use std::sync::Arc;
+
+        use crate::chains::{Chains, KvEvent};
+        use crate::config::ChainPolicy;
+        use crate::layout::BlockHash;
+        use crate::worker::tests::{Harness, age, config, harness};
+
+        pub const BASE: u64 = 0xabcd_e000_0000_0000;
+
+        pub fn hash(n: u64) -> BlockHash {
+            BlockHash(BASE + n)
+        }
+
+        /// One leaf dir of blocks `BASE + n`; `Some(secs)` ages a block, `None` keeps it hot.
+        pub fn bucket(blocks: &[(u64, Option<u64>)]) -> (tempfile::TempDir, PathBuf) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let cache = tmp.path().join("cache");
+            let leaf = cache.join("m_abcdef012345_r0/abc/de_g0");
+            fs::create_dir_all(&leaf).expect("mkdir");
+            for &(n, secs) in blocks {
+                let f = leaf.join(format!("{:016x}.bin", BASE + n));
+                fs::write(&f, b"x").expect("write");
+                if let Some(secs) = secs {
+                    age(&f, secs);
+                }
+            }
+            (tmp, cache)
+        }
+
+        pub fn names(ns: &[u64]) -> Vec<String> {
+            ns.iter()
+                .map(|n| format!("{:016x}.bin", BASE + n))
+                .collect()
+        }
+
+        pub fn chain_harness(cache: &Path, policy: ChainPolicy, chain: &[u64]) -> Harness {
+            let mut h = harness(config(cache, &[]));
+            let chains = Arc::new(Chains::new(1000, policy, 2));
+            chains.apply(&[KvEvent::Stored {
+                parent: None,
+                hashes: chain.iter().map(|&n| hash(n)).collect(),
+                medium: Some("GPU".into()),
+            }]);
+            h.worker.ctx.chains = Some(chains);
+            h
+        }
+
+        pub fn chains(h: &Harness) -> &Chains {
+            h.worker.ctx.chains.as_deref().expect("chains")
+        }
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn tail_first_deletes_a_chain_from_the_leaf_back() {
+        use crate::config::ChainPolicy;
+        use crate::worker::tests::chain_fixtures::{bucket, chain_harness, chains, names};
+
+        let (_tmp, cache) = bucket(&[
+            (1, Some(9000)),
+            (2, Some(8999)),
+            (3, Some(8998)),
+            (4, Some(8997)),
+        ]);
+        let mut h = chain_harness(&cache, ChainPolicy::TailFirst, &[1, 2, 3, 4]);
+        h.shared.set_mode(Mode::Evicting);
+        h.worker.round().expect("round");
+        assert_eq!(
+            bins(&cache),
+            names(&[1, 2]),
+            "4 then 3 go first though 1 is oldest"
+        );
+        h.worker.round().expect("round");
+        assert_eq!(bins(&cache), names(&[1]));
+        run_rounds(&mut h, 3);
+        assert!(bins(&cache).is_empty());
+        let s = &chains(&h).stats;
+        assert_eq!(Stats::get(&s.deleted_leaf), 3);
+        assert_eq!(Stats::get(&s.deleted_root), 1);
+        assert_eq!(Stats::get(&s.deleted_orphan), 0);
+        assert_eq!(
+            Stats::get(&s.deferrals),
+            1,
+            "only 1 still had a child on disk when round one ended"
+        );
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn observe_policy_evicts_oldest_first_and_counts_dead_tails() {
+        use crate::config::ChainPolicy;
+        use crate::worker::tests::chain_fixtures::{bucket, chain_harness, chains, names};
+
+        let (_tmp, cache) = bucket(&[
+            (1, Some(9000)),
+            (2, Some(8999)),
+            (3, Some(8998)),
+            (4, Some(8997)),
+        ]);
+        let mut h = chain_harness(&cache, ChainPolicy::Observe, &[1, 2, 3, 4]);
+        h.shared.set_mode(Mode::Evicting);
+        h.worker.round().expect("round");
+        assert_eq!(bins(&cache), names(&[3, 4]), "plain oldest-first");
+        let s = &chains(&h).stats;
+        assert_eq!(Stats::get(&s.deleted_root), 1);
+        assert_eq!(Stats::get(&s.deleted_orphan), 1, "2 lost its parent first");
+        assert_eq!(Stats::get(&s.deferrals), 0);
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn tail_first_prefers_childless_blocks_over_older_interiors() {
+        use crate::config::ChainPolicy;
+        use crate::worker::tests::chain_fixtures::{bucket, chain_harness, names};
+
+        // Chain 1 -> 2 with 2 hot; 9 is an unrelated, younger single block.
+        let (_tmp, cache) = bucket(&[(1, Some(9000)), (2, None), (9, Some(7300))]);
+        let mut h = chain_harness(&cache, ChainPolicy::TailFirst, &[1, 2]);
+        h.shared.set_mode(Mode::Evicting);
+        h.worker.round().expect("round");
+        assert_eq!(bins(&cache), names(&[1, 2]));
+        let deferred = h.worker.pool.pop_oldest().expect("1 is back in the pool");
+        assert_eq!(deferred.deferrals, 1);
+        h.worker.pool.insert(deferred);
+        run_rounds(&mut h, 5);
+        assert_eq!(
+            bins(&cache),
+            names(&[2]),
+            "an interior is evicted once its deferrals run out"
+        );
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn interior_alone_is_deferred_a_bounded_number_of_rounds() {
+        use crate::config::ChainPolicy;
+        use crate::worker::tests::chain_fixtures::{bucket, chain_harness, names};
+
+        let (_tmp, cache) = bucket(&[(1, Some(9000)), (2, None)]);
+        let mut h = chain_harness(&cache, ChainPolicy::TailFirst, &[1, 2]);
+        h.shared.set_mode(Mode::Evicting);
+        let mut evicted_in = None;
+        for round in 1..=5 {
+            let r = h.worker.round().expect("round").expect("buckets");
+            if r.evicted > 0 {
+                evicted_in = Some(round);
+                break;
+            }
+        }
+        assert_eq!(evicted_in, Some(3), "max_deferrals is 2");
+        assert_eq!(bins(&cache), names(&[2]));
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn tail_first_deletes_dead_blocks_before_older_live_ones() {
+        use crate::config::ChainPolicy;
+        use crate::worker::tests::chain_fixtures::{bucket, chain_harness, chains, hash, names};
+
+        // 1 -> 2 -> 3 where 1 is already gone; 9 is an older unrelated block.
+        let (_tmp, cache) = bucket(&[
+            (2, Some(8000)),
+            (3, Some(7999)),
+            (9, Some(9000)),
+            (10, None),
+        ]);
+        let mut h = chain_harness(&cache, ChainPolicy::TailFirst, &[1, 2, 3]);
+        chains(&h).deleted(hash(1));
+        h.shared.set_mode(Mode::Evicting);
+        h.worker.round().expect("round");
+        assert_eq!(bins(&cache), names(&[9, 10]));
+        assert_eq!(
+            Stats::get(&chains(&h).stats.deleted_orphan),
+            2,
+            "3 is orphaned once 2 goes"
+        );
+        assert_eq!(Stats::get(&chains(&h).stats.deleted_leaf), 0);
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn emergency_mode_ignores_chain_order() {
+        use crate::config::ChainPolicy;
+        use crate::worker::tests::chain_fixtures::{bucket, chain_harness, names};
+
+        let (_tmp, cache) = bucket(&[
+            (1, Some(9000)),
+            (2, Some(8999)),
+            (3, Some(8998)),
+            (4, Some(8997)),
+        ]);
+        let mut h = chain_harness(&cache, ChainPolicy::TailFirst, &[1, 2, 3, 4]);
+        h.shared.set_mode(Mode::Emergency);
+        h.worker.round().expect("round");
+        assert_eq!(bins(&cache), names(&[3, 4]));
+    }
+
+    #[test]
+    fn pool_reinsert_keeps_the_higher_deferral_count() {
+        let mut pool = Pool::new(10);
+        let mut c = candidate("/a", 10);
+        c.deferrals = 3;
+        pool.insert(c);
+        pool.insert(candidate("/a", 10));
+        assert_eq!(pool.pop_oldest().map(|c| c.deferrals), Some(3));
     }
 }

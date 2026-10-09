@@ -19,6 +19,8 @@ pub enum ConfigError {
     TargetNotBelowCleanup { target: f64, cleanup: f64 },
     #[error("NUM_CRAWLER_PROCESSES must be a power of 2 from 1 to 16, got {0}")]
     InvalidWorkerCount(i64),
+    #[error("CHAIN_EVICTION must be tail-first or observe, got {0:?}")]
+    InvalidChainPolicy(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
@@ -88,6 +90,26 @@ impl WorkerCount {
     }
 }
 
+/// What workers do with the prefix-chain index built from `KV_EVENTS_ENDPOINTS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainPolicy {
+    /// Among the oldest candidates, delete dead blocks, then childless ones,
+    /// then chain interiors (each deferred at most `CHAIN_MAX_DEFERRALS` times).
+    TailFirst,
+    /// Keep the index and count deletions by chain position, but evict oldest-first.
+    Observe,
+}
+
+impl ChainPolicy {
+    fn parse(raw: &str) -> Result<Self, ConfigError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "tail-first" => Ok(Self::TailFirst),
+            "observe" => Ok(Self::Observe),
+            _ => Err(ConfigError::InvalidChainPolicy(raw.to_string())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Debug,
@@ -138,6 +160,10 @@ pub struct Config {
     pub storage_events_endpoint: Option<String>,
     /// When set, usage is estimated from bucket samples against this size instead of `statvfs`.
     pub capacity_bytes: Option<CapacityBytes>,
+    /// vLLM `--kv-events-config` PUB endpoints to build the prefix-chain index from.
+    pub kv_events_endpoints: Vec<String>,
+    pub chain_policy: ChainPolicy,
+    pub chain_max_deferrals: u32,
 }
 
 const IGNORED_VARS: [&str; 2] = ["FILE_QUEUE_MAXSIZE", "FILE_QUEUE_MIN_SIZE"];
@@ -255,6 +281,15 @@ impl Config {
             capacity_bytes: optional("CAPACITY_BYTES")
                 .map(|raw| CapacityBytes::parse("CAPACITY_BYTES", &raw))
                 .transpose()?,
+            kv_events_endpoints: get("KV_EVENTS_ENDPOINTS", "")
+                .split(',')
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            chain_policy: ChainPolicy::parse(&get("CHAIN_EVICTION", "tail-first"))?,
+            chain_max_deferrals: u32::try_from(int("CHAIN_MAX_DEFERRALS", "8")?.max(0))
+                .unwrap_or(u32::MAX),
         })
     }
 }
@@ -263,7 +298,7 @@ impl Config {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::config::{Config, ConfigError, LogLevel};
+    use crate::config::{ChainPolicy, Config, ConfigError, LogLevel};
 
     fn cfg(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
         let env: HashMap<String, String> = pairs
@@ -296,6 +331,46 @@ mod tests {
         assert_eq!(c.log_file_path, None);
         assert_eq!(c.storage_events_endpoint, None);
         assert_eq!(c.capacity_bytes, None);
+        assert!(c.kv_events_endpoints.is_empty());
+        assert_eq!(c.chain_policy, ChainPolicy::TailFirst);
+        assert_eq!(c.chain_max_deferrals, 8);
+    }
+
+    #[test]
+    fn kv_events_endpoints_split_on_commas() {
+        let c = cfg(&[("KV_EVENTS_ENDPOINTS", " tcp://a:5557 ,,tcp://b:5557,")]).expect("parse");
+        assert_eq!(c.kv_events_endpoints, vec!["tcp://a:5557", "tcp://b:5557"]);
+        assert!(
+            cfg(&[("KV_EVENTS_ENDPOINTS", " , ")])
+                .expect("parse")
+                .kv_events_endpoints
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn chain_policy_and_deferrals_parse() {
+        let c = cfg(&[
+            ("CHAIN_EVICTION", " Observe "),
+            ("CHAIN_MAX_DEFERRALS", "0"),
+        ])
+        .expect("parse");
+        assert_eq!(c.chain_policy, ChainPolicy::Observe);
+        assert_eq!(c.chain_max_deferrals, 0);
+        assert_eq!(
+            cfg(&[("CHAIN_MAX_DEFERRALS", "-3")])
+                .expect("parse")
+                .chain_max_deferrals,
+            0
+        );
+        assert_eq!(
+            cfg(&[("CHAIN_EVICTION", "head-first")]).err(),
+            Some(ConfigError::InvalidChainPolicy("head-first".into()))
+        );
+        assert!(matches!(
+            cfg(&[("CHAIN_MAX_DEFERRALS", "lots")]),
+            Err(ConfigError::NotANumber { .. })
+        ));
     }
 
     #[test]
