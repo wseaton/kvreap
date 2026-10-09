@@ -421,7 +421,7 @@ AGENT_SCRIPT = r"""
 set -u
 mkdir -p /results/agent
 nyann-bench generate --target "$BASE_URL/v1" --model "$MODEL" --config /bench/nyann.json \
-  --seed 7 --output-dir /results/agent > /results/agent/log.txt 2>&1 || echo "nyann-bench failed" >&2
+  --output-dir /results/agent > /results/agent/log.txt 2>&1 || echo "nyann-bench failed" >&2
 touch /results/DONE
 sleep infinity
 """

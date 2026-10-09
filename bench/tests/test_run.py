@@ -148,6 +148,7 @@ def test_agent_workload_runs_nyann_conversation_pool() -> None:
     assert lg["image"] == NYANN_IMAGE
     assert "/bench/nyann.json" in lg["command"][-1]
     assert "touch /results/DONE" in lg["command"][-1]
+    assert "--seed" not in lg["command"][-1], "nyann-bench edd5f54 has no --seed"
     assert "nyann.json" not in sampler_configmap(cfg())["data"]
 
 
