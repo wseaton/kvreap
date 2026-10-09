@@ -200,6 +200,7 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
                     "root_dir": f"{KV_MOUNT}/{CACHE_DIRECTORY}",
                     "n_read_threads": 16,
                     "n_write_threads": 16,
+                    **({"enable_kv_events": True} if cfg.kv_events else {}),
                 }
             ],
         },
@@ -406,6 +407,7 @@ def evictor_manifests(cfg: RunConfig) -> list[Manifest]:
         env = dict(cfg.evictor_env)
         if cfg.kv_events:
             env.setdefault("KV_EVENTS_ENDPOINTS", cfg.kv_events_endpoint)
+            env.setdefault("KV_EVENTS_DISK_MEDIUM", "STORAGE")
         for c in spec["containers"]:
             if c["name"] == "evictor":
                 c.setdefault("env", []).extend({"name": k, "value": v} for k, v in env.items())

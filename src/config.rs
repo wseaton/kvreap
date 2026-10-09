@@ -164,6 +164,8 @@ pub struct Config {
     pub kv_events_endpoints: Vec<String>,
     pub chain_policy: ChainPolicy,
     pub chain_max_deferrals: u32,
+    /// Only `BlockStored` events of this medium mark blocks on disk (vLLM fs tier: `STORAGE`).
+    pub kv_events_disk_medium: Option<String>,
 }
 
 const IGNORED_VARS: [&str; 2] = ["FILE_QUEUE_MAXSIZE", "FILE_QUEUE_MIN_SIZE"];
@@ -290,6 +292,7 @@ impl Config {
             chain_policy: ChainPolicy::parse(&get("CHAIN_EVICTION", "tail-first"))?,
             chain_max_deferrals: u32::try_from(int("CHAIN_MAX_DEFERRALS", "8")?.max(0))
                 .unwrap_or(u32::MAX),
+            kv_events_disk_medium: optional("KV_EVENTS_DISK_MEDIUM"),
         })
     }
 }
@@ -334,6 +337,14 @@ mod tests {
         assert!(c.kv_events_endpoints.is_empty());
         assert_eq!(c.chain_policy, ChainPolicy::TailFirst);
         assert_eq!(c.chain_max_deferrals, 8);
+        assert_eq!(c.kv_events_disk_medium, None);
+        assert_eq!(
+            cfg(&[("KV_EVENTS_DISK_MEDIUM", "STORAGE")])
+                .expect("parse")
+                .kv_events_disk_medium
+                .as_deref(),
+            Some("STORAGE")
+        );
     }
 
     #[test]

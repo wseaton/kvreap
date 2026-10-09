@@ -43,6 +43,12 @@ def test_vllm_with_kv_events_publishes_on_the_service() -> None:
     assert {"containerPort": KV_EVENTS_PORT} in container["ports"]
     assert {"name": "kv-events", "port": KV_EVENTS_PORT, "targetPort": KV_EVENTS_PORT} in svc["spec"]["ports"]
     assert cfg().kv_events_endpoint == f"tcp://kvreap-bench-d-vllm:{KV_EVENTS_PORT}"
+    [kv] = [a for a in container["args"] if a.startswith("--kv-transfer-config=")]
+    [tier] = json.loads(kv.split("=", 1)[1])["kv_connector_extra_config"]["secondary_tiers"]
+    assert tier["enable_kv_events"] is True
+    plain, _ = vllm_parts(cfg())
+    [kv] = [a for a in plain["args"] if a.startswith("--kv-transfer-config=")]
+    assert "enable_kv_events" not in kv
 
 
 def evictor_env(c: RunConfig) -> dict[str, str]:
@@ -61,6 +67,7 @@ def test_evictor_gets_kv_events_endpoint_and_extra_env() -> None:
     env = evictor_env(cfg(kv_events=True, evictor_env={"CHAIN_EVICTION": "observe"}))
     assert env["KV_EVENTS_ENDPOINTS"] == "tcp://kvreap-bench-d-vllm:5557"
     assert env["CHAIN_EVICTION"] == "observe"
+    assert env["KV_EVENTS_DISK_MEDIUM"] == "STORAGE"
 
 
 @needs_chart

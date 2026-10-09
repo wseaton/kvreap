@@ -111,36 +111,36 @@ impl ChainIndex {
             n.children_on_disk = n.children_on_disk.saturating_add(1);
         } else if let Some(n) = self.nodes.get_mut(&p) {
             n.children_on_disk = n.children_on_disk.saturating_sub(1);
-            if !n.on_disk && n.children_on_disk == 0 {
+            if !n.on_disk && n.children_on_disk == 0 && n.parent.is_none() {
                 self.nodes.remove(&p);
             }
         }
     }
 
-    /// Records `hashes` as a chain hanging off `parent`, all now on disk.
-    pub fn store(&mut self, parent: Option<BlockHash>, hashes: &[BlockHash]) {
+    /// Records `hashes` as a chain hanging off `parent`; `on_disk` also marks
+    /// them written. Without it only the parent links are learned.
+    pub fn store(&mut self, parent: Option<BlockHash>, hashes: &[BlockHash], on_disk: bool) {
         let mut parent = parent;
         for &hash in hashes {
-            self.store_one(hash, parent);
+            self.store_one(hash, parent, on_disk);
             parent = Some(hash);
         }
         self.enforce_cap();
     }
 
-    fn store_one(&mut self, hash: BlockHash, parent: Option<BlockHash>) {
+    fn store_one(&mut self, hash: BlockHash, parent: Option<BlockHash>, on_disk: bool) {
         let node = *self.node_mut(hash);
-        if node.on_disk {
-            if node.parent.is_none() && parent.is_some() {
-                self.node_mut(hash).parent = parent;
-                self.adjust_children(parent, true);
-            }
-            return;
-        }
         let parent = node.parent.or(parent);
         let n = self.node_mut(hash);
-        n.on_disk = true;
         n.parent = parent;
-        self.adjust_children(parent, true);
+        if on_disk {
+            n.on_disk = true;
+        }
+        let gained_parent = node.parent.is_none() && parent.is_some();
+        let counted = node.on_disk && !gained_parent;
+        if n.on_disk && !counted {
+            self.adjust_children(parent, true);
+        }
     }
 
     /// Marks `hash` gone from disk and returns where it sat in its chain.
@@ -232,15 +232,24 @@ pub struct Chains {
     index: Mutex<ChainIndex>,
     pub policy: ChainPolicy,
     pub max_deferrals: u32,
+    /// When set, only `BlockStored` events of this medium mark blocks on
+    /// disk; the rest only teach parent links.
+    pub disk_medium: Option<String>,
     pub stats: ChainStats,
 }
 
 impl Chains {
-    pub fn new(cap: usize, policy: ChainPolicy, max_deferrals: u32) -> Self {
+    pub fn new(
+        cap: usize,
+        policy: ChainPolicy,
+        max_deferrals: u32,
+        disk_medium: Option<String>,
+    ) -> Self {
         Self {
             index: Mutex::new(ChainIndex::new(cap)),
             policy,
             max_deferrals,
+            disk_medium,
             stats: ChainStats::default(),
         }
     }
@@ -271,12 +280,23 @@ impl Chains {
         let mut index = self.index();
         for event in events {
             match event {
-                KvEvent::Stored { parent, hashes, .. } => {
-                    index.store(*parent, hashes);
-                    Stats::add(&self.stats.blocks_stored, hashes.len() as u64);
+                KvEvent::Stored {
+                    parent,
+                    hashes,
+                    medium,
+                } => {
+                    let on_disk = self
+                        .disk_medium
+                        .as_deref()
+                        .is_none_or(|m| medium.as_deref() == Some(m));
+                    index.store(*parent, hashes, on_disk);
+                    if on_disk {
+                        Stats::add(&self.stats.blocks_stored, hashes.len() as u64);
+                    }
                 }
                 KvEvent::Removed { hashes, medium }
-                    if medium.as_deref() == Some(MEDIUM_STORAGE) =>
+                    if medium.as_deref()
+                        == Some(self.disk_medium.as_deref().unwrap_or(MEDIUM_STORAGE)) =>
                 {
                     for &h in hashes {
                         index.remove(h);
@@ -292,6 +312,7 @@ impl Chains {
         let (root, orphan) = (Stats::get(&s.deleted_root), Stats::get(&s.deleted_orphan));
         tracing::info!(
             policy = ?self.policy,
+            disk_medium = self.disk_medium.as_deref().unwrap_or("any"),
             index_blocks = self.index().len(),
             event_batches = Stats::get(&s.batches),
             decode_errors = Stats::get(&s.decode_errors),
@@ -685,8 +706,8 @@ mod tests {
     #[test]
     fn chain_positions_follow_the_tree() {
         let mut ix = ChainIndex::new(100);
-        ix.store(None, &[h(1), h(2), h(3)]);
-        ix.store(Some(h(2)), &[h(4)]);
+        ix.store(None, &[h(1), h(2), h(3)], true);
+        ix.store(Some(h(2)), &[h(4)], true);
         assert_eq!(ix.position(h(1)), Position::Root);
         assert_eq!(ix.position(h(2)), Position::Internal);
         assert_eq!(ix.position(h(3)), Position::Leaf);
@@ -706,21 +727,25 @@ mod tests {
     #[test]
     fn head_first_deletion_orphans_the_rest() {
         let mut ix = ChainIndex::new(100);
-        ix.store(None, &[h(1), h(2), h(3)]);
+        ix.store(None, &[h(1), h(2), h(3)], true);
         assert_eq!(ix.remove(h(1)), Position::Root);
         assert_eq!(ix.position(h(2)), Position::Orphan);
         assert_eq!(ix.rank(h(2), 0, 3), Rank::Dead);
         assert_eq!(ix.remove(h(2)), Position::Orphan);
         assert_eq!(ix.remove(h(3)), Position::Orphan);
-        assert_eq!(ix.len(), 0);
+        assert_eq!(
+            ix.len(),
+            1,
+            "2 keeps its parent link until the cap drops it"
+        );
     }
 
     #[test]
     fn duplicate_stores_do_not_inflate_child_counts() {
         let mut ix = ChainIndex::new(100);
-        ix.store(None, &[h(1), h(2)]);
-        ix.store(None, &[h(1), h(2)]);
-        ix.store(Some(h(1)), &[h(2)]);
+        ix.store(None, &[h(1), h(2)], true);
+        ix.store(None, &[h(1), h(2)], true);
+        ix.store(Some(h(1)), &[h(2)], true);
         assert_eq!(ix.remove(h(2)), Position::Leaf);
         assert_eq!(ix.rank(h(1), 0, 3), Rank::Childless);
     }
@@ -728,13 +753,13 @@ mod tests {
     #[test]
     fn restore_after_deletion_counts_again() {
         let mut ix = ChainIndex::new(100);
-        ix.store(None, &[h(1), h(2)]);
+        ix.store(None, &[h(1), h(2)], true);
         ix.remove(h(2));
-        ix.store(Some(h(1)), &[h(2)]);
+        ix.store(Some(h(1)), &[h(2)], true);
         assert_eq!(ix.rank(h(1), 0, 3), Rank::Interior);
         assert_eq!(ix.remove(h(1)), Position::Root);
         assert_eq!(ix.position(h(2)), Position::Orphan);
-        ix.store(None, &[h(1)]);
+        ix.store(None, &[h(1)], true);
         assert_eq!(ix.position(h(2)), Position::Leaf, "parent rewritten");
         assert_eq!(ix.position(h(1)), Position::Root);
         assert_eq!(ix.rank(h(1), 0, 3), Rank::Interior);
@@ -743,10 +768,10 @@ mod tests {
     #[test]
     fn late_parent_fills_in_a_placeholder_store() {
         let mut ix = ChainIndex::new(100);
-        ix.store(None, &[h(1)]);
-        ix.store(None, &[h(2)]);
+        ix.store(None, &[h(1)], true);
+        ix.store(None, &[h(2)], true);
         assert_eq!(ix.position(h(2)), Position::Root);
-        ix.store(Some(h(1)), &[h(2)]);
+        ix.store(Some(h(1)), &[h(2)], true);
         assert_eq!(ix.position(h(2)), Position::Leaf);
         assert_eq!(ix.position(h(1)), Position::Root);
         assert_eq!(ix.rank(h(1), 0, 3), Rank::Interior);
@@ -755,7 +780,7 @@ mod tests {
     #[test]
     fn rank_orders_dead_childless_overdue_interior() {
         let mut ix = ChainIndex::new(100);
-        ix.store(None, &[h(1), h(2), h(3)]);
+        ix.store(None, &[h(1), h(2), h(3)], true);
         assert_eq!(ix.rank(h(3), 0, 2), Rank::Childless);
         assert_eq!(ix.rank(h(2), 0, 2), Rank::Interior);
         assert_eq!(ix.rank(h(2), 1, 2), Rank::Interior);
@@ -771,8 +796,8 @@ mod tests {
     #[test]
     fn cap_forgets_oldest_blocks_and_releases_their_parents() {
         let mut ix = ChainIndex::new(3);
-        ix.store(None, &[h(1), h(2)]);
-        ix.store(None, &[h(10), h(11)]);
+        ix.store(None, &[h(1), h(2)], true);
+        ix.store(None, &[h(10), h(11)], true);
         assert!(ix.len() <= 3);
         assert_eq!(ix.position(h(1)), Position::Untracked);
         assert_eq!(ix.position(h(11)), Position::Leaf);
@@ -781,13 +806,13 @@ mod tests {
 
         let mut ix = ChainIndex::new(1000);
         for i in 0..10_000u64 {
-            ix.store(None, &[h(i)]);
+            ix.store(None, &[h(i)], true);
             ix.remove(h(i));
         }
         assert_eq!(ix.len(), 0);
         let mut ix = ChainIndex::new(10);
         for i in 0..10_000u64 {
-            ix.store(Some(h(i)), &[h(i + 1)]);
+            ix.store(Some(h(i)), &[h(i + 1)], true);
         }
         assert!(ix.len() <= 10);
         assert!(ix.order.len() <= 21, "stale order entries are compacted");
@@ -795,7 +820,7 @@ mod tests {
 
     #[test]
     fn chains_counts_deletions_and_ignores_non_storage_removals() {
-        let chains = Chains::new(100, ChainPolicy::TailFirst, 2);
+        let chains = Chains::new(100, ChainPolicy::TailFirst, 2, None);
         chains.apply(&[stored(None, &[1, 2, 3], "GPU"), removed(&[3], "GPU")]);
         assert_eq!(
             chains.rank(h(2), 0),
@@ -816,6 +841,58 @@ mod tests {
     }
 
     #[test]
+    fn parent_links_without_disk_marks_make_children_orphans() {
+        let mut ix = ChainIndex::new(100);
+        ix.store(None, &[h(1), h(2), h(3)], false);
+        assert_eq!(ix.position(h(2)), Position::Untracked);
+        ix.store(None, &[h(2), h(3)], true);
+        assert_eq!(ix.position(h(2)), Position::Orphan, "1 never reached disk");
+        assert_eq!(ix.rank(h(2), 0, 3), Rank::Dead);
+        assert_eq!(ix.position(h(3)), Position::Leaf);
+        ix.store(None, &[h(1)], true);
+        assert_eq!(ix.position(h(2)), Position::Internal);
+        assert_eq!(ix.position(h(1)), Position::Root);
+        assert_eq!(ix.rank(h(1), 0, 3), Rank::Interior);
+    }
+
+    #[test]
+    fn disk_marks_before_parent_links_count_once() {
+        let mut ix = ChainIndex::new(100);
+        ix.store(None, &[h(2)], true);
+        ix.store(None, &[h(1)], true);
+        ix.store(None, &[h(1), h(2)], false);
+        ix.store(None, &[h(1), h(2)], false);
+        assert_eq!(ix.position(h(2)), Position::Leaf);
+        assert_eq!(ix.remove(h(2)), Position::Leaf);
+        assert_eq!(ix.rank(h(1), 0, 3), Rank::Childless);
+    }
+
+    #[test]
+    fn disk_medium_limits_which_stores_mark_disk() {
+        let chains = Chains::new(100, ChainPolicy::TailFirst, 2, Some("STORAGE".into()));
+        chains.apply(&[stored(None, &[1, 2, 3], "GPU")]);
+        assert_eq!(
+            chains.rank(h(1), 0),
+            Rank::Childless,
+            "GPU only: not on disk"
+        );
+        assert_eq!(Stats::get(&chains.stats.blocks_stored), 0);
+        // The fs tier's own events carry only the hash.
+        chains.apply(&[
+            stored(None, &[1], "STORAGE"),
+            stored(None, &[2], "STORAGE"),
+            stored(None, &[3], "STORAGE"),
+        ]);
+        assert_eq!(Stats::get(&chains.stats.blocks_stored), 3);
+        assert_eq!(chains.rank(h(1), 0), Rank::Interior);
+        assert_eq!(chains.rank(h(3), 0), Rank::Childless);
+        chains.apply(&[removed(&[3], "STORAGE")]);
+        assert_eq!(chains.rank(h(2), 0), Rank::Childless);
+        assert_eq!(chains.deleted(h(2)), Position::Leaf);
+        assert_eq!(chains.deleted(h(1)), Position::Root);
+    }
+
+    #[test]
     fn subscriber_applies_batches_from_a_real_pub_socket() {
         let ctx = zmq::Context::new();
         let publisher = ctx.socket(zmq::PUB).expect("pub");
@@ -824,7 +901,7 @@ mod tests {
             .get_last_endpoint()
             .expect("endpoint")
             .expect("utf8");
-        let chains = Arc::new(Chains::new(100, ChainPolicy::TailFirst, 2));
+        let chains = Arc::new(Chains::new(100, ChainPolicy::TailFirst, 2, None));
         let shutdown = Arc::new(Shutdown::default());
         let handle = {
             let (chains, shutdown) = (Arc::clone(&chains), Arc::clone(&shutdown));

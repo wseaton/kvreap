@@ -1023,7 +1023,7 @@ mod tests {
 
         pub fn chain_harness(cache: &Path, policy: ChainPolicy, chain: &[u64]) -> Harness {
             let mut h = harness(config(cache, &[]));
-            let chains = Arc::new(Chains::new(1000, policy, 2));
+            let chains = Arc::new(Chains::new(1000, policy, 2, None));
             chains.apply(&[KvEvent::Stored {
                 parent: None,
                 hashes: chain.iter().map(|&n| hash(n)).collect(),
