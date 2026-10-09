@@ -28,6 +28,7 @@ def vllm_parts(c: RunConfig) -> tuple[dict, dict]:
 def test_vllm_without_kv_events_is_unchanged() -> None:
     container, svc = vllm_parts(cfg())
     assert not any(a.startswith("--kv-events-config") for a in container["args"])
+    assert not any(e["name"] == "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES" for e in container["env"])
     assert container["ports"] == [{"containerPort": 8000}]
     assert [p["port"] for p in svc["spec"]["ports"]] == [8000]
 
@@ -41,6 +42,7 @@ def test_vllm_with_kv_events_publishes_on_the_service() -> None:
         "endpoint": f"tcp://*:{KV_EVENTS_PORT}",
     }
     assert {"containerPort": KV_EVENTS_PORT} in container["ports"]
+    assert {"name": "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "value": "0"} in container["env"]
     assert {"name": "kv-events", "port": KV_EVENTS_PORT, "targetPort": KV_EVENTS_PORT} in svc["spec"]["ports"]
     assert cfg().kv_events_endpoint == f"tcp://kvreap-bench-d-vllm:{KV_EVENTS_PORT}"
     [kv] = [a for a in container["args"] if a.startswith("--kv-transfer-config=")]

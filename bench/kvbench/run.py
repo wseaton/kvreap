@@ -214,11 +214,17 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
         f"--num-gpu-blocks-override={cfg.gpu_blocks}",
         f"--kv-transfer-config={json.dumps(kv_config)}",
     ]
+    env = [
+        {"name": "HF_HOME", "value": "/models/hf"},
+        {"name": "HOME", "value": "/tmp"},
+        {"name": "VLLM_LOGGING_LEVEL", "value": "INFO"},
+    ]
     ports = [{"containerPort": 8000}]
     svc_ports = [{"name": "http", "port": 8000, "targetPort": 8000}]
     if cfg.kv_events:
         events = {"enable_kv_cache_events": True, "publisher": "zmq", "endpoint": f"tcp://*:{KV_EVENTS_PORT}"}
         args.append(f"--kv-events-config={json.dumps(events)}")
+        env.append({"name": "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "value": "0"})
         ports.append({"containerPort": KV_EVENTS_PORT})
         svc_ports.append({"name": "kv-events", "port": KV_EVENTS_PORT, "targetPort": KV_EVENTS_PORT})
     pod = {
@@ -239,11 +245,7 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
                     "image": cfg.vllm_image,
                     "command": ["vllm", "serve", cfg.model],
                     "args": args,
-                    "env": [
-                        {"name": "HF_HOME", "value": "/models/hf"},
-                        {"name": "HOME", "value": "/tmp"},
-                        {"name": "VLLM_LOGGING_LEVEL", "value": "INFO"},
-                    ],
+                    "env": env,
                     "ports": ports,
                     "readinessProbe": {"httpGet": {"path": "/health", "port": 8000}, "periodSeconds": 5},
                     "resources": {

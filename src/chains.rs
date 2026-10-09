@@ -314,6 +314,8 @@ pub struct ChainStats {
     pub deleted_leaf: AtomicU64,
     pub deferrals: AtomicU64,
     pub cascaded: AtomicU64,
+    /// Stored blocks announced as int hashes, whose files cannot be named.
+    pub undigested: AtomicU64,
 }
 
 /// The index shared by the subscriber and every worker.
@@ -403,6 +405,9 @@ impl Chains {
                         .as_deref()
                         .is_none_or(|m| medium.as_deref() == Some(m));
                     index.store(*parent, hashes, on_disk);
+                    if digests.is_empty() {
+                        Stats::add(&self.stats.undigested, hashes.len() as u64);
+                    }
                     for (h, d) in hashes.iter().zip(digests) {
                         index.set_digest(*h, d);
                     }
@@ -441,6 +446,7 @@ impl Chains {
             deleted_untracked = Stats::get(&s.deleted_untracked),
             deferrals = Stats::get(&s.deferrals),
             cascaded = Stats::get(&s.cascaded),
+            undigested = Stats::get(&s.undigested),
             "chains"
         );
     }
@@ -989,6 +995,7 @@ mod tests {
         assert_eq!(Stats::get(&s.deleted_orphan), 1);
         assert_eq!(Stats::get(&s.deleted_untracked), 1);
         assert_eq!(Stats::get(&s.deleted_leaf), 0);
+        assert_eq!(Stats::get(&s.undigested), 3, "test events carry int hashes");
     }
 
     #[test]
