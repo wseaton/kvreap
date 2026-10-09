@@ -2,7 +2,7 @@
 //!
 //! ```text
 //!  loop while evicting:
-//!    bucket <- random <rank>/<hhh> owned by this worker's shard
+//!    bucket <- next <rank>/<hhh> of this worker's shard, in shuffled passes
 //!    statx every *.bin under bucket/*/  ──►  pool (oldest POOL_CAP cold files)
 //!    unlink the oldest sampled x EVICT_FRACTION from the pool (fractions carry over)
 //! ```
@@ -112,8 +112,22 @@ impl Pool {
 
 #[derive(Debug, Default)]
 struct BucketIndex {
+    /// Shuffled; `next` walks it, and it is reshuffled after each full pass.
     buckets: Vec<(Arc<RankDir>, CString)>,
+    next: usize,
     refreshed_at: Option<Instant>,
+}
+
+impl BucketIndex {
+    fn next_bucket(&mut self) -> Option<(Arc<RankDir>, CString)> {
+        if self.next >= self.buckets.len() {
+            fastrand::shuffle(&mut self.buckets);
+            self.next = 0;
+        }
+        let bucket = self.buckets.get(self.next).cloned();
+        self.next += 1;
+        bucket
+    }
 }
 
 pub struct Context {
@@ -208,7 +222,9 @@ impl Worker {
         if self.fruitless_rounds < FRUITLESS_ROUNDS_BEFORE_BACKOFF {
             return None;
         }
-        self.index.refreshed_at = None;
+        if self.fruitless_rounds == FRUITLESS_ROUNDS_BEFORE_BACKOFF {
+            self.index.refreshed_at = None;
+        }
         let wait = self.backoff;
         self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
         Some(wait)
@@ -271,8 +287,10 @@ impl Worker {
             buckets = buckets.len(),
             "bucket index refreshed"
         );
+        fastrand::shuffle(&mut buckets);
         self.index = BucketIndex {
             buckets,
+            next: 0,
             refreshed_at: Some(Instant::now()),
         };
     }
@@ -287,11 +305,9 @@ impl Worker {
         if stale {
             self.refresh_index();
         }
-        if self.index.buckets.is_empty() {
+        let Some((rank, bucket)) = self.index.next_bucket() else {
             return Ok(None);
-        }
-        let (rank, bucket) =
-            self.index.buckets[fastrand::usize(..self.index.buckets.len())].clone();
+        };
         let sampled = match self.sample_bucket(&rank, &bucket) {
             Ok(n) => n,
             Err(e) if fsops::is_not_found(&e) => {
@@ -479,8 +495,8 @@ mod tests {
     use crate::shutdown::Shutdown;
     use crate::stats::Stats;
     use crate::worker::{
-        BACKOFF_MIN, Candidate, Context, FRUITLESS_ROUNDS_BEFORE_BACKOFF, Pool, RankDir, Removed,
-        RoundResult, Worker,
+        BACKOFF_MIN, BucketIndex, Candidate, Context, FRUITLESS_ROUNDS_BEFORE_BACKOFF, Pool,
+        RankDir, Removed, RoundResult, Worker,
     };
 
     fn candidate(path: &str, age_secs: u64) -> Candidate {
@@ -942,6 +958,57 @@ mod tests {
                 "a pending cold candidate is not a reason to back off"
             );
         }
+    }
+
+    #[test]
+    fn every_bucket_is_visited_once_per_pass() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("cache");
+        for b in 0..20 {
+            fs::create_dir_all(cache.join(format!("m_abcdef012345_r0/{:03x}/00_g0", b * 16)))
+                .expect("mkdir");
+        }
+        let mut h = harness(config(&cache, &[("ENABLE_DIR_CLEANUP", "false")]));
+        h.worker.refresh_index();
+        for _pass in 0..3 {
+            let mut seen: Vec<_> = (0..20)
+                .map(|_| h.worker.index.next_bucket().expect("bucket").1)
+                .collect();
+            seen.sort();
+            seen.dedup();
+            assert_eq!(seen.len(), 20, "a pass visits each bucket exactly once");
+        }
+        assert!(BucketIndex::default().next_bucket().is_none());
+    }
+
+    #[test]
+    fn last_cold_block_is_found_before_backoff() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("cache");
+        for b in 0..15u64 {
+            let hex = format!("{:03x}00{:011x}", b * 16, b);
+            let leaf = cache.join(format!("m_abcdef012345_r0/{}/00_g0", &hex[..3]));
+            fs::create_dir_all(&leaf).expect("mkdir");
+            let f = leaf.join(format!("{hex}.bin"));
+            fs::write(&f, b"x").expect("write");
+            if b == 7 {
+                age(&f, 7200);
+            }
+        }
+        let mut h = harness(config(&cache, &[]));
+        h.shared.set_mode(Mode::Evicting);
+        for _ in 0..FRUITLESS_ROUNDS_BEFORE_BACKOFF {
+            let r = h.worker.round().expect("round").expect("buckets");
+            assert_eq!(
+                h.worker.after_round(&r),
+                None,
+                "no backoff before a full pass"
+            );
+            if Stats::get(&h.stats.files_deleted) == 1 {
+                return;
+            }
+        }
+        panic!("the single cold block was not deleted within one pass plus credit");
     }
 
     #[test]
