@@ -94,8 +94,11 @@ struct Controller {
 
 impl Controller {
     fn run(self) {
-        let hysteresis =
-            Hysteresis::new(self.config.cleanup_threshold, self.config.target_threshold);
+        let hysteresis = Hysteresis::new(
+            self.config.cleanup_threshold,
+            self.config.target_threshold,
+            self.config.emergency_threshold,
+        );
         let mut pacer = Pacer::new(self.config.target_threshold);
         let mut planned = false;
         let mut mode = Mode::Idle;
@@ -409,6 +412,7 @@ fn main() -> ExitCode {
         cache = %config.cache_path().display(),
         cleanup = config.cleanup_threshold.get(),
         target = config.target_threshold.get(),
+        emergency = config.emergency_threshold.get(),
         workers = config.workers.get(),
         max_files_per_second = config.max_files_per_second,
         hot_threshold_secs = config.hot_threshold.as_secs(),

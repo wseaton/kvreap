@@ -637,7 +637,7 @@ fn atime_probe_falls_back_to_the_mount_when_the_cache_dir_is_missing() {
 
 #[test]
 fn invalid_config_exits_nonzero_with_reason() {
-    let cases: [(&[(&str, &str)], &str); 4] = [
+    let cases: [(&[(&str, &str)], &str); 5] = [
         (
             &[("NUM_CRAWLER_PROCESSES", "3")],
             "NUM_CRAWLER_PROCESSES must be a power of 2",
@@ -651,6 +651,7 @@ fn invalid_config_exits_nonzero_with_reason() {
             &[("DELETION_MAX_FILES_PER_SECOND", "-5")],
             "DELETION_MAX_FILES_PER_SECOND",
         ),
+        (&[("EMERGENCY_THRESHOLD", "80")], "EMERGENCY_THRESHOLD"),
     ];
     for (env, needle) in cases {
         let (status, stderr) = run_to_exit(env);
@@ -740,6 +741,55 @@ fn prune_is_paced_to_reach_target_in_about_a_minute() {
         "{deleted} deletions in 10 s, expected about 200\n{log}"
     );
     assert!(!log.contains("DELETION_END"), "{log}");
+}
+
+/// Deletions in the first 3 s of a prune starting at 95% with pacing capped at 1 file/s.
+fn deletions_in_first_seconds(emergency: Option<&str>) -> (usize, String) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(tmp.path());
+    let block_size = 64 * 1024;
+    let cold = cache.cold_blocks(100, block_size);
+    let capacity = (cold.len() * block_size) as f64 / 0.95;
+    let mut env = vec![
+        ("CAPACITY_BYTES", format!("{}", capacity as u64)),
+        ("CLEANUP_THRESHOLD", "85".to_string()),
+        ("TARGET_THRESHOLD", "70".to_string()),
+        ("DELETION_MAX_FILES_PER_SECOND", "1".to_string()),
+        ("LOGGER_INTERVAL_SECONDS", "0.05".to_string()),
+    ];
+    if let Some(e) = emergency {
+        env.push(("EMERGENCY_THRESHOLD", e.to_string()));
+    }
+    let mut ev = Evictor::start(tmp.path(), &env);
+    assert!(
+        ev.wait_for_log("DELETION_START", Duration::from_secs(10)),
+        "{}",
+        ev.log()
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    let deleted = cold.len() - existing(&cold).len();
+    assert!(ev.sigterm().success());
+    (deleted, ev.log())
+}
+
+#[test]
+fn emergency_threshold_moves_the_unpaced_band() {
+    let (deleted, log) = deletions_in_first_seconds(Some("86"));
+    assert!(log.contains("emergency band"), "{log}");
+    assert!(
+        deleted >= 7,
+        "95% -> 86% unpaced should delete ~9 blocks at once, got {deleted}\n{log}"
+    );
+
+    let (deleted, log) = deletions_in_first_seconds(None);
+    assert!(
+        !log.contains("emergency band"),
+        "95% is below the default 97%\n{log}"
+    );
+    assert!(
+        deleted <= 4,
+        "1 file/s cap allows at most ~3 deletions in 3 s, got {deleted}\n{log}"
+    );
 }
 
 #[test]

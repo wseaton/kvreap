@@ -6,7 +6,8 @@ filesystem.
 
 Each item is marked **measured** (observed on coreweave-waldorf, 2026-10-09),
 **inferred** (follows from a measurement or documented kernel behavior, not
-directly tested) or **proposed** (a change to kvreap).
+directly tested), **proposed** (a change to kvreap) or **implemented** (a
+proposed change that has landed).
 
 ## What kvreap assumes
 
@@ -119,7 +120,7 @@ mounted with `prjquota`.
 | Local ext4/XFS with a dedicated LV (topolvm, LVM CSI) | exact | `relatime` | the easy case |
 | Filesystems without `d_type` (XFS `ftype=0`, some NFS) | — | — | kvreap stats each entry to learn its type: one extra op per entry |
 
-## Proposed changes to kvreap
+## Changes to kvreap
 
 In rough priority order.
 
@@ -159,9 +160,11 @@ In rough priority order.
    20 deletes). The budget runs at the lowest of that (floored at 20 ops/s),
    `2 x DELETION_MAX_FILES_PER_SECOND` and AIMD, and AIMD no longer grows
    while it isn't the binding limit. The emergency band stays unpaced.
-5. **Configurable emergency band** (proposed). The unpaced band starts at 97%,
-   which is too late on VAST with a 5 s usage lag and a soft quota. Add
-   `EMERGENCY_THRESHOLD`, defaulting to the current behavior.
+5. **Configurable emergency band** (implemented). The unpaced band starts at
+   97% by default, which is too late on VAST with a 5 s usage lag and a soft
+   quota. `EMERGENCY_THRESHOLD` moves it; the default stays
+   `max(97, CLEANUP_THRESHOLD)`, and values below `CLEANUP_THRESHOLD` are
+   rejected.
 6. **Health check that never touches the mount** (proposed). Add
    `kvreap healthcheck`, which checks the controller's last successful
    `statvfs` timestamp from a heartbeat file in `/tmp`, so a hung NFS mount

@@ -7,8 +7,6 @@ use std::time::Duration;
 use crate::capacity::Samples;
 use crate::config::{CapacityBytes, Percent};
 
-pub const EMERGENCY_FLOOR: f64 = 97.0;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Idle,
@@ -101,11 +99,11 @@ pub struct Hysteresis {
 }
 
 impl Hysteresis {
-    pub fn new(cleanup: Percent, target: Percent) -> Self {
+    pub fn new(cleanup: Percent, target: Percent, emergency: Percent) -> Self {
         Self {
             cleanup: cleanup.get(),
             target: target.get(),
-            emergency: cleanup.get().max(EMERGENCY_FLOOR),
+            emergency: emergency.get(),
         }
     }
 
@@ -240,9 +238,16 @@ mod tests {
     };
 
     fn h(cleanup: f64, target: f64) -> Hysteresis {
+        let c = Config::from_lookup(|k| match k {
+            "CLEANUP_THRESHOLD" => Some(cleanup.to_string()),
+            "TARGET_THRESHOLD" => Some(target.to_string()),
+            _ => None,
+        })
+        .expect("config");
         Hysteresis::new(
-            Percent::new("c", cleanup).expect("pct"),
-            Percent::new("t", target).expect("pct"),
+            c.cleanup_threshold,
+            c.target_threshold,
+            c.emergency_threshold,
         )
     }
 
@@ -264,6 +269,20 @@ mod tests {
         assert_eq!(h.next(Mode::Evicting, 99.0), Mode::Emergency);
         assert_eq!(h.next(Mode::Emergency, 96.9), Mode::Evicting);
         assert_eq!(h.next(Mode::Emergency, 60.0), Mode::Idle);
+    }
+
+    #[test]
+    fn configured_emergency_band() {
+        let pct = |v: f64| Percent::new("p", v).expect("pct");
+        let h = Hysteresis::new(pct(85.0), pct(70.0), pct(90.0));
+        assert_eq!(h.next(Mode::Idle, 89.9), Mode::Evicting);
+        assert_eq!(h.next(Mode::Idle, 90.0), Mode::Emergency);
+        assert_eq!(h.next(Mode::Emergency, 89.0), Mode::Evicting);
+        assert_eq!(h.next(Mode::Emergency, 70.0), Mode::Idle);
+
+        let h = Hysteresis::new(pct(85.0), pct(70.0), pct(85.0));
+        assert_eq!(h.next(Mode::Idle, 84.9), Mode::Idle);
+        assert_eq!(h.next(Mode::Idle, 85.0), Mode::Emergency, "no paced band");
     }
 
     #[test]

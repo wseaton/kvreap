@@ -17,6 +17,8 @@ pub enum ConfigError {
     },
     #[error("TARGET_THRESHOLD ({target}) must be below CLEANUP_THRESHOLD ({cleanup})")]
     TargetNotBelowCleanup { target: f64, cleanup: f64 },
+    #[error("EMERGENCY_THRESHOLD ({emergency}) must not be below CLEANUP_THRESHOLD ({cleanup})")]
+    EmergencyBelowCleanup { emergency: f64, cleanup: f64 },
     #[error("NUM_CRAWLER_PROCESSES must be a power of 2 from 1 to 16, got {0}")]
     InvalidWorkerCount(i64),
 }
@@ -123,6 +125,8 @@ pub struct Config {
     pub cache_directory: PathBuf,
     pub cleanup_threshold: Percent,
     pub target_threshold: Percent,
+    /// Usage at which pacing is dropped.
+    pub emergency_threshold: Percent,
     pub dry_run: bool,
     pub log_level: LogLevel,
     pub workers: WorkerCount,
@@ -139,6 +143,9 @@ pub struct Config {
     /// When set, usage is estimated from bucket samples against this size instead of `statvfs`.
     pub capacity_bytes: Option<CapacityBytes>,
 }
+
+/// Default emergency band floor; the default band is `max(97, CLEANUP_THRESHOLD)`.
+const DEFAULT_EMERGENCY_FLOOR: f64 = 97.0;
 
 const IGNORED_VARS: [&str; 2] = ["FILE_QUEUE_MAXSIZE", "FILE_QUEUE_MIN_SIZE"];
 
@@ -163,14 +170,14 @@ impl Config {
         let get = |var: &'static str, default: &str| -> String {
             lookup(var).unwrap_or_else(|| default.to_string())
         };
-        let num = |var: &'static str, default: &str| -> Result<f64, ConfigError> {
-            let raw = get(var, default);
+        let parse = |var: &'static str, raw: String| -> Result<f64, ConfigError> {
             raw.trim()
                 .parse::<f64>()
                 .ok()
                 .filter(|v| v.is_finite())
                 .ok_or(ConfigError::NotANumber { var, value: raw })
         };
+        let num = |var: &'static str, default: &str| parse(var, get(var, default));
         let int = |var: &'static str, default: &str| -> Result<i64, ConfigError> {
             num(var, default).map(|v| v.trunc() as i64)
         };
@@ -195,6 +202,20 @@ impl Config {
         if target >= cleanup {
             return Err(ConfigError::TargetNotBelowCleanup {
                 target: target.get(),
+                cleanup: cleanup.get(),
+            });
+        }
+
+        let emergency = Percent::new(
+            "EMERGENCY_THRESHOLD",
+            match optional("EMERGENCY_THRESHOLD") {
+                Some(raw) => parse("EMERGENCY_THRESHOLD", raw)?,
+                None => cleanup.get().max(DEFAULT_EMERGENCY_FLOOR),
+            },
+        )?;
+        if emergency < cleanup {
+            return Err(ConfigError::EmergencyBelowCleanup {
+                emergency: emergency.get(),
                 cleanup: cleanup.get(),
             });
         }
@@ -229,6 +250,7 @@ impl Config {
             cache_directory: PathBuf::from(get("CACHE_DIRECTORY", "kv/model-cache/models")),
             cleanup_threshold: cleanup,
             target_threshold: target,
+            emergency_threshold: emergency,
             dry_run: flag("DRY_RUN", "false"),
             log_level: LogLevel::parse(&get("LOG_LEVEL", "INFO")),
             workers: WorkerCount::new(int("NUM_CRAWLER_PROCESSES", "8")?)?,
@@ -283,6 +305,7 @@ mod tests {
         );
         assert_eq!(c.cleanup_threshold.get(), 85.0);
         assert_eq!(c.target_threshold.get(), 70.0);
+        assert_eq!(c.emergency_threshold.get(), 97.0);
         assert!(!c.dry_run);
         assert_eq!(c.log_level, LogLevel::Info);
         assert_eq!(c.workers.get(), 8);
@@ -411,6 +434,49 @@ mod tests {
         assert!(matches!(
             cfg(&[("CLEANUP_THRESHOLD", "101")]),
             Err(ConfigError::OutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn emergency_threshold_defaults_to_max_of_97_and_cleanup() {
+        let c = cfg(&[("CLEANUP_THRESHOLD", "98.5"), ("TARGET_THRESHOLD", "90")]).expect("parse");
+        assert_eq!(c.emergency_threshold.get(), 98.5);
+        let c = cfg(&[("EMERGENCY_THRESHOLD", "")]).expect("parse");
+        assert_eq!(c.emergency_threshold.get(), 97.0);
+    }
+
+    #[test]
+    fn emergency_threshold_is_configurable_down_to_cleanup() {
+        let c = cfg(&[("EMERGENCY_THRESHOLD", "90")]).expect("parse");
+        assert_eq!(c.emergency_threshold.get(), 90.0);
+        let c = cfg(&[("EMERGENCY_THRESHOLD", "85")]).expect("parse");
+        assert_eq!(c.emergency_threshold.get(), 85.0);
+        let c = cfg(&[("EMERGENCY_THRESHOLD", "100")]).expect("parse");
+        assert_eq!(c.emergency_threshold.get(), 100.0);
+    }
+
+    #[test]
+    fn emergency_threshold_rejects_bad_values() {
+        assert_eq!(
+            cfg(&[("EMERGENCY_THRESHOLD", "80")]).err(),
+            Some(ConfigError::EmergencyBelowCleanup {
+                emergency: 80.0,
+                cleanup: 85.0
+            })
+        );
+        assert!(matches!(
+            cfg(&[("EMERGENCY_THRESHOLD", "101")]),
+            Err(ConfigError::OutOfRange {
+                var: "EMERGENCY_THRESHOLD",
+                ..
+            })
+        ));
+        assert!(matches!(
+            cfg(&[("EMERGENCY_THRESHOLD", "soon")]),
+            Err(ConfigError::NotANumber {
+                var: "EMERGENCY_THRESHOLD",
+                ..
+            })
         ));
     }
 

@@ -25,7 +25,8 @@ metadata operation that competes with vLLM's own lookups and writes. kvreap:
 - **Paces every metadata op** through one budget: at most
   `2 x DELETION_MAX_FILES_PER_SECOND` ops/s (0 = no cap), reduced further by
   AIMD when observed `readdir`/`statx`/`unlink` latency rises 3x above its
-  rolling baseline. At 97% usage pacing is dropped.
+  rolling baseline. At `EMERGENCY_THRESHOLD` (default 97%, or
+  `CLEANUP_THRESHOLD` if higher) pacing is dropped.
 - **Paces prunes to need.** A prune targets the delete rate that brings usage
   from where it started down to `TARGET_THRESHOLD` in about 60 s (bytes over
   target / mean sampled file size, converted to ops with the measured ops per
@@ -45,6 +46,7 @@ metadata operation that competes with vLLM's own lookups and writes. kvreap:
 | `PVC_MOUNT_PATH` | `/kv-cache` | |
 | `CACHE_DIRECTORY` | `kv/model-cache/models` | relative to the mount |
 | `CLEANUP_THRESHOLD` / `TARGET_THRESHOLD` | `85` / `70` | start / stop eviction (% used) |
+| `EMERGENCY_THRESHOLD` | `max(97, CLEANUP_THRESHOLD)` | % used at which deletion stops being paced; must not be below `CLEANUP_THRESHOLD` |
 | `NUM_CRAWLER_PROCESSES` | `8` | worker threads; 1, 2, 4, 8 or 16 |
 | `LOGGER_INTERVAL_SECONDS` | `0.5` | `statvfs` poll interval |
 | `DELETION_MAX_FILES_PER_SECOND` | `0` | 0 = no cap (AIMD still applies) |
