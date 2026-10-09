@@ -1,11 +1,14 @@
 //! Metadata-operation budget shared by all workers.
 //!
 //! ```text
-//!   ops/s = min(cap, aimd)            cap = 2 x DELETION_MAX_FILES_PER_SECOND (stat + unlink)
+//!   ops/s = min(cap, aimd, max(need, MIN_RATE))
+//!           cap  = 2 x DELETION_MAX_FILES_PER_SECOND (stat + unlink)
+//!           need = set by the controller while evicting (none: no limit)
 //!
 //!   every tick (1s):  latency EWMA per op kind vs. its rolling-minimum baseline
 //!     any kind > CONGESTION_RATIO x baseline (and > LATENCY_FLOOR)  -> aimd /= 2
-//!     otherwise                                                     -> aimd += step
+//!     otherwise, if aimd is the binding limit                       -> aimd += step
+//!     otherwise                                                     -> aimd holds
 //! ```
 
 use std::collections::VecDeque;
@@ -106,15 +109,16 @@ impl Aimd {
         self.tracks[kind.index()].observe(latency.as_secs_f64());
     }
 
-    /// Returns true if the rate was cut.
-    pub fn tick(&mut self) -> bool {
+    /// Returns true if the rate was cut. `limited` says whether the AIMD rate
+    /// was the binding limit since the last tick; if not, it does not grow.
+    pub fn tick(&mut self, limited: bool) -> bool {
         let congested = OpKind::ALL
             .iter()
             .map(|k| self.tracks[k.index()].congested_and_roll())
             .fold(false, |acc, c| acc | c);
         if congested {
             self.rate /= 2.0;
-        } else {
+        } else if limited {
             self.rate += ADDITIVE_STEP;
         }
         self.clamp();
@@ -125,11 +129,27 @@ impl Aimd {
 #[derive(Debug)]
 struct Inner {
     aimd: Aimd,
+    need: Option<f64>,
     next_slot: Instant,
     last_tick: Instant,
 }
 
-/// Spaces operations evenly (no burst) at the current AIMD rate.
+impl Inner {
+    fn need_floor(&self) -> Option<f64> {
+        self.need.map(|n| n.max(MIN_RATE))
+    }
+
+    fn rate(&self) -> f64 {
+        let aimd = self.aimd.rate();
+        self.need_floor().map_or(aimd, |n| aimd.min(n))
+    }
+
+    fn aimd_limited(&self) -> bool {
+        self.need_floor().is_none_or(|n| n >= self.aimd.rate())
+    }
+}
+
+/// Spaces operations evenly (no burst) at the current rate.
 #[derive(Debug)]
 pub struct Budget {
     inner: Mutex<Inner>,
@@ -143,6 +163,7 @@ impl Budget {
         Self {
             inner: Mutex::new(Inner {
                 aimd: Aimd::new(cap),
+                need: None,
                 next_slot: now,
                 last_tick: now,
             }),
@@ -150,7 +171,14 @@ impl Budget {
     }
 
     pub fn rate(&self) -> f64 {
-        self.inner.lock().map(|g| g.aimd.rate()).unwrap_or(0.0)
+        self.inner.lock().map(|g| g.rate()).unwrap_or(0.0)
+    }
+
+    /// Ops/s the current prune needs (floored at `MIN_RATE`); `None` lifts the limit.
+    pub fn set_need(&self, ops_per_sec: Option<f64>) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.need = ops_per_sec.filter(|n| n.is_finite());
+        }
     }
 
     pub fn observe(&self, kind: OpKind, latency: Duration) {
@@ -168,7 +196,8 @@ impl Budget {
             let now = Instant::now();
             if now.duration_since(g.last_tick) >= TICK {
                 g.last_tick = now;
-                if g.aimd.tick() {
+                let limited = g.aimd_limited();
+                if g.aimd.tick(limited) {
                     tracing::info!(
                         rate = g.aimd.rate(),
                         "metadata latency rising, halving op rate"
@@ -179,7 +208,7 @@ impl Budget {
                 g.next_slot = now;
                 Duration::ZERO
             } else {
-                let interval = Duration::from_secs_f64(1.0 / g.aimd.rate());
+                let interval = Duration::from_secs_f64(1.0 / g.rate());
                 let slot = g.next_slot.max(now);
                 g.next_slot = slot + interval;
                 slot - now
@@ -209,7 +238,7 @@ mod tests {
             for _ in 0..10 {
                 aimd.observe(kind, latency);
             }
-            aimd.tick();
+            aimd.tick(true);
         }
     }
 
@@ -228,7 +257,7 @@ mod tests {
         for _ in 0..30 {
             a.observe(OpKind::Unlink, ms(20));
         }
-        assert!(a.tick());
+        assert!(a.tick(true));
         assert_eq!(a.rate(), before / 2.0);
     }
 
@@ -239,7 +268,10 @@ mod tests {
         for _ in 0..30 {
             a.observe(OpKind::Stat, ms(1));
         }
-        assert!(!a.tick(), "1ms is below the floor even at 100x baseline");
+        assert!(
+            !a.tick(true),
+            "1ms is below the floor even at 100x baseline"
+        );
     }
 
     #[test]
@@ -248,13 +280,13 @@ mod tests {
         for _ in 0..5 {
             a.observe(OpKind::Unlink, ms(3));
             a.observe(OpKind::Readdir, ms(4));
-            a.tick();
+            a.tick(true);
         }
         for _ in 0..30 {
             a.observe(OpKind::Readdir, ms(50));
         }
         a.observe(OpKind::Unlink, ms(3));
-        assert!(a.tick());
+        assert!(a.tick(true));
     }
 
     #[test]
@@ -270,7 +302,7 @@ mod tests {
             for _ in 0..30 {
                 a.observe(OpKind::Unlink, ms(3 * 4u64.pow((i % 6) + 1)));
             }
-            a.tick();
+            a.tick(true);
         }
         assert!(a.rate() >= MIN_RATE);
     }
@@ -285,8 +317,85 @@ mod tests {
         let mut a = Aimd::new(None);
         steady(&mut a, OpKind::Unlink, ms(3), 3);
         let before = a.rate();
-        assert!(!a.tick());
+        assert!(!a.tick(true));
         assert_eq!(a.rate(), before + ADDITIVE_STEP);
+    }
+
+    #[test]
+    fn no_additive_increase_when_not_the_binding_limit() {
+        let mut a = Aimd::new(None);
+        for _ in 0..5 {
+            a.observe(OpKind::Unlink, ms(3));
+            assert!(!a.tick(false));
+        }
+        assert_eq!(a.rate(), START_RATE);
+        for _ in 0..30 {
+            a.observe(OpKind::Unlink, ms(30));
+        }
+        assert!(a.tick(false), "congestion still halves");
+        assert_eq!(a.rate(), START_RATE / 2.0);
+    }
+
+    #[test]
+    fn need_limits_the_rate_with_a_floor() {
+        let budget = Budget::new(0.0);
+        assert_eq!(budget.rate(), START_RATE);
+        budget.set_need(Some(120.0));
+        assert_eq!(budget.rate(), 120.0);
+        budget.set_need(Some(1.0));
+        assert_eq!(budget.rate(), MIN_RATE);
+        budget.set_need(Some(10_000.0));
+        assert_eq!(budget.rate(), START_RATE, "AIMD still caps");
+        budget.set_need(Some(f64::NAN));
+        assert_eq!(budget.rate(), START_RATE);
+        budget.set_need(None);
+        assert_eq!(budget.rate(), START_RATE);
+
+        let capped = Budget::new(5.0);
+        capped.set_need(Some(1.0));
+        assert_eq!(
+            capped.rate(),
+            10.0,
+            "a cap below MIN_RATE wins over the floor"
+        );
+    }
+
+    #[test]
+    fn aimd_holds_while_need_is_the_binding_limit() {
+        let budget = Budget::new(0.0);
+        let shutdown = Shutdown::default();
+        budget.set_need(Some(400.0));
+        let start = Instant::now();
+        while start.elapsed() < ms(2300) {
+            assert!(budget.acquire(&shutdown, false));
+        }
+        budget.set_need(None);
+        assert_eq!(
+            budget.rate(),
+            START_RATE,
+            "AIMD did not grow behind the need limit"
+        );
+
+        let unlimited = Budget::new(0.0);
+        let start = Instant::now();
+        while start.elapsed() < ms(2300) {
+            assert!(unlimited.acquire(&shutdown, false));
+        }
+        assert!(unlimited.rate() > START_RATE);
+    }
+
+    #[test]
+    fn budget_paces_at_need() {
+        let budget = Budget::new(0.0);
+        budget.set_need(Some(50.0)); // 20ms spacing
+        let shutdown = Shutdown::default();
+        let start = Instant::now();
+        for _ in 0..11 {
+            assert!(budget.acquire(&shutdown, false));
+        }
+        let elapsed = start.elapsed();
+        assert!(elapsed >= ms(190), "{elapsed:?}");
+        assert!(elapsed < ms(600), "{elapsed:?}");
     }
 
     #[test]

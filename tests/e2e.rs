@@ -706,6 +706,43 @@ fn capacity_bytes_drives_thresholds_instead_of_statvfs() {
 }
 
 #[test]
+fn prune_is_paced_to_reach_target_in_about_a_minute() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(tmp.path());
+    let block_size = 4096;
+    let cold = cache.cold_blocks(1500, block_size);
+    // 90% of CAPACITY_BYTES; reaching 20% means deleting ~1170 blocks, so the
+    // pace is ~20 files/s. Unpaced, AIMD starts at 500 ops/s and only climbs.
+    let capacity = (cold.len() * block_size) as f64 / 0.9;
+    let env = vec![
+        ("CAPACITY_BYTES", format!("{}", capacity as u64)),
+        ("CLEANUP_THRESHOLD", "50".to_string()),
+        ("TARGET_THRESHOLD", "20".to_string()),
+        ("LOGGER_INTERVAL_SECONDS", "0.1".to_string()),
+    ];
+    let mut ev = Evictor::start(tmp.path(), &env);
+    assert!(
+        ev.wait_for_log("DELETION_START", Duration::from_secs(10)),
+        "{}",
+        ev.log()
+    );
+    assert!(
+        ev.wait_for_log("pacing prune", Duration::from_secs(5)),
+        "{}",
+        ev.log()
+    );
+    std::thread::sleep(Duration::from_secs(10));
+    let deleted = cold.len() - existing(&cold).len();
+    assert!(ev.sigterm().success());
+    let log = ev.log();
+    assert!(
+        (60..=450).contains(&deleted),
+        "{deleted} deletions in 10 s, expected about 200\n{log}"
+    );
+    assert!(!log.contains("DELETION_END"), "{log}");
+}
+
+#[test]
 fn capacity_bytes_ignores_statvfs() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cache = Cache::new(tmp.path());

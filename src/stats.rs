@@ -11,10 +11,25 @@ pub struct Stats {
     pub stat_ops: AtomicU64,
     pub unlink_ops: AtomicU64,
     pub rmdir_ops: AtomicU64,
+    /// Ops by the `CAPACITY_BYTES` sampler, which bypass the budget.
+    pub sampler_ops: AtomicU64,
     pub errors: AtomicU64,
 }
 
 impl Stats {
+    /// Metadata ops issued through the budget.
+    pub fn budgeted_ops(&self) -> u64 {
+        [
+            &self.readdir_ops,
+            &self.stat_ops,
+            &self.unlink_ops,
+            &self.rmdir_ops,
+        ]
+        .into_iter()
+        .map(Self::get)
+        .sum()
+    }
+
     pub fn add(counter: &AtomicU64, n: u64) {
         counter.fetch_add(n, Ordering::Relaxed);
     }

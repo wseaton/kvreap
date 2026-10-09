@@ -151,12 +151,14 @@ In rough priority order.
    leaves and buckets that sampling finds empty and unchanged for
    `DIR_CLEANUP_TTL_SECONDS`. Still to do: measure vLLM MKDIR and evictor
    RMDIR against the numbers above.
-4. **Pace to need instead of bursting** (proposed). On VAST the AIMD back-off
-   never fired and the op budget climbed to ~7k ops/s during prunes. Target a
-   delete rate that reaches `TARGET_THRESHOLD` in a fixed time (e.g.
-   bytes over target ÷ 60 s, converted with the sampled mean file size),
-   capped by `DELETION_MAX_FILES_PER_SECOND` and AIMD. Prunes stay fast
-   without the spikes.
+4. **Pace to need instead of bursting** (implemented). On VAST the AIMD
+   back-off never fired and the op budget climbed to ~7k ops/s during prunes.
+   The controller now plans each prune: bytes over target when it started
+   (or now, if larger) ÷ 60 s, converted to files with the mean sampled file
+   size and to ops with the ops per delete measured during the prune (3 until
+   20 deletes). The budget runs at the lowest of that (floored at 20 ops/s),
+   `2 x DELETION_MAX_FILES_PER_SECOND` and AIMD, and AIMD no longer grows
+   while it isn't the binding limit. The emergency band stays unpaced.
 5. **Configurable emergency band** (proposed). The unpaced band starts at 97%,
    which is too late on VAST with a 5 s usage lag and a soft quota. Add
    `EMERGENCY_THRESHOLD`, defaulting to the current behavior.

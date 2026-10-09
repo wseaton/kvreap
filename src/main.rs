@@ -26,7 +26,9 @@ use crate::atime::AtimeBehavior;
 use crate::budget::Budget;
 use crate::capacity::{Sampler, Samples, statvfs_overreports};
 use crate::config::Config;
-use crate::controller::{Hysteresis, Mode, SharedState, UsageSource, disk_usage};
+use crate::controller::{
+    Hysteresis, Mode, OpCounts, PRUNE_HORIZON, Pacer, SharedState, UsageSource, disk_usage,
+};
 use crate::layout::Shard;
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
@@ -79,67 +81,106 @@ fn unix_now() -> f64 {
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-fn controller_loop(
+/// Polls usage, drives the eviction mode and paces prunes to need.
+struct Controller {
     config: Arc<Config>,
     source: UsageSource,
     shared: Arc<SharedState>,
+    budget: Arc<Budget>,
+    samples: Arc<Samples>,
+    stats: Arc<Stats>,
     shutdown: Arc<Shutdown>,
-) {
-    let hysteresis = Hysteresis::new(config.cleanup_threshold, config.target_threshold);
-    let mut mode = Mode::Idle;
-    let mut have_usage = false;
-    loop {
-        match source.read() {
-            Ok(Some(usage)) => {
-                let pct = usage.percent();
-                if !have_usage {
-                    have_usage = true;
-                    if let UsageSource::Sampled { .. } = source {
+}
+
+impl Controller {
+    fn run(self) {
+        let hysteresis =
+            Hysteresis::new(self.config.cleanup_threshold, self.config.target_threshold);
+        let mut pacer = Pacer::new(self.config.target_threshold);
+        let mut planned = false;
+        let mut mode = Mode::Idle;
+        let mut have_usage = false;
+        loop {
+            match self.source.read() {
+                Ok(Some(usage)) => {
+                    let pct = usage.percent();
+                    if !have_usage {
+                        have_usage = true;
+                        if let UsageSource::Sampled { .. } = self.source {
+                            tracing::info!(
+                                usage = format!("{pct:.2}%"),
+                                used_gb = format!("{:.2}", usage.used_bytes as f64 / GIB),
+                                capacity_gb = format!("{:.2}", usage.total_bytes as f64 / GIB),
+                                "sampled usage estimate ready"
+                            );
+                        }
+                    }
+                    self.shared.set_usage(pct);
+                    let next = hysteresis.next(mode, pct);
+                    if next != mode {
+                        let previous = mode;
+                        mode = next;
+                        self.shared.set_mode(mode);
+                        let (used, total) = (
+                            usage.used_bytes as f64 / GIB,
+                            usage.total_bytes as f64 / GIB,
+                        );
+                        match (previous.is_evicting(), next.is_evicting()) {
+                            (false, true) => tracing::info!(
+                                "DELETION_START: timestamp={:.3}, usage={pct:.2}%, used={used:.2}GB, total={total:.2}GB",
+                                unix_now()
+                            ),
+                            (true, false) => tracing::info!(
+                                "DELETION_END: timestamp={:.3}, usage={pct:.2}%, used={used:.2}GB, total={total:.2}GB",
+                                unix_now()
+                            ),
+                            _ => {}
+                        }
+                        if next == Mode::Emergency {
+                            tracing::warn!(
+                                usage = pct,
+                                "usage in emergency band, deleting without pacing"
+                            );
+                        }
+                    }
+                    let plan = match mode {
+                        Mode::Evicting => pacer.plan(
+                            usage,
+                            self.samples.mean_file_size(),
+                            OpCounts {
+                                ops: self.stats.budgeted_ops(),
+                                deletes: Stats::get(&self.stats.files_deleted),
+                            },
+                        ),
+                        Mode::Emergency => None,
+                        Mode::Idle => {
+                            pacer.stop();
+                            planned = false;
+                            None
+                        }
+                    };
+                    if let Some(plan) = plan
+                        && !planned
+                    {
+                        planned = true;
                         tracing::info!(
-                            usage = format!("{pct:.2}%"),
-                            used_gb = format!("{:.2}", usage.used_bytes as f64 / GIB),
-                            capacity_gb = format!("{:.2}", usage.total_bytes as f64 / GIB),
-                            "sampled usage estimate ready"
+                            files_per_sec = format!("{:.1}", plan.files_per_sec),
+                            ops_per_sec = format!("{:.0}", plan.ops_per_sec),
+                            "pacing prune to reach TARGET_THRESHOLD in {}s",
+                            PRUNE_HORIZON.as_secs()
                         );
                     }
+                    self.budget.set_need(plan.map(|p| p.ops_per_sec));
                 }
-                shared.set_usage(pct);
-                let next = hysteresis.next(mode, pct);
-                if next != mode {
-                    let previous = mode;
-                    mode = next;
-                    shared.set_mode(mode);
-                    let (used, total) = (
-                        usage.used_bytes as f64 / GIB,
-                        usage.total_bytes as f64 / GIB,
-                    );
-                    match (previous.is_evicting(), next.is_evicting()) {
-                        (false, true) => tracing::info!(
-                            "DELETION_START: timestamp={:.3}, usage={pct:.2}%, used={used:.2}GB, total={total:.2}GB",
-                            unix_now()
-                        ),
-                        (true, false) => tracing::info!(
-                            "DELETION_END: timestamp={:.3}, usage={pct:.2}%, used={used:.2}GB, total={total:.2}GB",
-                            unix_now()
-                        ),
-                        _ => {}
-                    }
-                    if next == Mode::Emergency {
-                        tracing::warn!(
-                            usage = pct,
-                            "usage in emergency band, deleting without pacing"
-                        );
-                    }
-                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "statvfs failed"),
             }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(error = %e, "statvfs failed"),
+            if self.shutdown.wait(self.config.usage_poll_interval) {
+                break;
+            }
         }
-        if shutdown.wait(config.usage_poll_interval) {
-            break;
-        }
+        self.shared.set_mode(Mode::Idle);
     }
-    shared.set_mode(Mode::Idle);
 }
 
 fn log_atime_behavior(config: &Config) {
@@ -220,6 +261,7 @@ fn log_status(shared: &SharedState, budget: &Budget, stats: &Stats) {
         stat_ops = Stats::get(&stats.stat_ops),
         unlink_ops = Stats::get(&stats.unlink_ops),
         rmdir_ops = Stats::get(&stats.rmdir_ops),
+        sampler_ops = Stats::get(&stats.sampler_ops),
         errors = Stats::get(&stats.errors),
         "status"
     );
@@ -301,16 +343,16 @@ fn run(config: Config) -> anyhow::Result<()> {
     let (events_tx, events_thread) = start_events(&config)?;
     let (source, sampler) = start_usage_source(&config, &samples, &stats, &shutdown)?;
 
-    let controller = {
-        let (config, shared, shutdown) = (
-            Arc::clone(&config),
-            Arc::clone(&shared),
-            Arc::clone(&shutdown),
-        );
-        spawn("controller".into(), move || {
-            controller_loop(config, source, shared, shutdown)
-        })?
+    let controller = Controller {
+        config: Arc::clone(&config),
+        source,
+        shared: Arc::clone(&shared),
+        budget: Arc::clone(&budget),
+        samples: Arc::clone(&samples),
+        stats: Arc::clone(&stats),
+        shutdown: Arc::clone(&shutdown),
     };
+    let controller = spawn("controller".into(), move || controller.run())?;
 
     let mut workers = Vec::new();
     for (id, shard) in Shard::split(config.workers.get()).into_iter().enumerate() {

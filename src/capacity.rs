@@ -65,6 +65,15 @@ impl Samples {
         self.inner.lock().map(|w| w.samples.len()).unwrap_or(0)
     }
 
+    /// Mean block file size over the window; `None` before any file was sampled.
+    pub fn mean_file_size(&self) -> Option<f64> {
+        let w = self.inner.lock().ok()?;
+        let (files, bytes) = w.samples.iter().fold((0u64, 0u64), |(f, b), s| {
+            (f.saturating_add(s.files), b.saturating_add(s.bytes))
+        });
+        (files > 0).then(|| bytes as f64 / files as f64)
+    }
+
     /// Estimated bytes of block files in the cache; `None` until the buckets
     /// have been counted and at least `MIN_SAMPLES` of them sampled.
     pub fn estimated_used_bytes(&self) -> Option<u64> {
@@ -88,22 +97,23 @@ pub fn statvfs_overreports(statvfs_total: u64, capacity: CapacityBytes) -> bool 
     statvfs_total > capacity.get().saturating_mul(STATVFS_MISMATCH_FACTOR)
 }
 
-/// Lists and stats one bucket without going through the op budget.
+/// Lists and stats one bucket without going through the op budget. Ops count
+/// as `sampler_ops`, so the controller's ops-per-delete ratio leaves them out.
 fn bucket_sample(bucket: &Path, stats: &Stats) -> io::Result<BucketSample> {
     let bucket_fd = fsops::open_dir(bucket)?;
-    Stats::add(&stats.readdir_ops, 1);
+    Stats::add(&stats.sampler_ops, 1);
     let leaves = fsops::list(&bucket_fd)?;
     let mut sample = BucketSample::default();
     for leaf in leaves.iter().filter(|e| e.kind == EntryKind::Dir) {
         let Ok(leaf_fd) = fsops::open_dir_at(&bucket_fd, &leaf.name) else {
             continue;
         };
-        Stats::add(&stats.readdir_ops, 1);
+        Stats::add(&stats.sampler_ops, 1);
         let Ok(files) = fsops::list(&leaf_fd) else {
             continue;
         };
         for (name, _) in block_files(&files) {
-            Stats::add(&stats.stat_ops, 1);
+            Stats::add(&stats.sampler_ops, 1);
             if let Ok(meta) = fsops::stat_at(&leaf_fd, name) {
                 sample.files += 1;
                 sample.bytes = sample.bytes.saturating_add(meta.size);
@@ -128,7 +138,7 @@ impl Sampler {
     fn list_buckets(&self) -> Vec<PathBuf> {
         let mut buckets = Vec::new();
         for rank in discover_rank_dirs(&self.cache) {
-            Stats::add(&self.stats.readdir_ops, 1);
+            Stats::add(&self.stats.sampler_ops, 1);
             let Ok(entries) = fsops::open_dir(&rank).and_then(|fd| fsops::list(&fd)) else {
                 continue;
             };
@@ -251,6 +261,18 @@ mod tests {
             s.record(sample(1, 10));
         }
         assert_eq!(s.estimated_used_bytes(), Some(1000));
+        assert_eq!(s.mean_file_size(), Some(10.0));
+    }
+
+    #[test]
+    fn mean_file_size_weights_by_file_count() {
+        let s = Samples::default();
+        assert_eq!(s.mean_file_size(), None);
+        s.record(sample(0, 0));
+        assert_eq!(s.mean_file_size(), None);
+        s.record(sample(3, 300));
+        s.record(sample(1, 500));
+        assert_eq!(s.mean_file_size(), Some(200.0));
     }
 
     #[test]
@@ -296,8 +318,9 @@ mod tests {
         let stats = Stats::default();
         let got = bucket_sample(&cache.join("m_abcdef012345_r0/abc"), &stats).expect("sample");
         assert_eq!(got, sample(3, 400));
-        assert_eq!(Stats::get(&stats.stat_ops), 3);
-        assert_eq!(Stats::get(&stats.readdir_ops), 4);
+        assert_eq!(Stats::get(&stats.sampler_ops), 7, "3 readdirs, 4 statx");
+        assert_eq!(Stats::get(&stats.readdir_ops), 0);
+        assert_eq!(Stats::get(&stats.stat_ops), 0);
     }
 
     #[test]

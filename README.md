@@ -26,6 +26,11 @@ metadata operation that competes with vLLM's own lookups and writes. kvreap:
   `2 x DELETION_MAX_FILES_PER_SECOND` ops/s (0 = no cap), reduced further by
   AIMD when observed `readdir`/`statx`/`unlink` latency rises 3x above its
   rolling baseline. At 97% usage pacing is dropped.
+- **Paces prunes to need.** A prune targets the delete rate that brings usage
+  from where it started down to `TARGET_THRESHOLD` in about 60 s (bytes over
+  target / mean sampled file size, converted to ops with the measured ops per
+  delete, at least 20 ops/s), within the cap and AIMD above. AIMD only grows
+  while it is the binding limit.
 - **Uses `statx(AT_STATX_DONT_SYNC)`** relative to directory fds, so stats can
   be answered from cached attributes instead of forcing cap recalls or flushes
   on a concurrent writer.
