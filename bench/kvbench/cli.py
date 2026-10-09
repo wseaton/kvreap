@@ -42,13 +42,6 @@ def main() -> int:
     )
 
     r.add_argument(
-        "--churn-shared-prefix-len",
-        type=int,
-        default=0,
-        help="tokens of system prompt shared by churn prompts (0: fully random prompts)",
-    )
-    r.add_argument("--churn-shared-prefixes", type=int, default=1, help="distinct shared system prompts")
-    r.add_argument(
         "--workload",
         choices=["churn-hot", "agent"],
         default="churn-hot",
@@ -139,8 +132,6 @@ def main() -> int:
         hot_prefix_len=args.hot_prefix_len,
         max_model_len=args.max_model_len,
         gpu_blocks=args.gpu_blocks,
-        churn_shared_prefix_len=args.churn_shared_prefix_len,
-        churn_shared_prefixes=args.churn_shared_prefixes,
         gpu_memory_utilization=args.gpu_memory_utilization,
         cpu_tier_bytes=int(args.cpu_tier_gib * 1024**3),
         hf_pvc=args.hf_pvc,
