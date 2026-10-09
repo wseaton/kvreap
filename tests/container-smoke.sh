@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the image the way the pvc-evictor Helm chart does and checks the drop-in contract:
 # chart env vars parse, the chart's python3 probe works, cold blocks go, hot blocks stay,
-# and SIGTERM exits 0.
+# kvreap healthcheck --live/--ready pass, and SIGTERM exits 0.
 set -euo pipefail
 
 image="${1:?usage: $0 <image>}"
@@ -20,6 +20,13 @@ docker run -d --name "$name" --tmpfs /kv-cache:size=64m,exec \
   "$image" >/dev/null
 
 docker exec "$name" python3 -c "import os; exit(0 if os.path.exists('/kv-cache') else 1)"
+
+for _ in $(seq 1 20); do
+  docker exec "$name" kvreap healthcheck --ready && break
+  sleep 0.5
+done
+docker exec "$name" kvreap healthcheck --ready || { echo "healthcheck --ready failed"; docker logs "$name"; exit 1; }
+docker exec "$name" kvreap healthcheck --live || { echo "healthcheck --live failed"; docker logs "$name"; exit 1; }
 
 docker exec -i "$name" python3 - <<'PY'
 import json, os, time

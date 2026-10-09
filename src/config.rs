@@ -45,6 +45,53 @@ impl Percent {
     }
 }
 
+/// `f64` parse that rejects NaN and infinities, like the Python evictor's `float()` plus checks.
+fn parse_number(var: &'static str, raw: String) -> Result<f64, ConfigError> {
+    raw.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .ok_or(ConfigError::NotANumber { var, value: raw })
+}
+
+/// Where liveness and readiness sentinel files live. Parsed on its own so
+/// `kvreap healthcheck` does not depend on the rest of the configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthConfig {
+    /// Local, writable, never on the PVC.
+    pub dir: PathBuf,
+    /// `healthcheck --live` fails when the heartbeat is older than this.
+    pub max_age: Duration,
+}
+
+impl HealthConfig {
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let present = |var: &str| lookup(var).filter(|s| !s.is_empty());
+        let max_age = match present("HEALTH_MAX_AGE_SECONDS") {
+            Some(raw) => parse_max_age("HEALTH_MAX_AGE_SECONDS", raw)?,
+            None => Duration::from_secs(30),
+        };
+        Ok(Self {
+            dir: PathBuf::from(present("HEALTH_DIR").unwrap_or_else(|| "/tmp/kvreap".into())),
+            max_age,
+        })
+    }
+}
+
+/// Whole seconds, at least 1 (`int(float(raw))`).
+pub fn parse_max_age(var: &'static str, raw: String) -> Result<Duration, ConfigError> {
+    let secs = parse_number(var, raw)?.trunc();
+    if secs < 1.0 {
+        return Err(ConfigError::OutOfRange {
+            var,
+            value: secs,
+            min: 1.0,
+            max: f64::MAX,
+        });
+    }
+    Ok(Duration::from_secs_f64(secs))
+}
+
 /// Size of the volume in bytes, for filesystems whose `statvfs` does not report it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapacityBytes(NonZeroU64);
@@ -142,6 +189,7 @@ pub struct Config {
     pub storage_events_endpoint: Option<String>,
     /// When set, usage is estimated from bucket samples against this size instead of `statvfs`.
     pub capacity_bytes: Option<CapacityBytes>,
+    pub health: HealthConfig,
 }
 
 /// Default emergency band floor; the default band is `max(97, CLEANUP_THRESHOLD)`.
@@ -170,14 +218,7 @@ impl Config {
         let get = |var: &'static str, default: &str| -> String {
             lookup(var).unwrap_or_else(|| default.to_string())
         };
-        let parse = |var: &'static str, raw: String| -> Result<f64, ConfigError> {
-            raw.trim()
-                .parse::<f64>()
-                .ok()
-                .filter(|v| v.is_finite())
-                .ok_or(ConfigError::NotANumber { var, value: raw })
-        };
-        let num = |var: &'static str, default: &str| parse(var, get(var, default));
+        let num = |var: &'static str, default: &str| parse_number(var, get(var, default));
         let int = |var: &'static str, default: &str| -> Result<i64, ConfigError> {
             num(var, default).map(|v| v.trunc() as i64)
         };
@@ -209,7 +250,7 @@ impl Config {
         let emergency = Percent::new(
             "EMERGENCY_THRESHOLD",
             match optional("EMERGENCY_THRESHOLD") {
-                Some(raw) => parse("EMERGENCY_THRESHOLD", raw)?,
+                Some(raw) => parse_number("EMERGENCY_THRESHOLD", raw)?,
                 None => cleanup.get().max(DEFAULT_EMERGENCY_FLOOR),
             },
         )?;
@@ -277,6 +318,7 @@ impl Config {
             capacity_bytes: optional("CAPACITY_BYTES")
                 .map(|raw| CapacityBytes::parse("CAPACITY_BYTES", &raw))
                 .transpose()?,
+            health: HealthConfig::from_lookup(&lookup)?,
         })
     }
 }
@@ -285,7 +327,9 @@ impl Config {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::config::{Config, ConfigError, LogLevel};
+    use std::time::Duration;
+
+    use crate::config::{Config, ConfigError, HealthConfig, LogLevel};
 
     fn cfg(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
         let env: HashMap<String, String> = pairs
@@ -319,6 +363,8 @@ mod tests {
         assert_eq!(c.log_file_path, None);
         assert_eq!(c.storage_events_endpoint, None);
         assert_eq!(c.capacity_bytes, None);
+        assert_eq!(c.health.dir.to_str(), Some("/tmp/kvreap"));
+        assert_eq!(c.health.max_age, Duration::from_secs(30));
     }
 
     #[test]
@@ -481,11 +527,51 @@ mod tests {
     }
 
     #[test]
+    fn health_config_parses_on_its_own() {
+        let env: HashMap<&str, &str> = [
+            ("HEALTH_DIR", "/run/kvreap"),
+            ("HEALTH_MAX_AGE_SECONDS", "12.9"),
+            ("CLEANUP_THRESHOLD", "lots"),
+        ]
+        .into_iter()
+        .collect();
+        let h = HealthConfig::from_lookup(|k| env.get(k).map(|v| v.to_string()))
+            .expect("health config ignores unrelated vars");
+        assert_eq!(h.dir.to_str(), Some("/run/kvreap"));
+        assert_eq!(h.max_age, Duration::from_secs(12));
+        let c = cfg(&[("HEALTH_MAX_AGE_SECONDS", "45"), ("HEALTH_DIR", "/x")]).expect("parse");
+        assert_eq!(c.health.max_age, Duration::from_secs(45));
+        assert_eq!(c.health.dir.to_str(), Some("/x"));
+    }
+
+    #[test]
+    fn health_max_age_must_be_at_least_a_second() {
+        for raw in ["0", "0.9", "-5"] {
+            assert!(
+                matches!(
+                    cfg(&[("HEALTH_MAX_AGE_SECONDS", raw)]),
+                    Err(ConfigError::OutOfRange {
+                        var: "HEALTH_MAX_AGE_SECONDS",
+                        ..
+                    })
+                ),
+                "{raw}"
+            );
+        }
+        assert!(matches!(
+            cfg(&[("HEALTH_MAX_AGE_SECONDS", "soon")]),
+            Err(ConfigError::NotANumber { .. })
+        ));
+    }
+
+    #[test]
     fn capacity_bytes_parses_plain_byte_counts() {
         let c = cfg(&[("CAPACITY_BYTES", " 21474836480 ")]).expect("parse");
         assert_eq!(c.capacity_bytes.map(|b| b.get()), Some(21_474_836_480));
         let c = cfg(&[("CAPACITY_BYTES", "")]).expect("parse");
         assert_eq!(c.capacity_bytes, None);
+        assert_eq!(c.health.dir.to_str(), Some("/tmp/kvreap"));
+        assert_eq!(c.health.max_age, Duration::from_secs(30));
     }
 
     #[test]

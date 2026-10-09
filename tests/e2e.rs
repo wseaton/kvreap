@@ -169,6 +169,7 @@ impl Evictor {
         let child = Command::new(BIN)
             .env_clear()
             .env("PVC_MOUNT_PATH", mount)
+            .env("HEALTH_DIR", logs.path().join("health"))
             .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
             .stdout(Stdio::from(fs::File::create(&stdout).expect("stdout file")))
             .stderr(Stdio::inherit())
@@ -179,6 +180,16 @@ impl Evictor {
             stdout,
             _logs: logs,
         }
+    }
+
+    fn health_dir(&self) -> PathBuf {
+        self._logs.path().join("health")
+    }
+
+    fn signal(&self, sig: rustix::process::Signal) {
+        let child = self.child.as_ref().expect("still running");
+        rustix::process::kill_process(rustix::process::Pid::from_child(child), sig)
+            .expect("send signal");
     }
 
     fn log(&self) -> String {
@@ -214,6 +225,21 @@ impl Drop for Evictor {
             let _ = child.wait();
         }
     }
+}
+
+/// Runs `kvreap healthcheck <args>`; returns the exit code and stderr.
+fn healthcheck(env: &[(&str, &str)], args: &[&str]) -> (Option<i32>, String) {
+    let out = Command::new(BIN)
+        .env_clear()
+        .envs(env.iter().copied())
+        .arg("healthcheck")
+        .args(args)
+        .output()
+        .expect("run healthcheck");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 fn run_to_exit(env: &[(&str, &str)]) -> (ExitStatus, String) {
@@ -836,6 +862,111 @@ fn capacity_bytes_far_below_statvfs_warns_at_startup() {
     );
     assert!(ev.sigterm().success());
     assert!(!ev.log().contains("DELETION_START"));
+}
+
+#[test]
+fn healthcheck_tracks_readiness_and_heartbeat() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    Cache::new(tmp.path());
+    let mut ev = Evictor::start(tmp.path(), &[]);
+    let dir = ev.health_dir();
+    let dir_str = dir.to_string_lossy().into_owned();
+    let env = [("HEALTH_DIR", dir_str.as_str())];
+    assert!(
+        wait_until(Duration::from_secs(10), || healthcheck(&env, &["--ready"])
+            .0
+            == Some(0)),
+        "never became ready\n{}",
+        ev.log()
+    );
+    assert_eq!(healthcheck(&env, &["--live"]).0, Some(0));
+
+    assert!(ev.sigterm().success());
+    let (code, stderr) = healthcheck(&env, &["--ready"]);
+    assert_eq!(code, Some(1), "ready must be removed on SIGTERM");
+    assert!(stderr.contains("not ready"), "{stderr}");
+
+    let alive = dir.join("alive");
+    let old = SystemTime::now() - Duration::from_secs(120);
+    fs::File::options()
+        .write(true)
+        .open(&alive)
+        .and_then(|f| f.set_modified(old))
+        .expect("back-date alive");
+    let (code, stderr) = healthcheck(&env, &["--live"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("old, max 30s"), "{stderr}");
+    assert_eq!(
+        healthcheck(&env, &["--live", "--max-age", "300"]).0,
+        Some(0)
+    );
+    let env_max_age = [
+        ("HEALTH_DIR", dir_str.as_str()),
+        ("HEALTH_MAX_AGE_SECONDS", "300"),
+    ];
+    assert_eq!(healthcheck(&env_max_age, &["--live"]).0, Some(0));
+}
+
+#[test]
+fn stalled_controller_fails_liveness() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    Cache::new(tmp.path());
+    let env = vec![("LOGGER_INTERVAL_SECONDS", "0.05".to_string())];
+    let mut ev = Evictor::start(tmp.path(), &env);
+    let dir_str = ev.health_dir().to_string_lossy().into_owned();
+    let env = [("HEALTH_DIR", dir_str.as_str())];
+    let live = || healthcheck(&env, &["--live", "--max-age", "1"]).0;
+    assert!(
+        wait_until(Duration::from_secs(10), || live() == Some(0)),
+        "{}",
+        ev.log()
+    );
+    // A stopped process stands in for a controller blocked in statvfs on a dead mount.
+    ev.signal(rustix::process::Signal::STOP);
+    assert!(
+        wait_until(Duration::from_secs(5), || live() == Some(1)),
+        "heartbeat kept moving while stopped"
+    );
+    assert_eq!(
+        healthcheck(&env, &["--ready"]).0,
+        Some(0),
+        "readiness does not depend on the heartbeat"
+    );
+    ev.signal(rustix::process::Signal::CONT);
+    assert!(
+        wait_until(Duration::from_secs(5), || live() == Some(0)),
+        "{}",
+        ev.log()
+    );
+    assert!(ev.sigterm().success());
+}
+
+#[test]
+fn healthcheck_ignores_other_config_and_never_needs_the_mount() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("ready"), b"").expect("write");
+    fs::write(tmp.path().join("alive"), b"").expect("write");
+    let dir = tmp.path().to_string_lossy().into_owned();
+    let env = [
+        ("HEALTH_DIR", dir.as_str()),
+        ("CLEANUP_THRESHOLD", "lots"),
+        ("NUM_CRAWLER_PROCESSES", "3"),
+        ("PVC_MOUNT_PATH", "/nonexistent/kv-cache"),
+    ];
+    assert_eq!(healthcheck(&env, &["--ready"]).0, Some(0));
+    assert_eq!(healthcheck(&env, &["--live"]).0, Some(0));
+
+    let missing = tmp.path().join("missing").to_string_lossy().into_owned();
+    let (code, stderr) = healthcheck(&[("HEALTH_DIR", missing.as_str())], &["--live"]);
+    assert_eq!(code, Some(1));
+    assert_eq!(stderr.lines().count(), 1, "one-line reason: {stderr}");
+    assert!(stderr.contains("does not exist"), "{stderr}");
+
+    for args in [&[][..], &["--live", "--ready"][..], &["--now"][..]] {
+        let (code, stderr) = healthcheck(&env, args);
+        assert_eq!(code, Some(2), "{args:?}: {stderr}");
+        assert!(stderr.contains("usage: kvreap healthcheck"), "{stderr}");
+    }
 }
 
 static E2E_DIR_LOCK: Mutex<()> = Mutex::new(());

@@ -6,6 +6,7 @@ mod controller;
 #[cfg(feature = "events")]
 mod events;
 mod fsops;
+mod health;
 mod layout;
 mod shutdown;
 mod stats;
@@ -29,6 +30,7 @@ use crate::config::Config;
 use crate::controller::{
     Hysteresis, Mode, OpCounts, PRUNE_HORIZON, Pacer, SharedState, UsageSource, disk_usage,
 };
+use crate::health::Sentinels;
 use crate::layout::Shard;
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
@@ -89,10 +91,33 @@ struct Controller {
     budget: Arc<Budget>,
     samples: Arc<Samples>,
     stats: Arc<Stats>,
+    sentinels: Option<Arc<Sentinels>>,
     shutdown: Arc<Shutdown>,
 }
 
 impl Controller {
+    /// Touches `alive`, and marks ready on the first call.
+    fn beat(&self, ready: &mut bool, warned: &mut bool) {
+        let Some(s) = &self.sentinels else {
+            return;
+        };
+        let result = s.heartbeat().and_then(|()| {
+            if *ready {
+                return Ok(());
+            }
+            s.mark_ready()?;
+            *ready = true;
+            tracing::info!("ready");
+            Ok(())
+        });
+        if let Err(e) = result
+            && !*warned
+        {
+            *warned = true;
+            tracing::warn!(error = %e, "cannot write health sentinel files");
+        }
+    }
+
     fn run(self) {
         let hysteresis = Hysteresis::new(
             self.config.cleanup_threshold,
@@ -103,8 +128,16 @@ impl Controller {
         let mut planned = false;
         let mut mode = Mode::Idle;
         let mut have_usage = false;
+        let (mut ready, mut warned) = (false, false);
         loop {
-            match self.source.read() {
+            let usage = match disk_usage(&self.config.pvc_mount_path) {
+                Ok(statvfs) => {
+                    self.beat(&mut ready, &mut warned);
+                    Ok(self.source.read(statvfs))
+                }
+                Err(e) => Err(e),
+            };
+            match usage {
                 Ok(Some(usage)) => {
                     let pct = usage.percent();
                     if !have_usage {
@@ -218,7 +251,7 @@ fn start_usage_source(
     shutdown: &Arc<Shutdown>,
 ) -> anyhow::Result<(UsageSource, Option<JoinHandle<()>>)> {
     let Some(capacity) = config.capacity_bytes else {
-        return Ok((UsageSource::Statvfs(config.pvc_mount_path.clone()), None));
+        return Ok((UsageSource::Statvfs, None));
     };
     match disk_usage(&config.pvc_mount_path) {
         Ok(u) if statvfs_overreports(u.total_bytes, capacity) => tracing::warn!(
@@ -338,6 +371,14 @@ fn run(config: Config) -> anyhow::Result<()> {
 
     log_atime_behavior(&config);
 
+    let sentinels = match Sentinels::new(&config.health.dir) {
+        Ok(s) => Some(Arc::new(s)),
+        Err(e) => {
+            tracing::warn!(dir = %config.health.dir.display(), error = %e, "cannot create HEALTH_DIR; healthcheck will report unhealthy");
+            None
+        }
+    };
+
     let shared = Arc::new(SharedState::default());
     let stats = Arc::new(Stats::default());
     let samples = Arc::new(Samples::default());
@@ -345,17 +386,6 @@ fn run(config: Config) -> anyhow::Result<()> {
 
     let (events_tx, events_thread) = start_events(&config)?;
     let (source, sampler) = start_usage_source(&config, &samples, &stats, &shutdown)?;
-
-    let controller = Controller {
-        config: Arc::clone(&config),
-        source,
-        shared: Arc::clone(&shared),
-        budget: Arc::clone(&budget),
-        samples: Arc::clone(&samples),
-        stats: Arc::clone(&stats),
-        shutdown: Arc::clone(&shutdown),
-    };
-    let controller = spawn("controller".into(), move || controller.run())?;
 
     let mut workers = Vec::new();
     for (id, shard) in Shard::split(config.workers.get()).into_iter().enumerate() {
@@ -372,10 +402,27 @@ fn run(config: Config) -> anyhow::Result<()> {
             Worker::new(id, shard, ctx).run()
         })?);
     }
+    let controller = Controller {
+        config: Arc::clone(&config),
+        source,
+        shared: Arc::clone(&shared),
+        budget: Arc::clone(&budget),
+        samples: Arc::clone(&samples),
+        stats: Arc::clone(&stats),
+        sentinels: sentinels.clone(),
+        shutdown: Arc::clone(&shutdown),
+    };
+    let controller = spawn("controller".into(), move || controller.run())?;
+
     drop(events_tx);
 
     while !shutdown.wait(STATUS_INTERVAL) {
         log_status(&shared, &budget, &stats);
+    }
+    if let Some(s) = &sentinels
+        && let Err(e) = s.clear_ready()
+    {
+        tracing::warn!(error = %e, "cannot remove ready sentinel");
     }
 
     for w in workers {
@@ -396,6 +443,10 @@ fn run(config: Config) -> anyhow::Result<()> {
 }
 
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("healthcheck") {
+        return ExitCode::from(health::run_cli(&args[1..], |k| std::env::var(k).ok()));
+    }
     let config = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -418,6 +469,7 @@ fn main() -> ExitCode {
         hot_threshold_secs = config.hot_threshold.as_secs(),
         dry_run = config.dry_run,
         capacity_bytes = config.capacity_bytes.map(|c| c.get()),
+        health_dir = %config.health.dir.display(),
         version = env!("CARGO_PKG_VERSION"),
         "kvreap starting"
     );

@@ -91,7 +91,8 @@ retrans=2, forcerdirplus, acregmin=3, acregmax=60, acdirmin=30, acdirmax=60`.
   is unreachable (inferred from the options). Worker threads sit in
   uninterruptible sleep, SIGTERM cannot interrupt them, and the chart's
   liveness probe (`python3 -c "os.path.exists('/kv-cache')"`) hangs too, so
-  the kubelet restarts a container that cannot exit.
+  the kubelet restarts a container that cannot exit. `kvreap healthcheck`
+  avoids the mount; see item 6 below.
 
 ## Local NVMe (hostPath / emptyDir)
 
@@ -169,11 +170,13 @@ In rough priority order.
    quota. `EMERGENCY_THRESHOLD` moves it; the default stays
    `max(97, CLEANUP_THRESHOLD)`, and values below `CLEANUP_THRESHOLD` are
    rejected.
-6. **Health check that never touches the mount** (proposed). Add
-   `kvreap healthcheck`, which checks the controller's last successful
-   `statvfs` timestamp from a heartbeat file in `/tmp`, so a hung NFS mount
-   shows up as unhealthy instead of a probe that never returns. This needs a
-   chart change to use it, so it is opt-in.
+6. **Health check that never touches the mount** (implemented).
+   `kvreap healthcheck --live|--ready` only stats sentinel files in
+   `HEALTH_DIR` (default `/tmp/kvreap`). The controller touches `alive` after
+   each successful `statvfs`, so a hung NFS mount shows up as a stale
+   heartbeat (older than `HEALTH_MAX_AGE_SECONDS`) instead of a probe that
+   never returns; `ready` is removed on SIGTERM. Using it needs a chart
+   change, so it is opt-in.
 7. **Document scheduling** (proposed). Pod anti-affinity against vLLM is not
    needed on VAST at this load (measured, see the
    [placement benchmark](../benchmarks/placement/README.md)). It only matters

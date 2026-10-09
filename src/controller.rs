@@ -1,5 +1,5 @@
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
@@ -64,10 +64,11 @@ pub fn disk_usage(path: &Path) -> io::Result<DiskUsage> {
     })
 }
 
-/// Where the controller gets used and total bytes from.
+/// Where the controller gets used and total bytes from. `statvfs` runs every
+/// poll either way: it is also the liveness signal for the mount.
 #[derive(Debug, Clone)]
 pub enum UsageSource {
-    Statvfs(PathBuf),
+    Statvfs,
     /// Sampled cache size against a configured capacity (`CAPACITY_BYTES`).
     Sampled {
         capacity: CapacityBytes,
@@ -76,15 +77,15 @@ pub enum UsageSource {
 }
 
 impl UsageSource {
-    /// `Ok(None)` while a sampled estimate is not available yet.
-    pub fn read(&self) -> io::Result<Option<DiskUsage>> {
+    /// `None` while a sampled estimate is not available yet.
+    pub fn read(&self, statvfs: DiskUsage) -> Option<DiskUsage> {
         match self {
-            Self::Statvfs(path) => disk_usage(path).map(Some),
+            Self::Statvfs => Some(statvfs),
             Self::Sampled { capacity, samples } => {
-                Ok(samples.estimated_used_bytes().map(|used| DiskUsage {
+                samples.estimated_used_bytes().map(|used| DiskUsage {
                     total_bytes: capacity.get(),
                     used_bytes: used,
-                }))
+                })
             }
         }
     }
@@ -318,17 +319,10 @@ mod tests {
     }
 
     #[test]
-    fn statvfs_source_reads_the_mount() {
+    fn statvfs_source_passes_statvfs_through() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let got = UsageSource::Statvfs(tmp.path().to_path_buf())
-            .read()
-            .expect("statvfs")
-            .expect("always available");
-        assert_eq!(
-            got.total_bytes,
-            disk_usage(tmp.path()).expect("statvfs").total_bytes
-        );
-        assert!(got.used_bytes <= got.total_bytes);
+        let st = disk_usage(tmp.path()).expect("statvfs");
+        assert_eq!(UsageSource::Statvfs.read(st), Some(st));
     }
 
     #[test]
@@ -342,7 +336,11 @@ mod tests {
             capacity,
             samples: Arc::clone(&samples),
         };
-        assert_eq!(source.read().expect("read"), None);
+        let statvfs = DiskUsage {
+            total_bytes: 1 << 50,
+            used_bytes: 1 << 49,
+        };
+        assert_eq!(source.read(statvfs), None);
         samples.set_bucket_count(10);
         for _ in 0..64 {
             samples.record(BucketSample {
@@ -350,7 +348,7 @@ mod tests {
                 bytes: 300,
             });
         }
-        let usage = source.read().expect("read").expect("estimate");
+        let usage = source.read(statvfs).expect("estimate");
         assert_eq!(
             usage,
             DiskUsage {

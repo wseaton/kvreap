@@ -56,8 +56,36 @@ metadata operation that competes with vLLM's own lookups and writes. kvreap:
 | `HEX_BUCKET_LEN` | `3` | |
 | `CAPACITY_BYTES` | unset | volume size in bytes (e.g. the PVC request). When set, used bytes are estimated from bucket samples (mean block bytes per bucket x bucket count) instead of `statvfs`; for volumes whose `statvfs` reports the wrong filesystem. Warns at startup if `statvfs` reports more than 10x this |
 | `STORAGE_EVENTS_ENDPOINT` | unset | ZMQ PUB bind address for `BlockRemoved` events; needs the `events` build, otherwise logged and ignored |
+| `HEALTH_DIR` | `/tmp/kvreap` | local writable dir for the `ready` and `alive` sentinel files; never the PVC |
+| `HEALTH_MAX_AGE_SECONDS` | `30` | `healthcheck --live` fails when `alive` is older than this |
 | `DRY_RUN`, `LOG_LEVEL`, `LOG_FILE_PATH` | | as in the Python evictor |
 | `FILE_QUEUE_MAXSIZE`, `FILE_QUEUE_MIN_SIZE` | | accepted and ignored |
+
+## Health probes
+
+kvreap creates `HEALTH_DIR/ready` once the mount is found, the workers are
+running and the first `statvfs` succeeded, and removes it on SIGTERM so the
+pod goes unready while draining. The controller touches `HEALTH_DIR/alive`
+after every successful `statvfs`, so a controller stuck on a hung hard NFS
+mount lets it go stale. The probe command only stats those two files and
+ignores the rest of the configuration:
+
+```yaml
+livenessProbe:
+  exec:
+    command: ["kvreap", "healthcheck", "--live"]   # optional: --max-age SECONDS
+readinessProbe:
+  exec:
+    command: ["kvreap", "healthcheck", "--ready"]   # same as: ["cat", "/tmp/kvreap/ready"]
+```
+
+Readiness is plain file existence, so `cat HEALTH_DIR/ready` works too.
+Liveness needs the age check: a controller stuck on a dead mount cannot
+remove its own file, so `alive` is judged by its mtime.
+
+It exits 0 when healthy, 1 with a one-line reason on stderr when not, and 2
+on bad arguments. The image keeps `python3`, since the current pvc-evictor
+chart's probes still run it; switching probes is a chart setting.
 
 ## `BlockRemoved` events
 
