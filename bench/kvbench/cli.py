@@ -3,7 +3,7 @@ import json
 import sys
 from pathlib import Path
 
-from kvbench import analyze
+from kvbench import analyze, chart
 from kvbench.run import Cluster, RunConfig, run
 
 
@@ -33,9 +33,16 @@ def main() -> int:
     a = sub.add_parser("analyze", help="summarize and compare run directories")
     a.add_argument("dirs", type=Path, nargs="+")
 
+    rep = sub.add_parser("report", help="write a Markdown report with SVG charts comparing run directories")
+    rep.add_argument("dirs", type=Path, nargs="+")
+    rep.add_argument("--out", type=Path, required=True, help="report directory (REPORT.md and charts/)")
+    rep.add_argument("--title", default="PVC evictor benchmark")
+
     args = p.parse_args()
     if args.cmd == "analyze":
         return analyze.main(args.dirs)
+    if args.cmd == "report":
+        return chart.main(args.dirs, args.out, args.title)
 
     if args.variant != "none" and (args.image is None or args.chart is None):
         p.error("--image and --chart are required unless --variant none")
