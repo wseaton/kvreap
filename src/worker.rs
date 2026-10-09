@@ -58,7 +58,6 @@ struct Candidate {
     size: u64,
     atime: SystemTime,
     sampled_at: Instant,
-    leaf_files: usize,
 }
 
 /// Cold files ordered by atime, capped at `cap` by evicting the youngest.
@@ -358,7 +357,6 @@ impl Worker {
                     size: meta.size,
                     atime: meta.atime,
                     sampled_at: Instant::now(),
-                    leaf_files: files.len(),
                 });
             }
         }
@@ -421,26 +419,10 @@ impl Worker {
                 hash: c.hash,
             });
         }
-        if c.leaf_files == 1
-            && let Some(leaf) = c.path.parent()
-        {
-            self.try_rmdir(leaf);
-        }
         true
     }
 
-    fn try_rmdir(&self, dir: &Path) {
-        if !self.ctx.config.enable_dir_cleanup || !self.acquire() {
-            return;
-        }
-        Stats::add(&self.ctx.stats.rmdir_ops, 1);
-        match fsops::rmdir_path(dir) {
-            Ok(()) => Stats::add(&self.ctx.stats.dirs_removed, 1),
-            Err(e) if fsops::is_not_found(&e) || fsops::is_not_empty(&e) => {}
-            Err(e) => tracing::debug!(dir = %dir.display(), error = %e, "rmdir failed"),
-        }
-    }
-
+    /// Removes `dir` if it is empty and unchanged for `DIR_CLEANUP_TTL_SECONDS`.
     fn reap_if_stale(&self, dir: &Path) {
         if !self.ctx.config.enable_dir_cleanup || !self.acquire() {
             return;
@@ -451,8 +433,14 @@ impl Worker {
         let age = SystemTime::now()
             .duration_since(meta.mtime)
             .unwrap_or(Duration::ZERO);
-        if age >= self.ctx.config.dir_cleanup_ttl {
-            self.try_rmdir(dir);
+        if age < self.ctx.config.dir_cleanup_ttl || !self.acquire() {
+            return;
+        }
+        Stats::add(&self.ctx.stats.rmdir_ops, 1);
+        match fsops::rmdir_path(dir) {
+            Ok(()) => Stats::add(&self.ctx.stats.dirs_removed, 1),
+            Err(e) if fsops::is_not_found(&e) || fsops::is_not_empty(&e) => {}
+            Err(e) => tracing::debug!(dir = %dir.display(), error = %e, "rmdir failed"),
         }
     }
 }
@@ -486,7 +474,6 @@ mod tests {
             size: 1,
             atime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - age_secs),
             sampled_at: Instant::now(),
-            leaf_files: 2,
         }
     }
 
@@ -726,18 +713,42 @@ mod tests {
     }
 
     #[test]
-    fn removes_leaf_dir_emptied_by_last_file() {
+    fn emptied_leaf_is_left_for_ttl_reaping() {
         let fx = fixture(1, 0);
+        let leaf = fx.cache.join("org-model_abcdef012345_r0/100/00_g0");
         let mut h = harness(config(&fx.cache, &[]));
         h.shared.set_mode(Mode::Evicting);
+        h.worker.round().expect("round");
+        h.worker.evict(1);
+        assert!(bins(&fx.cache).is_empty());
+        assert!(
+            leaf.is_dir(),
+            "unlinking the last file must not rmdir its leaf"
+        );
+        assert_eq!(Stats::get(&h.stats.rmdir_ops), 0);
+
         run_rounds(&mut h, 5);
-        let leaf = fx.cache.join("org-model_abcdef012345_r0/100/00_g0");
-        assert!(!leaf.exists());
+        assert!(
+            !leaf.exists(),
+            "empty leaf is reaped when sampling finds it"
+        );
         assert!(
             !leaf.parent().expect("bucket").exists(),
             "emptied bucket is reaped on a later round"
         );
         assert_eq!(Stats::get(&h.stats.dirs_removed), 2);
+    }
+
+    #[test]
+    fn emptied_leaf_younger_than_ttl_survives() {
+        let fx = fixture(1, 0);
+        let leaf = fx.cache.join("org-model_abcdef012345_r0/100/00_g0");
+        let mut h = harness(config(&fx.cache, &[("DIR_CLEANUP_TTL_SECONDS", "3600")]));
+        h.shared.set_mode(Mode::Evicting);
+        run_rounds(&mut h, 10);
+        assert!(bins(&fx.cache).is_empty());
+        assert!(leaf.is_dir());
+        assert_eq!(Stats::get(&h.stats.rmdir_ops), 0);
     }
 
     #[test]

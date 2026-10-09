@@ -143,13 +143,14 @@ In rough priority order.
    protection is effectively "recently written" and eviction is
    oldest-written-first. The probe file is removed afterwards. There is no
    metrics endpoint, so the result is only logged.
-3. **Stop removing leaf directories right after the last unlink** (proposed).
-   It costs one RMDIR per deleted block, races vLLM's `makedirs` + create
-   (an `rmdir` between them fails the store; not observed in our runs, where
-   vLLM logged no store failures), and buys little: the next
-   store in that leaf recreates it. Reap only leaves found empty and older
-   than `DIR_CLEANUP_TTL_SECONDS` during sampling, which already happens.
-   Measure vLLM MKDIR and evictor RMDIR before and after.
+3. **Stop removing leaf directories right after the last unlink**
+   (implemented). It cost one RMDIR per deleted block, raced vLLM's
+   `makedirs` + create (an `rmdir` between them fails the store; not
+   observed in our runs, where vLLM logged no store failures), and bought
+   little: the next store in that leaf recreates it. kvreap now only reaps
+   leaves and buckets that sampling finds empty and unchanged for
+   `DIR_CLEANUP_TTL_SECONDS`. Still to do: measure vLLM MKDIR and evictor
+   RMDIR against the numbers above.
 4. **Pace to need instead of bursting** (proposed). On VAST the AIMD back-off
    never fired and the op budget climbed to ~7k ops/s during prunes. Target a
    delete rate that reaches `TARGET_THRESHOLD` in a fixed time (e.g.
