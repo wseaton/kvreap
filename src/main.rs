@@ -1,3 +1,4 @@
+mod atime;
 mod budget;
 mod capacity;
 mod config;
@@ -21,6 +22,7 @@ use anyhow::Context as _;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 
+use crate::atime::AtimeBehavior;
 use crate::budget::Budget;
 use crate::capacity::{Sampler, Samples, statvfs_overreports};
 use crate::config::Config;
@@ -138,6 +140,30 @@ fn controller_loop(
         }
     }
     shared.set_mode(Mode::Idle);
+}
+
+fn log_atime_behavior(config: &Config) {
+    let cache = config.cache_path();
+    let dir = if cache.is_dir() {
+        cache
+    } else {
+        config.pvc_mount_path.clone()
+    };
+    match atime::probe(&dir) {
+        Ok(AtimeBehavior::Tracked) => tracing::info!(
+            dir = %dir.display(),
+            "atime probe: reads move atime, hot protection follows last access"
+        ),
+        Ok(AtimeBehavior::Untracked) => tracing::warn!(
+            dir = %dir.display(),
+            "atime probe: reads do not move atime on this mount, so hot protection means recently written and eviction is oldest-written-first"
+        ),
+        Err(e) => tracing::warn!(
+            dir = %dir.display(),
+            error = %e,
+            "atime probe failed, atime behavior unknown"
+        ),
+    }
 }
 
 /// Picks the usage source and, for `CAPACITY_BYTES`, starts the sampler thread.
@@ -264,6 +290,8 @@ fn run(config: Config) -> anyhow::Result<()> {
             config.pvc_mount_path.display()
         );
     }
+
+    log_atime_behavior(&config);
 
     let shared = Arc::new(SharedState::default());
     let stats = Arc::new(Stats::default());

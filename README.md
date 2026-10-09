@@ -29,6 +29,8 @@ metadata operation that competes with vLLM's own lookups and writes. kvreap:
 - **Uses `statx(AT_STATX_DONT_SYNC)`** relative to directory fds, so stats can
   be answered from cached attributes instead of forcing cap recalls or flushes
   on a concurrent writer.
+- **Checks atime at startup.** A probe file is read with a back-dated atime;
+  if atime doesn't move, kvreap warns that "hot" means recently written.
 - One process, one thread per shard (`NUM_CRAWLER_PROCESSES`), no `xargs`.
 
 ## Configuration

@@ -90,14 +90,24 @@ fn to_system_time(secs: i64, nanos: u32) -> SystemTime {
     }
 }
 
-/// `statx(AT_STATX_DONT_SYNC)` relative to `dir`, without following symlinks.
+/// Whether a stat may be answered from cached attributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Freshness {
+    Cached,
+    Synced,
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn stat_at(dir: impl AsFd, name: &CStr) -> io::Result<Meta> {
+fn stat_at_with(dir: impl AsFd, name: &CStr, freshness: Freshness) -> io::Result<Meta> {
     use rustix::fs::StatxFlags;
+    let sync = match freshness {
+        Freshness::Cached => AtFlags::STATX_DONT_SYNC,
+        Freshness::Synced => AtFlags::STATX_FORCE_SYNC,
+    };
     let st = rustix::fs::statx(
         dir,
         name,
-        AtFlags::SYMLINK_NOFOLLOW | AtFlags::STATX_DONT_SYNC,
+        AtFlags::SYMLINK_NOFOLLOW | sync,
         StatxFlags::TYPE | StatxFlags::SIZE | StatxFlags::ATIME | StatxFlags::MTIME,
     )?;
     Ok(Meta {
@@ -109,7 +119,7 @@ pub fn stat_at(dir: impl AsFd, name: &CStr) -> io::Result<Meta> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn stat_at(dir: impl AsFd, name: &CStr) -> io::Result<Meta> {
+fn stat_at_with(dir: impl AsFd, name: &CStr, _freshness: Freshness) -> io::Result<Meta> {
     let st = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
     let nanos = |n: i64| u32::try_from(n).unwrap_or(0);
     Ok(Meta {
@@ -118,6 +128,11 @@ pub fn stat_at(dir: impl AsFd, name: &CStr) -> io::Result<Meta> {
         size: u64::try_from(st.st_size).unwrap_or(0),
         kind: kind_from_mode(u32::from(st.st_mode)),
     })
+}
+
+/// `statx(AT_STATX_DONT_SYNC)` relative to `dir`, without following symlinks.
+pub fn stat_at(dir: impl AsFd, name: &CStr) -> io::Result<Meta> {
+    stat_at_with(dir, name, Freshness::Cached)
 }
 
 pub fn unlink_at(dir: impl AsFd, name: &CStr) -> io::Result<()> {
@@ -136,6 +151,11 @@ fn c_path(path: &Path) -> io::Result<CString> {
 
 pub fn stat_path(path: &Path) -> io::Result<Meta> {
     stat_at(rustix::fs::CWD, &c_path(path)?)
+}
+
+/// `statx(AT_STATX_FORCE_SYNC)`: attributes as the server has them, not as cached.
+pub fn stat_path_synced(path: &Path) -> io::Result<Meta> {
+    stat_at_with(rustix::fs::CWD, &c_path(path)?, Freshness::Synced)
 }
 
 pub fn unlink_path(path: &Path) -> io::Result<()> {
@@ -162,7 +182,8 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use crate::fsops::{
-        EntryKind, is_not_empty, is_not_found, list, open_dir, rmdir_at, stat_at, unlink_at,
+        EntryKind, is_not_empty, is_not_found, list, open_dir, rmdir_at, stat_at, stat_path_synced,
+        unlink_at,
     };
 
     fn c(s: &str) -> CString {
@@ -212,6 +233,7 @@ mod tests {
         let skew = |t: SystemTime| t.duration_since(old).unwrap_or_else(|e| e.duration());
         assert!(skew(meta.atime) < Duration::from_secs(1));
         assert!(skew(meta.mtime) < Duration::from_secs(1));
+        assert_eq!(stat_path_synced(&path).expect("synced stat"), meta);
     }
 
     #[test]

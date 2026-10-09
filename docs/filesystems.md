@@ -134,10 +134,15 @@ In rough priority order.
    more than 10x `CAPACITY_BYTES` (VAST before the first write, hostPath,
    emptyDir). The estimate counts only block files, not temp files or other
    data on the volume, so leave headroom below 100%.
-2. **Detect missing atime and say so** (proposed). At startup, create a probe
-   file, back-date its atime, read it, and `statx` it again. If atime didn't
-   move, log that hot protection is effectively "recently written" and
-   eviction is oldest-written-first. Expose it as a metric.
+2. **Detect missing atime and say so** (implemented). At startup kvreap
+   creates a probe file in the cache directory (the mount if the cache
+   directory doesn't exist yet), back-dates its atime by two days, reads it
+   with `O_DIRECT` (as vLLM does, so an NFS client cannot serve the read from
+   its page cache), and `statx`es it again with `AT_STATX_FORCE_SYNC`. If
+   atime didn't move, or couldn't be back-dated, it logs a warning that hot
+   protection is effectively "recently written" and eviction is
+   oldest-written-first. The probe file is removed afterwards. There is no
+   metrics endpoint, so the result is only logged.
 3. **Stop removing leaf directories right after the last unlink** (proposed).
    It costs one RMDIR per deleted block, races vLLM's `makedirs` + create
    (an `rmdir` between them fails the store; not observed in our runs, where

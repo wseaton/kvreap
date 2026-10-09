@@ -593,6 +593,49 @@ fn logs_to_log_file_path_and_reports_compat_vars() {
 }
 
 #[test]
+fn startup_probes_atime_and_removes_the_probe_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(tmp.path());
+    let mut ev = Evictor::start(tmp.path(), &[]);
+    assert!(
+        ev.wait_for_log("worker started", Duration::from_secs(10)),
+        "{}",
+        ev.log()
+    );
+    assert!(ev.sigterm().success());
+    let log = ev.log();
+    assert!(log.contains("atime probe: "), "{log}");
+    assert!(!log.contains("atime probe failed"), "{log}");
+    #[cfg(target_os = "linux")]
+    assert!(
+        log.contains("reads move atime"),
+        "relatime moves a 2-day-old atime\n{log}"
+    );
+    let leftovers: Vec<_> = fs::read_dir(cache.root())
+        .expect("read cache root")
+        .flatten()
+        .map(|e| e.file_name())
+        .filter(|n| n.to_string_lossy().contains("atime-probe"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
+fn atime_probe_falls_back_to_the_mount_when_the_cache_dir_is_missing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut ev = Evictor::start(tmp.path(), &[]);
+    assert!(
+        ev.wait_for_log("worker started", Duration::from_secs(10)),
+        "{}",
+        ev.log()
+    );
+    assert!(ev.sigterm().success());
+    let log = ev.log();
+    assert!(log.contains("atime probe: "), "{log}");
+    assert_eq!(fs::read_dir(tmp.path()).expect("read mount").count(), 0);
+}
+
+#[test]
 fn invalid_config_exits_nonzero_with_reason() {
     let cases: [(&[(&str, &str)], &str); 4] = [
         (
