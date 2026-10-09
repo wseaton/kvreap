@@ -19,7 +19,7 @@ pub enum ConfigError {
     TargetNotBelowCleanup { target: f64, cleanup: f64 },
     #[error("NUM_CRAWLER_PROCESSES must be a power of 2 from 1 to 16, got {0}")]
     InvalidWorkerCount(i64),
-    #[error("CHAIN_EVICTION must be tail-first or observe, got {0:?}")]
+    #[error("CHAIN_EVICTION must be tail-first, subtree or observe, got {0:?}")]
     InvalidChainPolicy(String),
 }
 
@@ -98,6 +98,9 @@ pub enum ChainPolicy {
     TailFirst,
     /// Keep the index and count deletions by chain position, but evict oldest-first.
     Observe,
+    /// Among the oldest candidates, delete dead blocks, then the block with
+    /// the fewest leaves below it, together with its whole on-disk subtree.
+    Subtree,
 }
 
 impl ChainPolicy {
@@ -105,6 +108,7 @@ impl ChainPolicy {
         match raw.trim().to_ascii_lowercase().as_str() {
             "tail-first" => Ok(Self::TailFirst),
             "observe" => Ok(Self::Observe),
+            "subtree" => Ok(Self::Subtree),
             _ => Err(ConfigError::InvalidChainPolicy(raw.to_string())),
         }
     }
@@ -367,6 +371,12 @@ mod tests {
         ])
         .expect("parse");
         assert_eq!(c.chain_policy, ChainPolicy::Observe);
+        assert_eq!(
+            cfg(&[("CHAIN_EVICTION", "subtree")])
+                .expect("parse")
+                .chain_policy,
+            ChainPolicy::Subtree
+        );
         assert_eq!(c.chain_max_deferrals, 0);
         assert_eq!(
             cfg(&[("CHAIN_MAX_DEFERRALS", "-3")])

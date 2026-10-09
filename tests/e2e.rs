@@ -499,7 +499,7 @@ fn publishes_block_removed_events_for_every_deletion() {
 
 #[cfg(feature = "events")]
 /// A vLLM 0.31 `EventBatch` with one map-encoded `BlockStored` for `chain`
-/// (root first), hashes as 32-byte digests whose low 64 bits are the block hash.
+/// (root first), hashes as 32-byte digests that name `Cache::block_path` files.
 fn block_stored_batch(chain: &[u64]) -> Vec<u8> {
     let mut buf = Vec::new();
     let w = &mut buf;
@@ -512,9 +512,7 @@ fn block_stored_batch(chain: &[u64]) -> Vec<u8> {
     rmp::encode::write_str(w, "block_hashes").expect("encode");
     rmp::encode::write_array_len(w, u32::try_from(chain.len()).expect("len")).expect("encode");
     for h in chain {
-        let mut digest = [0xaau8; 32];
-        digest[24..].copy_from_slice(&h.to_be_bytes());
-        rmp::encode::write_bin(w, &digest).expect("encode");
+        rmp::encode::write_bin(w, &h.to_be_bytes().repeat(4)).expect("encode");
     }
     rmp::encode::write_str(w, "parent_block_hash").expect("encode");
     rmp::encode::write_nil(w).expect("encode");
@@ -615,6 +613,16 @@ fn observe_eviction_deletes_announced_chain_head_first() {
     assert_eq!(counter(&line, "deleted_orphan"), 39, "{line}");
     assert_eq!(counter(&line, "deleted_leaf"), 0, "{line}");
     assert_eq!(counter(&line, "deferrals"), 0, "{line}");
+}
+
+#[cfg(feature = "events")]
+#[test]
+fn subtree_eviction_deletes_the_announced_chain_from_its_root() {
+    let line = evict_announced_chain("subtree");
+    assert_eq!(counter(&line, "deleted_root"), 1, "{line}");
+    assert_eq!(counter(&line, "cascaded"), 39, "{line}");
+    assert_eq!(counter(&line, "deleted_orphan"), 39, "{line}");
+    assert_eq!(counter(&line, "deleted_leaf"), 0, "{line}");
 }
 
 #[cfg(not(feature = "events"))]

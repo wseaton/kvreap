@@ -16,6 +16,7 @@
 //! msgspec tagged structs: maps keyed by field name with `"type"` as the tag
 //! (vLLM >= 0.12), or arrays with the tag first (older releases).
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -27,6 +28,7 @@ use crate::shutdown::Shutdown;
 use crate::stats::Stats;
 
 pub const INDEX_CAP: usize = 4 << 20;
+const SUBTREE_BUDGET: usize = 4096;
 const RECV_TIMEOUT_MS: i32 = 500;
 const MAX_DEPTH: usize = 16;
 const MEDIUM_STORAGE: &str = "STORAGE";
@@ -55,12 +57,29 @@ pub enum Rank {
     Interior,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Node {
     parent: Option<BlockHash>,
+    /// Every child ever linked; filter by `on_disk` when walking.
+    children: Vec<BlockHash>,
     children_on_disk: u32,
     on_disk: bool,
     generation: u64,
+    /// Full block hash, which names the block's file.
+    digest: Option<Box<[u8]>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SubtreeKey {
+    live: bool,
+    per_leaf: Reverse<usize>,
+}
+
+/// A block below a subtree root, with the file name of its digest if known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Descendant {
+    pub hash: BlockHash,
+    pub file_name: Option<String>,
 }
 
 /// Bounded `block -> parent` map with on-disk child counts. When over `cap`,
@@ -96,9 +115,11 @@ impl ChainIndex {
         }
         self.nodes.entry(hash).or_insert(Node {
             parent: None,
+            children: Vec::new(),
             children_on_disk: 0,
             on_disk: false,
             generation,
+            digest: None,
         })
     }
 
@@ -129,18 +150,84 @@ impl ChainIndex {
     }
 
     fn store_one(&mut self, hash: BlockHash, parent: Option<BlockHash>, on_disk: bool) {
-        let node = *self.node_mut(hash);
-        let parent = node.parent.or(parent);
         let n = self.node_mut(hash);
+        let (old_parent, was_on_disk) = (n.parent, n.on_disk);
+        let parent = old_parent.or(parent);
         n.parent = parent;
         if on_disk {
             n.on_disk = true;
         }
-        let gained_parent = node.parent.is_none() && parent.is_some();
-        let counted = node.on_disk && !gained_parent;
-        if n.on_disk && !counted {
+        let now_on_disk = n.on_disk;
+        let gained_parent = old_parent.is_none() && parent.is_some();
+        if let (true, Some(p)) = (gained_parent, parent) {
+            let siblings = &mut self.node_mut(p).children;
+            if !siblings.contains(&hash) {
+                siblings.push(hash);
+            }
+        }
+        let counted = was_on_disk && !gained_parent;
+        if now_on_disk && !counted {
             self.adjust_children(parent, true);
         }
+    }
+
+    /// Records the full hash that names `hash`'s file.
+    pub fn set_digest(&mut self, hash: BlockHash, digest: &[u8]) {
+        if let Some(n) = self.nodes.get_mut(&hash)
+            && n.digest.is_none()
+        {
+            n.digest = Some(digest.into());
+        }
+    }
+
+    fn on_disk_children(&self, hash: BlockHash) -> impl Iterator<Item = BlockHash> + '_ {
+        self.nodes
+            .get(&hash)
+            .map(|n| n.children.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .filter(move |c| {
+                self.on_disk(*c) && self.nodes.get(c).is_some_and(|n| n.parent == Some(hash))
+            })
+    }
+
+    /// `(blocks, leaves)` of the on-disk subtree rooted at `hash`, walking at
+    /// most `budget` blocks. A childless block is one block and one leaf.
+    pub fn shape(&self, hash: BlockHash, budget: usize) -> (usize, usize) {
+        let mut stack = vec![hash];
+        let (mut blocks, mut leaves) = (0, 0);
+        while let Some(h) = stack.pop() {
+            if blocks >= budget {
+                break;
+            }
+            blocks += 1;
+            let before = stack.len();
+            stack.extend(self.on_disk_children(h));
+            if stack.len() == before {
+                leaves += 1;
+            }
+        }
+        (blocks, leaves.max(1))
+    }
+
+    /// On-disk blocks strictly below `hash`, at most `budget` of them.
+    pub fn descendants(&self, hash: BlockHash, budget: usize) -> Vec<Descendant> {
+        let mut out = Vec::new();
+        let mut stack: Vec<BlockHash> = self.on_disk_children(hash).collect();
+        while let Some(h) = stack.pop() {
+            if out.len() >= budget {
+                break;
+            }
+            stack.extend(self.on_disk_children(h));
+            let file_name = self
+                .nodes
+                .get(&h)
+                .and_then(|n| n.digest.as_deref())
+                .map(|d| d.iter().map(|b| format!("{b:02x}")).collect::<String>() + ".bin");
+            out.push(Descendant { hash: h, file_name });
+        }
+        out
     }
 
     /// Marks `hash` gone from disk and returns where it sat in its chain.
@@ -197,12 +284,14 @@ impl ChainIndex {
             let Some((hash, generation)) = self.order.pop_front() else {
                 break;
             };
-            let current = self.nodes.get(&hash).filter(|n| n.generation == generation);
-            if let Some(node) = current.copied() {
-                self.nodes.remove(&hash);
-                if node.on_disk {
-                    self.adjust_children(node.parent, false);
-                }
+            let current = self
+                .nodes
+                .get(&hash)
+                .is_some_and(|n| n.generation == generation);
+            if let Some(node) = current.then(|| self.nodes.remove(&hash)).flatten()
+                && node.on_disk
+            {
+                self.adjust_children(node.parent, false);
             }
         }
         if self.order.len() > self.cap.saturating_mul(2) {
@@ -224,6 +313,7 @@ pub struct ChainStats {
     pub deleted_internal: AtomicU64,
     pub deleted_leaf: AtomicU64,
     pub deferrals: AtomicU64,
+    pub cascaded: AtomicU64,
 }
 
 /// The index shared by the subscriber and every worker.
@@ -262,6 +352,28 @@ impl Chains {
         self.index().rank(hash, deferrals, self.max_deferrals)
     }
 
+    /// Subtree eviction order, smallest first: dead blocks, then the most
+    /// blocks freed per continuation lost (subtree blocks / leaves), so the
+    /// heads of unshared chains go before prefixes many requests extend.
+    pub fn subtree_key(&self, hash: BlockHash) -> SubtreeKey {
+        let index = self.index();
+        if index.rank(hash, 0, u32::MAX) == Rank::Dead {
+            return SubtreeKey {
+                live: false,
+                per_leaf: Reverse(0),
+            };
+        }
+        let (blocks, leaves) = index.shape(hash, SUBTREE_BUDGET);
+        SubtreeKey {
+            live: true,
+            per_leaf: Reverse(blocks.saturating_mul(1000) / leaves),
+        }
+    }
+
+    pub fn descendants(&self, hash: BlockHash) -> Vec<Descendant> {
+        self.index().descendants(hash, SUBTREE_BUDGET)
+    }
+
     /// Records a deletion by kvreap and counts its chain position.
     pub fn deleted(&self, hash: BlockHash) -> Position {
         let position = self.index().remove(hash);
@@ -283,6 +395,7 @@ impl Chains {
                 KvEvent::Stored {
                     parent,
                     hashes,
+                    digests,
                     medium,
                 } => {
                     let on_disk = self
@@ -290,6 +403,9 @@ impl Chains {
                         .as_deref()
                         .is_none_or(|m| medium.as_deref() == Some(m));
                     index.store(*parent, hashes, on_disk);
+                    for (h, d) in hashes.iter().zip(digests) {
+                        index.set_digest(*h, d);
+                    }
                     if on_disk {
                         Stats::add(&self.stats.blocks_stored, hashes.len() as u64);
                     }
@@ -324,6 +440,7 @@ impl Chains {
             deleted_leaf = Stats::get(&s.deleted_leaf),
             deleted_untracked = Stats::get(&s.deleted_untracked),
             deferrals = Stats::get(&s.deferrals),
+            cascaded = Stats::get(&s.cascaded),
             "chains"
         );
     }
@@ -334,6 +451,8 @@ pub enum KvEvent {
     Stored {
         parent: Option<BlockHash>,
         hashes: Vec<BlockHash>,
+        /// Full hashes, parallel to `hashes`; empty when vLLM sends int hashes.
+        digests: Vec<Vec<u8>>,
         medium: Option<String>,
     },
     Removed {
@@ -483,6 +602,20 @@ fn block_hash(v: &Value<'_>) -> Option<BlockHash> {
     }
 }
 
+fn digests(v: Option<&Value<'_>>) -> Vec<Vec<u8>> {
+    match v {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|i| match i {
+                Value::Bin(b) => Some(b.to_vec()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 fn hashes(v: Option<&Value<'_>>) -> Vec<BlockHash> {
     match v {
         Some(Value::Array(items)) => items.iter().filter_map(block_hash).collect(),
@@ -524,6 +657,7 @@ fn event(v: &Value<'_>) -> KvEvent {
     match string(fields.get("type", 0)).as_deref() {
         Some("BlockStored") => KvEvent::Stored {
             hashes: hashes(fields.get("block_hashes", 1)),
+            digests: digests(fields.get("block_hashes", 1)),
             parent: fields.get("parent_block_hash", 2).and_then(block_hash),
             medium: string(fields.get("medium", 6)),
         },
@@ -631,6 +765,7 @@ mod tests {
         KvEvent::Stored {
             parent: parent.map(BlockHash),
             hashes: hashes.iter().copied().map(BlockHash).collect(),
+            digests: Vec::new(),
             medium: Some(medium.to_string()),
         }
     }
@@ -642,14 +777,30 @@ mod tests {
         }
     }
 
+    fn digest(n: u64) -> Vec<u8> {
+        let mut d = vec![0xaa; 24];
+        d.extend(n.to_be_bytes());
+        d
+    }
+
+    fn with_digests(mut e: KvEvent) -> KvEvent {
+        if let KvEvent::Stored {
+            hashes, digests, ..
+        } = &mut e
+        {
+            *digests = hashes.iter().map(|h| digest(h.0)).collect();
+        }
+        e
+    }
+
     #[test]
     fn decodes_vllm_031_map_encoded_batch() {
         let events = decode_batch(&unhex(GOLDEN_V031)).expect("decode");
         assert_eq!(
             events,
             vec![
-                stored(None, &[0x11, 0x12], "GPU"),
-                stored(Some(0x12), &[0x13], "GPU"),
+                with_digests(stored(None, &[0x11, 0x12], "GPU")),
+                with_digests(stored(Some(0x12), &[0x13], "GPU")),
                 removed(&[0x12], "GPU"),
                 removed(&[0x13], "STORAGE"),
                 KvEvent::Other,
@@ -890,6 +1041,75 @@ mod tests {
         assert_eq!(chains.rank(h(2), 0), Rank::Childless);
         assert_eq!(chains.deleted(h(2)), Position::Leaf);
         assert_eq!(chains.deleted(h(1)), Position::Root);
+    }
+
+    #[test]
+    fn subtree_walks_on_disk_children_and_counts_leaves() {
+        //   1 ── 2 ── 3
+        //        └─── 4 ── 5
+        //   6 (separate root)
+        let mut ix = ChainIndex::new(100);
+        ix.store(None, &[h(1), h(2), h(3)], true);
+        ix.store(Some(h(2)), &[h(4), h(5)], true);
+        ix.store(None, &[h(6)], true);
+        for n in [1, 2, 3, 4, 5] {
+            ix.set_digest(h(n), &[0xab, u8::try_from(n).expect("small")]);
+        }
+        assert_eq!(ix.shape(h(1), 100), (5, 2));
+        assert_eq!(ix.shape(h(4), 100), (2, 1));
+        assert_eq!(
+            ix.shape(h(6), 100),
+            (1, 1),
+            "a childless block is its own leaf"
+        );
+        assert_eq!(ix.shape(h(1), 2), (2, 1), "budget stops the walk");
+        let mut below: Vec<_> = ix.descendants(h(1), 100);
+        below.sort_by_key(|d| d.hash.0);
+        assert_eq!(
+            below.iter().map(|d| d.hash.0).collect::<Vec<_>>(),
+            vec![2, 3, 4, 5]
+        );
+        assert_eq!(below[0].file_name.as_deref(), Some("ab02.bin"));
+        assert_eq!(ix.descendants(h(1), 2).len(), 2);
+        assert!(ix.descendants(h(6), 100).is_empty());
+
+        ix.remove(h(5));
+        assert_eq!(ix.shape(h(1), 100), (4, 2), "4 is now a leaf");
+        assert_eq!(ix.descendants(h(2), 100).len(), 2);
+        ix.store(None, &[h(4)], false);
+        assert_eq!(
+            ix.descendants(h(2), 100).len(),
+            2,
+            "re-linking adds no duplicate child"
+        );
+    }
+
+    #[test]
+    fn subtree_key_prefers_dead_then_most_blocks_per_leaf() {
+        // Shared prefix 1-2 with four continuations; unshared chain 10-11-12.
+        let chains = Chains::new(100, ChainPolicy::Subtree, 2, None);
+        chains.apply(&[
+            stored(None, &[1, 2], "GPU"),
+            stored(Some(2), &[3], "GPU"),
+            stored(Some(2), &[4], "GPU"),
+            stored(Some(2), &[5], "GPU"),
+            stored(Some(2), &[6], "GPU"),
+            stored(None, &[10, 11, 12], "GPU"),
+        ]);
+        let (shared, unshared, leaf) = (
+            chains.subtree_key(h(1)),
+            chains.subtree_key(h(10)),
+            chains.subtree_key(h(12)),
+        );
+        assert!(unshared < shared, "3 blocks per leaf beats 6 / 4");
+        assert!(unshared < leaf, "a whole chain beats its last block");
+        assert!(
+            shared < leaf,
+            "6 blocks for 4 continuations beats 1 block for 1"
+        );
+        chains.deleted(h(10));
+        let dead = chains.subtree_key(h(11));
+        assert!(dead < unshared.min(shared).min(leaf), "dead blocks first");
     }
 
     #[test]

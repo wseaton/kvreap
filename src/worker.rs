@@ -385,8 +385,11 @@ impl Worker {
 
     fn evict(&mut self, quota: usize) -> usize {
         #[cfg(feature = "events")]
-        if let Some(chains) = self.tail_first_chains() {
-            return self.evict_tail_first(quota, &chains);
+        if let Some(chains) = self.ordering_chains() {
+            return match chains.policy {
+                ChainPolicy::Subtree => self.evict_subtrees(quota, &chains),
+                _ => self.evict_tail_first(quota, &chains),
+            };
         }
         let mut evicted = 0;
         while evicted < quota && self.ctx.shared.mode().is_evicting() && !self.ctx.shutdown.is_set()
@@ -401,13 +404,64 @@ impl Worker {
         evicted
     }
 
+    /// The chain index when it should reorder eviction. Emergency mode
+    /// ignores chain order.
     #[cfg(feature = "events")]
-    fn tail_first_chains(&self) -> Option<Arc<Chains>> {
+    fn ordering_chains(&self) -> Option<Arc<Chains>> {
         self.ctx
             .chains
             .as_ref()
-            .filter(|c| c.policy == ChainPolicy::TailFirst && !self.unpaced())
+            .filter(|c| c.policy != ChainPolicy::Observe && !self.unpaced())
             .cloned()
+    }
+
+    /// Deletes the best subtree root in the window, then every on-disk block
+    /// below it: none of them is reachable by a prefix lookup once it is gone.
+    #[cfg(feature = "events")]
+    fn evict_subtrees(&mut self, quota: usize, chains: &Chains) -> usize {
+        let mut window: Vec<Candidate> = std::iter::from_fn(|| self.pool.pop_oldest())
+            .take(quota.saturating_mul(CHAIN_WINDOW))
+            .collect();
+        let mut evicted = 0;
+        while evicted < quota && self.ctx.shared.mode().is_evicting() && !self.ctx.shutdown.is_set()
+        {
+            let best = window
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (chains.subtree_key(c.hash), i))
+                .min();
+            let Some((_, i)) = best else {
+                break;
+            };
+            let root = window.remove(i);
+            let (hash, size, rank) = (root.hash, root.size, Arc::clone(&root.rank));
+            let group = leaf_group(&root.path);
+            if !self.evict_one(root) {
+                continue;
+            }
+            evicted += 1;
+            let Some(group) = group else {
+                continue;
+            };
+            for d in chains.descendants(hash) {
+                if !self.ctx.shared.mode().is_evicting() || self.ctx.shutdown.is_set() {
+                    break;
+                }
+                let path = d.file_name.and_then(|name| {
+                    block_path(&rank.path, &name, self.ctx.config.hex_bucket_len, &group)
+                });
+                if let Some(path) = path
+                    && self.remove_block(&path, d.hash, size, &rank)
+                {
+                    evicted += 1;
+                    Stats::add(&chains.stats.cascaded, 1);
+                }
+            }
+        }
+        for c in window {
+            self.pool.insert(c);
+        }
+        evicted
     }
 
     /// Ranks are recomputed after every deletion: removing a leaf can turn
@@ -460,33 +514,38 @@ impl Worker {
                 Err(_) => return false,
             }
         }
+        self.remove_block(&c.path, c.hash, c.size, &c.rank)
+    }
+
+    /// Unlinks one block file and records it everywhere a deletion is counted.
+    fn remove_block(&mut self, path: &Path, hash: BlockHash, size: u64, rank: &RankDir) -> bool {
         if self.ctx.config.dry_run {
-            tracing::debug!(path = %c.path.display(), "[DRY RUN] would delete");
+            tracing::debug!(path = %path.display(), "[DRY RUN] would delete");
             Stats::add(&self.ctx.stats.files_deleted, 1);
             return true;
         }
         if !self.acquire() || !self.ctx.shared.mode().is_evicting() {
             return false;
         }
-        match self.timed(OpKind::Unlink, || fsops::unlink_path(&c.path)) {
+        match self.timed(OpKind::Unlink, || fsops::unlink_path(path)) {
             Ok(()) => {}
             Err(e) if fsops::is_not_found(&e) => return false,
             Err(e) => {
                 Stats::add(&self.ctx.stats.errors, 1);
-                tracing::warn!(path = %c.path.display(), error = %e, "unlink failed");
+                tracing::warn!(path = %path.display(), error = %e, "unlink failed");
                 return false;
             }
         }
         Stats::add(&self.ctx.stats.files_deleted, 1);
-        Stats::add(&self.ctx.stats.bytes_freed, c.size);
+        Stats::add(&self.ctx.stats.bytes_freed, size);
         #[cfg(feature = "events")]
         if let Some(chains) = &self.ctx.chains {
-            chains.deleted(c.hash);
+            chains.deleted(hash);
         }
-        if let (Some(tx), Some(base)) = (&self.ctx.events, &c.rank.model_base) {
+        if let (Some(tx), Some(base)) = (&self.ctx.events, &rank.model_base) {
             let _ = tx.send(Removed {
                 model_base: base.clone(),
-                hash: c.hash,
+                hash,
             });
         }
         true
@@ -513,6 +572,25 @@ impl Worker {
             Err(e) => tracing::debug!(dir = %dir.display(), error = %e, "rmdir failed"),
         }
     }
+}
+
+/// `g0` from `.../<hh>_g0/<hash>.bin`.
+#[cfg(feature = "events")]
+fn leaf_group(block: &Path) -> Option<String> {
+    let leaf = block.parent()?.file_name()?.to_str()?;
+    leaf.rsplit_once("_g").map(|(_, g)| g.to_owned())
+}
+
+/// `<rank>/<hhh>/<hh>_g<group>/<name>` for a block file `name`.
+#[cfg(feature = "events")]
+fn block_path(rank: &Path, name: &str, bucket_len: usize, group: &str) -> Option<PathBuf> {
+    let bucket = name.get(..bucket_len)?;
+    let leaf = name.get(bucket_len..bucket_len + 2)?;
+    Some(
+        rank.join(bucket)
+            .join(format!("{leaf}_g{group}"))
+            .join(name),
+    )
 }
 
 #[cfg(test)]
@@ -1024,13 +1102,23 @@ mod tests {
         pub fn chain_harness(cache: &Path, policy: ChainPolicy, chain: &[u64]) -> Harness {
             let mut h = harness(config(cache, &[]));
             let chains = Arc::new(Chains::new(1000, policy, 2, None));
-            chains.apply(&[KvEvent::Stored {
-                parent: None,
-                hashes: chain.iter().map(|&n| hash(n)).collect(),
-                medium: Some("GPU".into()),
-            }]);
+            chains.apply(&[stored(None, chain)]);
             h.worker.ctx.chains = Some(chains);
             h
+        }
+
+        /// A GPU `BlockStored` whose digests are the 8-byte hashes, so the
+        /// digest names the fixture's 16-hex-digit files.
+        pub fn stored(parent: Option<u64>, chain: &[u64]) -> KvEvent {
+            KvEvent::Stored {
+                parent: parent.map(hash),
+                hashes: chain.iter().map(|&n| hash(n)).collect(),
+                digests: chain
+                    .iter()
+                    .map(|&n| hash(n).0.to_be_bytes().to_vec())
+                    .collect(),
+                medium: Some("GPU".into()),
+            }
         }
 
         pub fn chains(h: &Harness) -> &Chains {
@@ -1163,6 +1251,81 @@ mod tests {
             "3 is orphaned once 2 goes"
         );
         assert_eq!(Stats::get(&chains(&h).stats.deleted_leaf), 0);
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn subtree_policy_deletes_the_unshared_chain_whole_and_spares_the_shared_prefix() {
+        use crate::config::ChainPolicy;
+        use crate::worker::tests::chain_fixtures::{bucket, chain_harness, chains, names, stored};
+
+        // Shared prefix 1-2 continued by 3 and 4 (older); unshared chain 10-11-12.
+        let (_tmp, cache) = bucket(&[
+            (1, Some(9000)),
+            (2, Some(8999)),
+            (3, Some(8998)),
+            (4, Some(8997)),
+            (10, Some(8000)),
+            (11, Some(7999)),
+            (12, Some(7998)),
+        ]);
+        let mut h = chain_harness(&cache, ChainPolicy::Subtree, &[1, 2, 3]);
+        chains(&h).apply(&[stored(Some(2), &[4]), stored(None, &[10, 11, 12])]);
+        h.shared.set_mode(Mode::Evicting);
+        h.worker.round().expect("round");
+        assert_eq!(bins(&cache), names(&[1, 2, 3, 4]));
+        let s = &chains(&h).stats;
+        assert_eq!(Stats::get(&s.deleted_root), 1);
+        assert_eq!(Stats::get(&s.cascaded), 2);
+        assert_eq!(
+            Stats::get(&s.deleted_orphan),
+            2,
+            "11 and 12 were dead once 10 went"
+        );
+        assert_eq!(Stats::get(&h.stats.files_deleted), 3);
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn subtree_cascade_skips_blocks_without_a_digest_and_missing_files() {
+        use crate::chains::KvEvent;
+        use crate::config::ChainPolicy;
+        use crate::worker::tests::chain_fixtures::{bucket, chain_harness, chains, hash, names};
+
+        let (_tmp, cache) = bucket(&[(1, Some(9000)), (2, Some(8999)), (3, None)]);
+        let mut h = chain_harness(&cache, ChainPolicy::Subtree, &[1, 2]);
+        chains(&h).apply(&[KvEvent::Stored {
+            parent: Some(hash(2)),
+            hashes: vec![hash(3), hash(4)],
+            digests: Vec::new(),
+            medium: Some("GPU".into()),
+        }]);
+        h.shared.set_mode(Mode::Evicting);
+        h.worker.round().expect("round");
+        assert_eq!(
+            bins(&cache),
+            names(&[3]),
+            "3 has no known file name; 4 has no file"
+        );
+        assert_eq!(Stats::get(&chains(&h).stats.cascaded), 1);
+        assert_eq!(Stats::get(&h.stats.errors), 0);
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn block_path_rebuilds_the_fs_tier_layout() {
+        use std::path::Path;
+
+        use crate::worker::{block_path, leaf_group};
+
+        let block = Path::new("/c/m_abc_r0/abc/de_g3/abcdef.bin");
+        assert_eq!(leaf_group(block).as_deref(), Some("3"));
+        assert_eq!(leaf_group(Path::new("/c/m/abc/de/x.bin")), None);
+        assert_eq!(
+            block_path(Path::new("/c/m_abc_r0"), "0123ff.bin", 3, "3"),
+            Some(Path::new("/c/m_abc_r0/012/3f_g3/0123ff.bin").to_path_buf())
+        );
+        assert_eq!(block_path(Path::new("/r"), "ab", 3, "0"), None);
     }
 
     #[cfg(feature = "events")]
