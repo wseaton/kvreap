@@ -197,7 +197,7 @@ def load_agent(dir_: Path) -> dict[str, Any]:
         "agent_later_ttft_p50_ms": percentile(later, 0.5),
         "agent_later_ttft_p90_ms": percentile(later, 0.9),
         "agent_later_ttft_p99_ms": percentile(later, 0.99),
-        "agent_prompt_tok_per_s": prompt_tokens / span if span else None,
+        "agent_prompt_tok_per_s": prompt_tokens / span if span and prompt_tokens else None,
     }
 
 
