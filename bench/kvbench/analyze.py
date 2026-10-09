@@ -29,6 +29,7 @@ CHAIN_COUNTERS = (
     ("deferrals", "chain deferrals"),
     ("cascaded", "chain deletions: cascaded below a deleted root"),
     ("undigested", "blocks announced without a digest"),
+    ("young_edges", "leaf edges skipped as too young"),
     ("event_batches", "KV event batches received"),
     ("decode_errors", "KV event decode errors"),
 )

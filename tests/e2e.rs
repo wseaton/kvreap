@@ -526,6 +526,11 @@ fn block_stored_batch(chain: &[u64]) -> Vec<u8> {
 /// Runs kvreap over one 40-block chain in a single bucket, head oldest, with
 /// the chain announced over a real ZMQ PUB; returns the final `chains` status line.
 fn evict_announced_chain(policy: &str) -> String {
+    evict_announced_chain_with(policy, &[])
+}
+
+#[cfg(feature = "events")]
+fn evict_announced_chain_with(policy: &str, extra: &[(&'static str, &str)]) -> String {
     const LEN: u64 = 40;
     let tmp = tempfile::tempdir().expect("tempdir");
     let cache = Cache::new(tmp.path());
@@ -555,6 +560,7 @@ fn evict_announced_chain(policy: &str) -> String {
     env.push(("CHAIN_EVICTION", policy.into()));
     env.push(("CHAIN_MAX_DEFERRALS", "1000".into()));
     env.push(("NUM_CRAWLER_PROCESSES", "1".into()));
+    env.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
     let mut ev = Evictor::start(tmp.path(), &env);
     assert!(
         ev.wait_for_log("subscribed to KV cache events", Duration::from_secs(10)),
@@ -613,6 +619,17 @@ fn observe_eviction_deletes_announced_chain_head_first() {
     assert_eq!(counter(&line, "deleted_orphan"), 39, "{line}");
     assert_eq!(counter(&line, "deleted_leaf"), 0, "{line}");
     assert_eq!(counter(&line, "deferrals"), 0, "{line}");
+}
+
+#[cfg(feature = "events")]
+#[test]
+fn radix_eviction_deletes_the_announced_chain_as_one_edge_from_the_leaf() {
+    // The chain was announced moments ago; a zero hot window lets its edge go.
+    let line = evict_announced_chain_with("radix", &[("FILE_ACCESS_TIME_THRESHOLD_MINUTES", "0")]);
+    assert_eq!(counter(&line, "deleted_leaf"), 39, "{line}");
+    assert_eq!(counter(&line, "deleted_root"), 1, "{line}");
+    assert_eq!(counter(&line, "deleted_orphan"), 0, "{line}");
+    assert_eq!(counter(&line, "cascaded"), 39, "{line}");
 }
 
 #[cfg(feature = "events")]

@@ -20,7 +20,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::ChainPolicy;
 use crate::layout::BlockHash;
@@ -67,12 +67,25 @@ struct Node {
     generation: u64,
     /// Full block hash, which names the block's file.
     digest: Option<Box<[u8]>>,
+    /// When the block was last marked on disk.
+    stored_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SubtreeKey {
     live: bool,
     per_leaf: Reverse<usize>,
+}
+
+/// A radix-tree leaf edge: the on-disk blocks from just below the last fork
+/// (or a chain root, or a missing parent) down to a leaf, root side first.
+/// Only a leaf edge serves a single cached prefix, so it is the unit of
+/// connectivity-based eviction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafEdge {
+    pub blocks: Vec<Descendant>,
+    /// Most recent on-disk mark of any block in the edge.
+    pub newest_store: Option<Instant>,
 }
 
 /// A block below a subtree root, with the file name of its digest if known.
@@ -120,6 +133,7 @@ impl ChainIndex {
             on_disk: false,
             generation,
             digest: None,
+            stored_at: None,
         })
     }
 
@@ -154,8 +168,9 @@ impl ChainIndex {
         let (old_parent, was_on_disk) = (n.parent, n.on_disk);
         let parent = old_parent.or(parent);
         n.parent = parent;
-        if on_disk {
+        if on_disk && !n.on_disk {
             n.on_disk = true;
+            n.stored_at = Some(Instant::now());
         }
         let now_on_disk = n.on_disk;
         let gained_parent = old_parent.is_none() && parent.is_some();
@@ -211,6 +226,63 @@ impl ChainIndex {
         (blocks, leaves.max(1))
     }
 
+    fn descendant(&self, hash: BlockHash) -> Descendant {
+        let file_name = self
+            .nodes
+            .get(&hash)
+            .and_then(|n| n.digest.as_deref())
+            .map(|d| d.iter().map(|b| format!("{b:02x}")).collect::<String>() + ".bin");
+        Descendant { hash, file_name }
+    }
+
+    /// The leaf edge `hash` maps to: its own edge when nothing forks below
+    /// it, else the edge of the oldest-stored child at each fork on the way
+    /// down. `None` when `hash` is not on disk or the walk exceeds `budget`.
+    ///
+    /// ```text
+    ///   s0 ── s1 ──┬── a1 ── a2      hash = a1  → edge [a1, a2]
+    ///              └── b1            hash = s0  → edge [b1] (if b1 is older)
+    /// ```
+    pub fn leaf_edge(&self, hash: BlockHash, budget: usize) -> Option<LeafEdge> {
+        if !self.on_disk(hash) {
+            return None;
+        }
+        let mut leaf = hash;
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            if steps > budget {
+                return None;
+            }
+            let oldest_child = self
+                .on_disk_children(leaf)
+                .min_by_key(|c| self.nodes.get(c).and_then(|n| n.stored_at));
+            match oldest_child {
+                Some(c) => leaf = c,
+                None => break,
+            }
+        }
+        let mut blocks = vec![self.descendant(leaf)];
+        let mut top = leaf;
+        while let Some(p) = self.nodes.get(&top).and_then(|n| n.parent) {
+            let single = self.on_disk(p) && self.on_disk_children(p).take(2).count() == 1;
+            if !single || blocks.len() >= budget {
+                break;
+            }
+            blocks.push(self.descendant(p));
+            top = p;
+        }
+        blocks.reverse();
+        let newest_store = blocks
+            .iter()
+            .filter_map(|b| self.nodes.get(&b.hash).and_then(|n| n.stored_at))
+            .max();
+        Some(LeafEdge {
+            blocks,
+            newest_store,
+        })
+    }
+
     /// On-disk blocks strictly below `hash`, at most `budget` of them.
     pub fn descendants(&self, hash: BlockHash, budget: usize) -> Vec<Descendant> {
         let mut out = Vec::new();
@@ -220,12 +292,7 @@ impl ChainIndex {
                 break;
             }
             stack.extend(self.on_disk_children(h));
-            let file_name = self
-                .nodes
-                .get(&h)
-                .and_then(|n| n.digest.as_deref())
-                .map(|d| d.iter().map(|b| format!("{b:02x}")).collect::<String>() + ".bin");
-            out.push(Descendant { hash: h, file_name });
+            out.push(self.descendant(h));
         }
         out
     }
@@ -316,6 +383,8 @@ pub struct ChainStats {
     pub cascaded: AtomicU64,
     /// Stored blocks announced as int hashes, whose files cannot be named.
     pub undigested: AtomicU64,
+    /// Leaf edges left alone because a block in them is younger than the hot threshold.
+    pub young_edges: AtomicU64,
 }
 
 /// The index shared by the subscriber and every worker.
@@ -374,6 +443,10 @@ impl Chains {
 
     pub fn descendants(&self, hash: BlockHash) -> Vec<Descendant> {
         self.index().descendants(hash, SUBTREE_BUDGET)
+    }
+
+    pub fn leaf_edge(&self, hash: BlockHash) -> Option<LeafEdge> {
+        self.index().leaf_edge(hash, SUBTREE_BUDGET)
     }
 
     /// Records a deletion by kvreap and counts its chain position.
@@ -447,6 +520,7 @@ impl Chains {
             deferrals = Stats::get(&s.deferrals),
             cascaded = Stats::get(&s.cascaded),
             undigested = Stats::get(&s.undigested),
+            young_edges = Stats::get(&s.young_edges),
             "chains"
         );
     }
@@ -741,7 +815,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::chains::{
-        ChainIndex, Chains, DecodeError, KvEvent, Position, Rank, decode_batch, subscribe,
+        ChainIndex, Chains, DecodeError, KvEvent, LeafEdge, Position, Rank, decode_batch, subscribe,
     };
     use crate::config::ChainPolicy;
     use crate::layout::BlockHash;
@@ -1088,6 +1162,56 @@ mod tests {
             ix.descendants(h(2), 100).len(),
             2,
             "re-linking adds no duplicate child"
+        );
+    }
+
+    #[test]
+    fn leaf_edge_stops_at_the_last_fork_and_descends_shared_prefixes() {
+        //   1 ── 2 ──┬── 3 ── 4        (system prompt 1-2, two conversations)
+        //            └── 5 ── 6 ── 7
+        let mut ix = ChainIndex::new(100);
+        ix.store(None, &[h(1), h(2), h(3), h(4)], true);
+        std::thread::sleep(Duration::from_millis(5));
+        ix.store(Some(h(2)), &[h(5), h(6), h(7)], true);
+        for n in 1..=7 {
+            ix.set_digest(h(n), &[u8::try_from(n).expect("small")]);
+        }
+        let hashes = |e: LeafEdge| e.blocks.iter().map(|b| b.hash.0).collect::<Vec<_>>();
+        assert_eq!(ix.leaf_edge(h(6), 100).map(hashes), Some(vec![5, 6, 7]));
+        assert_eq!(ix.leaf_edge(h(4), 100).map(hashes), Some(vec![3, 4]));
+        assert_eq!(
+            ix.leaf_edge(h(1), 100).map(hashes),
+            Some(vec![3, 4]),
+            "a shared prefix maps to its oldest continuation, never to itself"
+        );
+        let edge = ix.leaf_edge(h(7), 100).expect("edge");
+        assert_eq!(edge.blocks[0].file_name.as_deref(), Some("05.bin"));
+        assert_eq!(
+            edge.newest_store,
+            ix.nodes.get(&h(7)).and_then(|n| n.stored_at)
+        );
+
+        for n in [4, 3] {
+            ix.remove(h(n));
+        }
+        assert_eq!(
+            ix.leaf_edge(h(1), 100).map(hashes),
+            Some(vec![1, 2, 5, 6, 7]),
+            "with one continuation left the prompt is part of its edge"
+        );
+        assert_eq!(ix.leaf_edge(h(99), 100), None);
+        assert_eq!(ix.leaf_edge(h(1), 2), None, "budget");
+    }
+
+    #[test]
+    fn leaf_edge_of_an_orphan_starts_at_the_missing_parent() {
+        let mut ix = ChainIndex::new(100);
+        ix.store(None, &[h(1), h(2), h(3)], true);
+        ix.remove(h(1));
+        let edge = ix.leaf_edge(h(3), 100).expect("edge");
+        assert_eq!(
+            edge.blocks.iter().map(|b| b.hash.0).collect::<Vec<_>>(),
+            vec![2, 3]
         );
     }
 

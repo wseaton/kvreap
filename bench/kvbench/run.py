@@ -90,6 +90,8 @@ class RunConfig:
     gpu_blocks: int = 4096
     churn_input_len: int = 4096
     churn_concurrency: int = 8
+    churn_shared_prefix_len: int = 0
+    churn_shared_prefixes: int = 1
     hot_prefixes: int = 64
     hot_prefix_len: int = 2048
     hot_request_rate: float = 2.0
@@ -292,8 +294,28 @@ common="--backend vllm --base-url $BASE_URL --model $MODEL --save-result --save-
 (
   i=0
   while [ $SECONDS -lt $end ]; do
-    vllm bench serve $common --dataset-name random \
-      --random-input-len $CHURN_INPUT_LEN --random-output-len 8 --num-prompts 64 \
+    if [ "$SHARED_PREFIX_LEN" -gt 0 ]; then
+      python3 - "$i" > /results/churn/prompts-$i.jsonl <<'PY'
+import json, os, random, sys
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained(os.environ["MODEL"])
+special = set(tok.all_special_ids)
+ids = [t for t in range(tok.vocab_size) if t not in special]
+def text(rng, n):
+    return tok.decode([rng.choice(ids) for _ in range(n)], skip_special_tokens=True)
+fixed = random.Random(42)
+n_prefix = int(os.environ["SHARED_PREFIX_LEN"])
+prompts = [text(fixed, n_prefix) for _ in range(int(os.environ["SHARED_PREFIXES"]))]
+rng = random.Random(1000 + int(sys.argv[1]))
+for _ in range(64):
+    suffix = text(rng, int(os.environ["CHURN_INPUT_LEN"]) - n_prefix)
+    print(json.dumps({"prompt": rng.choice(prompts) + suffix}))
+PY
+      data="--dataset-name custom --dataset-path /results/churn/prompts-$i.jsonl --custom-output-len 8 --skip-chat-template"
+    else
+      data="--dataset-name random --random-input-len $CHURN_INPUT_LEN --random-output-len 8"
+    fi
+    vllm bench serve $common $data --num-prompts 64 \
       --max-concurrency $CHURN_CONCURRENCY --seed $((1000 + i)) \
       --result-dir /results/churn --result-filename churn-$i.json > /results/churn/log-$i.txt 2>&1 \
       || echo "churn iteration $i failed" >&2
@@ -325,6 +347,8 @@ def loadgen_manifest(cfg: RunConfig) -> Manifest:
         "MODEL": cfg.model,
         "CHURN_INPUT_LEN": str(cfg.churn_input_len),
         "CHURN_CONCURRENCY": str(cfg.churn_concurrency),
+        "SHARED_PREFIX_LEN": str(cfg.churn_shared_prefix_len),
+        "SHARED_PREFIXES": str(cfg.churn_shared_prefixes),
         "HOT_PREFIXES": str(cfg.hot_prefixes),
         "HOT_PREFIX_LEN": str(cfg.hot_prefix_len),
         "HOT_RATE": str(cfg.hot_request_rate),

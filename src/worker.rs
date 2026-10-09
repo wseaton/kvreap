@@ -397,6 +397,7 @@ impl Worker {
         if let Some(chains) = self.ordering_chains() {
             return match chains.policy {
                 ChainPolicy::Subtree => self.evict_subtrees(quota, &chains),
+                ChainPolicy::Radix => self.evict_radix(quota, &chains),
                 _ => self.evict_tail_first(quota, &chains),
             };
         }
@@ -442,54 +443,158 @@ impl Worker {
             let Some((_, i)) = best else {
                 break;
             };
-            let root = window.remove(i);
-            let (hash, size, rank) = (root.hash, root.size, Arc::clone(&root.rank));
-            let group = leaf_group(&root.path);
-            let relative = root
-                .path
-                .strip_prefix(&rank.path)
-                .map(Path::to_path_buf)
-                .ok();
-            if !self.evict_one(root) {
-                continue;
-            }
-            evicted += 1;
-            let siblings = self.sibling_ranks(&rank);
-            if let Some(relative) = relative {
-                for sib in &siblings {
-                    if self.remove_block(&sib.path.join(&relative), hash, size, sib, false) {
-                        evicted += 1;
-                    }
-                }
-            }
-            let Some(group) = group else {
-                continue;
-            };
-            let bucket_len = self.ctx.config.hex_bucket_len;
-            for d in chains.descendants(hash) {
-                if !self.ctx.shared.mode().is_evicting() || self.ctx.shutdown.is_set() {
-                    break;
-                }
-                let Some(name) = d.file_name else {
-                    continue;
-                };
-                let mut removed_any = false;
-                for r in std::iter::once(&rank).chain(&siblings) {
-                    let Some(path) = block_path(&r.path, &name, bucket_len, &group) else {
-                        continue;
-                    };
-                    if self.remove_block(&path, d.hash, size, r, false) {
-                        evicted += 1;
-                        removed_any = true;
-                    }
-                }
-                if removed_any {
-                    chains.deleted(d.hash);
-                    Stats::add(&chains.stats.cascaded, 1);
-                }
-            }
+            evicted += self.delete_subtree(window.remove(i), chains);
         }
         for c in window {
+            self.pool.insert(c);
+        }
+        evicted
+    }
+
+    /// Deletes `root` and every on-disk block below it, in every rank dir of
+    /// its model. Returns files removed.
+    #[cfg(feature = "events")]
+    fn delete_subtree(&mut self, root: Candidate, chains: &Chains) -> usize {
+        let (hash, size, rank) = (root.hash, root.size, Arc::clone(&root.rank));
+        let group = leaf_group(&root.path);
+        let name = root
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned);
+        if !self.evict_one(root) {
+            return 0;
+        }
+        let siblings = self.sibling_ranks(&rank);
+        let mut removed = 1;
+        let (Some(group), Some(name)) = (group, name) else {
+            return removed;
+        };
+        removed += self.remove_named(&siblings, &name, &group, hash, size);
+        for d in chains.descendants(hash) {
+            if !self.ctx.shared.mode().is_evicting() || self.ctx.shutdown.is_set() {
+                break;
+            }
+            let Some(name) = d.file_name else {
+                continue;
+            };
+            let files = self.remove_named(
+                &[std::slice::from_ref(&rank), siblings.as_slice()].concat(),
+                &name,
+                &group,
+                d.hash,
+                size,
+            );
+            if files > 0 {
+                removed += files;
+                chains.deleted(d.hash);
+                Stats::add(&chains.stats.cascaded, 1);
+            }
+        }
+        removed
+    }
+
+    /// Unlinks block file `name` from each of `ranks`; returns files removed.
+    #[cfg(feature = "events")]
+    fn remove_named(
+        &mut self,
+        ranks: &[Arc<RankDir>],
+        name: &str,
+        group: &str,
+        hash: BlockHash,
+        size: u64,
+    ) -> usize {
+        let bucket_len = self.ctx.config.hex_bucket_len;
+        let mut removed = 0;
+        for r in ranks {
+            let Some(path) = block_path(&r.path, name, bucket_len, group) else {
+                continue;
+            };
+            if self.remove_block(&path, hash, size, r, false) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Dead candidates take their whole subtree with them. Any other
+    /// candidate maps to the radix leaf edge it belongs to (or, inside a
+    /// shared prefix, the oldest edge below it), which is deleted leaf first
+    /// unless one of its blocks is younger than the hot threshold.
+    #[cfg(feature = "events")]
+    fn evict_radix(&mut self, quota: usize, chains: &Chains) -> usize {
+        let mut window: Vec<Candidate> = std::iter::from_fn(|| self.pool.pop_oldest())
+            .take(quota.saturating_mul(CHAIN_WINDOW))
+            .collect();
+        let mut held = Vec::new();
+        let mut evicted = 0;
+        while evicted < quota && self.ctx.shared.mode().is_evicting() && !self.ctx.shutdown.is_set()
+        {
+            if window.is_empty() {
+                break;
+            }
+            let dead = window
+                .iter()
+                .position(|c| chains.rank(c.hash, 0) == Rank::Dead);
+            let c = window.remove(dead.unwrap_or(0));
+            if dead.is_some() {
+                evicted += self.delete_subtree(c, chains);
+                continue;
+            }
+            let Some(edge) = chains.leaf_edge(c.hash) else {
+                if self.evict_one(c) {
+                    evicted += 1;
+                }
+                continue;
+            };
+            if edge
+                .newest_store
+                .is_some_and(|t| t.elapsed() < self.ctx.config.hot_threshold)
+            {
+                Stats::add(&chains.stats.young_edges, 1);
+                held.push(c);
+                continue;
+            }
+            let Some(group) = leaf_group(&c.path) else {
+                held.push(c);
+                continue;
+            };
+            let ranks = [
+                std::slice::from_ref(&c.rank),
+                self.sibling_ranks(&c.rank).as_slice(),
+            ]
+            .concat();
+            let own_name = c
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_owned);
+            let mut candidate_gone = false;
+            for b in edge.blocks.iter().rev() {
+                let is_candidate = b.hash == c.hash;
+                let Some(name) = b
+                    .file_name
+                    .clone()
+                    .or_else(|| own_name.clone().filter(|_| is_candidate))
+                else {
+                    continue;
+                };
+                let files = self.remove_named(&ranks, &name, &group, b.hash, c.size);
+                if files > 0 {
+                    evicted += files;
+                    chains.deleted(b.hash);
+                    if is_candidate {
+                        candidate_gone = true;
+                    } else {
+                        Stats::add(&chains.stats.cascaded, 1);
+                    }
+                }
+            }
+            if !candidate_gone {
+                held.push(c);
+            }
+        }
+        for c in window.into_iter().chain(held) {
             self.pool.insert(c);
         }
         evicted
@@ -1399,6 +1504,90 @@ mod tests {
             0,
             "each block recorded once"
         );
+    }
+
+    #[cfg(feature = "events")]
+    fn radix_harness(cache: &Path, hot_minutes: &str) -> Harness {
+        use crate::config::ChainPolicy;
+        use crate::worker::tests::chain_fixtures::{chain_harness, chains, stored};
+
+        // System prompt 1-2 shared by three one-block conversations 3, 4, 5.
+        let mut h = chain_harness(cache, ChainPolicy::Radix, &[1, 2, 3]);
+        h.worker.ctx.config = Arc::new(config(
+            cache,
+            &[("FILE_ACCESS_TIME_THRESHOLD_MINUTES", hot_minutes)],
+        ));
+        chains(&h).apply(&[stored(Some(2), &[4]), stored(Some(2), &[5])]);
+        h.shared.set_mode(Mode::Evicting);
+        h
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn radix_keeps_a_shared_prompt_while_it_has_continuations() {
+        use crate::worker::tests::chain_fixtures::{bucket, chains, names};
+
+        let (_tmp, cache) = bucket(&[
+            (1, Some(9000)),
+            (2, Some(8999)),
+            (3, Some(8500)),
+            (4, Some(8400)),
+            (5, Some(8300)),
+        ]);
+        let mut h = radix_harness(&cache, "0");
+        h.worker.round().expect("round");
+        assert_eq!(
+            bins(&cache),
+            names(&[1, 2, 5]),
+            "the oldest blocks are the prompt, but its oldest conversations go instead"
+        );
+        assert_eq!(Stats::get(&chains(&h).stats.deleted_leaf), 2);
+        assert_eq!(Stats::get(&chains(&h).stats.deleted_root), 0);
+        run_rounds(&mut h, 10);
+        assert!(
+            bins(&cache).is_empty(),
+            "with one continuation left the prompt is part of its edge"
+        );
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn radix_leaves_young_edges_alone() {
+        use crate::worker::tests::chain_fixtures::{bucket, chains};
+
+        let (_tmp, cache) = bucket(&[
+            (1, Some(9000)),
+            (2, Some(8999)),
+            (3, Some(8500)),
+            (4, Some(8400)),
+            (5, Some(8300)),
+        ]);
+        let mut h = radix_harness(&cache, "60");
+        h.worker.ctx.config = Arc::new(config(
+            &cache,
+            &[("FILE_ACCESS_TIME_THRESHOLD_MINUTES", "60")],
+        ));
+        run_rounds(&mut h, 5);
+        assert_eq!(bins(&cache).len(), 5, "every edge was stored moments ago");
+        assert!(Stats::get(&chains(&h).stats.young_edges) > 0);
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn radix_deletes_a_dead_candidate_with_its_subtree() {
+        use crate::worker::tests::chain_fixtures::{bucket, chains, hash, names};
+
+        let (_tmp, cache) = bucket(&[
+            (2, Some(8000)),
+            (3, Some(7999)),
+            (9, Some(9000)),
+            (10, None),
+        ]);
+        let mut h = radix_harness(&cache, "0");
+        chains(&h).deleted(hash(1));
+        h.worker.round().expect("round");
+        assert_eq!(bins(&cache), names(&[9, 10]), "2 and 3 were dead");
+        assert_eq!(Stats::get(&chains(&h).stats.cascaded), 1);
     }
 
     #[cfg(feature = "events")]

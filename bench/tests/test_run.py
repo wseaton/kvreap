@@ -101,3 +101,17 @@ def test_hf_pvc_name_reaches_vllm_and_loadgen() -> None:
     assert "kvreap-bench-hf-large" in claims
     lg = loadgen_manifest(c)
     assert lg["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"] == "kvreap-bench-hf-large"
+
+
+def test_shared_prefix_settings_reach_the_loadgen() -> None:
+    from kvbench.run import loadgen_manifest
+
+    lg = loadgen_manifest(cfg(churn_shared_prefix_len=1024, churn_shared_prefixes=4))
+    env = {e["name"]: e["value"] for e in lg["spec"]["containers"][0]["env"]}
+    assert env["SHARED_PREFIX_LEN"] == "1024"
+    assert env["SHARED_PREFIXES"] == "4"
+    script = lg["spec"]["containers"][0]["command"][-1]
+    assert "--dataset-name custom" in script
+    assert "--skip-chat-template" in script
+    plain = {e["name"]: e["value"] for e in loadgen_manifest(cfg())["spec"]["containers"][0]["env"]}
+    assert plain["SHARED_PREFIX_LEN"] == "0"
