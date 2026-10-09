@@ -79,6 +79,8 @@ class RunConfig:
     storage_class: str = "kvreap-bench-vast"
     pvc_size: str = "100Gi"
     hf_pvc: str = "kvreap-bench-hf"
+    hf_pvc_size: str = "50Gi"
+    tensor_parallel_size: int = 1
     pull_secret: str = "quay-wseaton-pull"
     duration_s: int = 1200
     settle_s: int = 60
@@ -214,6 +216,9 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
         f"--num-gpu-blocks-override={cfg.gpu_blocks}",
         f"--kv-transfer-config={json.dumps(kv_config)}",
     ]
+    if cfg.tensor_parallel_size > 1:
+        args.append(f"--tensor-parallel-size={cfg.tensor_parallel_size}")
+    gpus = str(cfg.tensor_parallel_size)
     env = [
         {"name": "HF_HOME", "value": "/models/hf"},
         {"name": "HOME", "value": "/tmp"},
@@ -249,8 +254,8 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
                     "ports": ports,
                     "readinessProbe": {"httpGet": {"path": "/health", "port": 8000}, "periodSeconds": 5},
                     "resources": {
-                        "requests": {"nvidia.com/gpu": "1", "cpu": "16", "memory": "64Gi"},
-                        "limits": {"nvidia.com/gpu": "1", "memory": "96Gi"},
+                        "requests": {"nvidia.com/gpu": gpus, "cpu": "16", "memory": "64Gi"},
+                        "limits": {"nvidia.com/gpu": gpus, "memory": "96Gi"},
                     },
                     "volumeMounts": [
                         {"name": "kv", "mountPath": KV_MOUNT},
@@ -491,7 +496,7 @@ def run(cfg: RunConfig, keep: bool = False) -> None:
     c = cfg.cluster
     ensure_storage_class(c, cfg.storage_class, nosharecache=not cfg.share_nfs_client)
     if not c.exists("pvc", cfg.hf_pvc):
-        c.apply([pvc(cfg.hf_pvc, "shared-vast", "50Gi", {"app.kubernetes.io/part-of": PART_OF})])
+        c.apply([pvc(cfg.hf_pvc, "shared-vast", cfg.hf_pvc_size, {"app.kubernetes.io/part-of": PART_OF})])
 
     evictor = evictor_manifests(cfg)
     print(f"[{cfg.variant}] cleaning up any previous run", flush=True)

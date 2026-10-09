@@ -41,6 +41,10 @@ def main() -> int:
         help="mount like shared-vast (no nosharecache): co-located pods share one NFS client and counters merge",
     )
 
+    r.add_argument("--cpu-tier-gib", type=float, default=2.0, help="vLLM CPU offload tier size in GiB")
+    r.add_argument("--tensor-parallel-size", type=int, default=1, help="vLLM TP size; requests that many GPUs")
+    r.add_argument("--hf-pvc", default="kvreap-bench-hf", help="PVC holding the HF model cache (created if missing)")
+    r.add_argument("--hf-pvc-size", default="50Gi", help="size when --hf-pvc has to be created")
     r.add_argument(
         "--kv-events",
         action="store_true",
@@ -93,6 +97,10 @@ def main() -> int:
         placement=args.placement,
         share_nfs_client=args.share_nfs_client,
         kv_events=args.kv_events,
+        tensor_parallel_size=args.tensor_parallel_size,
+        cpu_tier_bytes=int(args.cpu_tier_gib * 1024**3),
+        hf_pvc=args.hf_pvc,
+        hf_pvc_size=args.hf_pvc_size,
         evictor_env=evictor_env,
         storage_class="kvreap-bench-vast-shared" if args.share_nfs_client else "kvreap-bench-vast",
     )

@@ -77,3 +77,24 @@ def test_explicit_endpoint_wins_and_default_has_none() -> None:
     env = evictor_env(cfg(kv_events=True, evictor_env={"KV_EVENTS_ENDPOINTS": "tcp://elsewhere:1"}))
     assert env["KV_EVENTS_ENDPOINTS"] == "tcp://elsewhere:1"
     assert "KV_EVENTS_ENDPOINTS" not in evictor_env(cfg())
+
+
+def test_tensor_parallel_requests_gpus_and_passes_the_flag() -> None:
+    container, _ = vllm_parts(cfg(tensor_parallel_size=4))
+    assert "--tensor-parallel-size=4" in container["args"]
+    assert container["resources"]["requests"]["nvidia.com/gpu"] == "4"
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == "4"
+    single, _ = vllm_parts(cfg())
+    assert not any(a.startswith("--tensor-parallel-size") for a in single["args"])
+    assert single["resources"]["limits"]["nvidia.com/gpu"] == "1"
+
+
+def test_hf_pvc_name_reaches_vllm_and_loadgen() -> None:
+    from kvbench.run import loadgen_manifest
+
+    c = cfg(hf_pvc="kvreap-bench-hf-large")
+    pod, _ = vllm_manifests(c)
+    claims = {v["persistentVolumeClaim"]["claimName"] for v in pod["spec"]["volumes"] if "persistentVolumeClaim" in v}
+    assert "kvreap-bench-hf-large" in claims
+    lg = loadgen_manifest(c)
+    assert lg["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"] == "kvreap-bench-hf-large"

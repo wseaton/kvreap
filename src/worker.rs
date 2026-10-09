@@ -125,6 +125,9 @@ impl Pool {
 #[derive(Debug, Default)]
 struct BucketIndex {
     buckets: Vec<(Arc<RankDir>, CString)>,
+    /// Every rank dir found, including ones with no bucket in this shard.
+    #[cfg(feature = "events")]
+    ranks: Vec<Arc<RankDir>>,
     refreshed_at: Option<Instant>,
 }
 
@@ -255,11 +258,15 @@ impl Worker {
         let cache = self.ctx.config.cache_path();
         let bucket_len = self.ctx.config.hex_bucket_len;
         let mut buckets = Vec::new();
+        #[cfg(feature = "events")]
+        let mut ranks = Vec::new();
         for path in discover_rank_dirs(&cache) {
             let rank = Arc::new(RankDir {
                 model_base: model_base_dir(&path),
                 path,
             });
+            #[cfg(feature = "events")]
+            ranks.push(Arc::clone(&rank));
             let listed = fsops::open_dir(&rank.path)
                 .and_then(|fd| self.timed(OpKind::Readdir, || fsops::list(&fd)));
             let Ok(entries) = listed else {
@@ -282,6 +289,8 @@ impl Worker {
         );
         self.index = BucketIndex {
             buckets,
+            #[cfg(feature = "events")]
+            ranks,
             refreshed_at: Some(Instant::now()),
         };
     }
@@ -436,24 +445,46 @@ impl Worker {
             let root = window.remove(i);
             let (hash, size, rank) = (root.hash, root.size, Arc::clone(&root.rank));
             let group = leaf_group(&root.path);
+            let relative = root
+                .path
+                .strip_prefix(&rank.path)
+                .map(Path::to_path_buf)
+                .ok();
             if !self.evict_one(root) {
                 continue;
             }
             evicted += 1;
+            let siblings = self.sibling_ranks(&rank);
+            if let Some(relative) = relative {
+                for sib in &siblings {
+                    if self.remove_block(&sib.path.join(&relative), hash, size, sib, false) {
+                        evicted += 1;
+                    }
+                }
+            }
             let Some(group) = group else {
                 continue;
             };
+            let bucket_len = self.ctx.config.hex_bucket_len;
             for d in chains.descendants(hash) {
                 if !self.ctx.shared.mode().is_evicting() || self.ctx.shutdown.is_set() {
                     break;
                 }
-                let path = d.file_name.and_then(|name| {
-                    block_path(&rank.path, &name, self.ctx.config.hex_bucket_len, &group)
-                });
-                if let Some(path) = path
-                    && self.remove_block(&path, d.hash, size, &rank)
-                {
-                    evicted += 1;
+                let Some(name) = d.file_name else {
+                    continue;
+                };
+                let mut removed_any = false;
+                for r in std::iter::once(&rank).chain(&siblings) {
+                    let Some(path) = block_path(&r.path, &name, bucket_len, &group) else {
+                        continue;
+                    };
+                    if self.remove_block(&path, d.hash, size, r, false) {
+                        evicted += 1;
+                        removed_any = true;
+                    }
+                }
+                if removed_any {
+                    chains.deleted(d.hash);
                     Stats::add(&chains.stats.cascaded, 1);
                 }
             }
@@ -514,11 +545,34 @@ impl Worker {
                 Err(_) => return false,
             }
         }
-        self.remove_block(&c.path, c.hash, c.size, &c.rank)
+        self.remove_block(&c.path, c.hash, c.size, &c.rank, true)
     }
 
-    /// Unlinks one block file and records it everywhere a deletion is counted.
-    fn remove_block(&mut self, path: &Path, hash: BlockHash, size: u64, rank: &RankDir) -> bool {
+    /// Other rank dirs of `rank`'s model. Tensor-parallel ranks each hold a
+    /// shard of every block, and a block is useless once any shard is gone.
+    #[cfg(feature = "events")]
+    fn sibling_ranks(&self, rank: &RankDir) -> Vec<Arc<RankDir>> {
+        let Some(base) = &rank.model_base else {
+            return Vec::new();
+        };
+        self.index
+            .ranks
+            .iter()
+            .filter(|r| r.model_base.as_ref() == Some(base) && r.path != rank.path)
+            .cloned()
+            .collect()
+    }
+
+    /// Unlinks one block file and records it everywhere a deletion is counted;
+    /// `record_chain` also marks the block gone in the chain index.
+    fn remove_block(
+        &mut self,
+        path: &Path,
+        hash: BlockHash,
+        size: u64,
+        rank: &RankDir,
+        record_chain: bool,
+    ) -> bool {
         if self.ctx.config.dry_run {
             tracing::debug!(path = %path.display(), "[DRY RUN] would delete");
             Stats::add(&self.ctx.stats.files_deleted, 1);
@@ -539,9 +593,11 @@ impl Worker {
         Stats::add(&self.ctx.stats.files_deleted, 1);
         Stats::add(&self.ctx.stats.bytes_freed, size);
         #[cfg(feature = "events")]
-        if let Some(chains) = &self.ctx.chains {
+        if let Some(chains) = self.ctx.chains.as_ref().filter(|_| record_chain) {
             chains.deleted(hash);
         }
+        #[cfg(not(feature = "events"))]
+        let _ = record_chain;
         if let (Some(tx), Some(base)) = (&self.ctx.events, &rank.model_base) {
             let _ = tx.send(Removed {
                 model_base: base.clone(),
@@ -1309,6 +1365,40 @@ mod tests {
         );
         assert_eq!(Stats::get(&chains(&h).stats.cascaded), 1);
         assert_eq!(Stats::get(&h.stats.errors), 0);
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn subtree_policy_deletes_every_tensor_parallel_shard_once() {
+        use crate::config::ChainPolicy;
+        use crate::worker::tests::chain_fixtures::{chain_harness, chains, names};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("cache");
+        let shards = ["m_abcdef012345_r0", "m_abcdef012345_r1"];
+        for rank in shards {
+            let leaf = cache.join(rank).join("abc/de_g0");
+            fs::create_dir_all(&leaf).expect("mkdir");
+            for (n, secs) in [(1u64, 9000u64), (2, 8999), (3, 8998)] {
+                let f = leaf.join(&names(&[n])[0]);
+                fs::write(&f, vec![0u8; 10]).expect("write");
+                age(&f, secs);
+            }
+        }
+        let mut h = chain_harness(&cache, ChainPolicy::Subtree, &[1, 2, 3]);
+        h.shared.set_mode(Mode::Evicting);
+        run_rounds(&mut h, 20);
+        assert!(bins(&cache).is_empty(), "left: {:?}", bins(&cache));
+        assert_eq!(Stats::get(&h.stats.files_deleted), 6);
+        let s = &chains(&h).stats;
+        assert_eq!(Stats::get(&s.deleted_root), 1);
+        assert_eq!(Stats::get(&s.cascaded), 2, "blocks, not files");
+        assert_eq!(Stats::get(&s.deleted_orphan), 2);
+        assert_eq!(
+            Stats::get(&s.deleted_untracked),
+            0,
+            "each block recorded once"
+        );
     }
 
     #[cfg(feature = "events")]
