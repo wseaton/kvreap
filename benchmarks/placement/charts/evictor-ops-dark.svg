@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 260" width="640" height="260" font-family="system-ui, -apple-system, Segoe UI, sans-serif" role="img" aria-label="Evictor NFS metadata ops/s (5 s windows)">
+<rect width="640" height="260" rx="8" fill="#1a1a19"/>
+<text x="48" y="18" font-size="13" font-weight="600" fill="#ffffff">Evictor NFS metadata ops/s (5 s windows)</text>
+<line x1="536" x2="550" y1="14" y2="14" stroke="#d95926" stroke-width="2"/>
+<text x="554" y="18" font-size="11" fill="#c3c2b7">a-separate</text>
+<line x1="437" x2="451" y1="14" y2="14" stroke="#3987e5" stroke-width="2"/>
+<text x="455" y="18" font-size="11" fill="#c3c2b7">a-colocated</text>
+<line x1="48" x2="568" y1="232.0" y2="232.0" stroke="#383835" stroke-width="1"/>
+<text x="42" y="236.0" text-anchor="end" font-size="11" fill="#898781">0</text>
+<line x1="48" x2="568" y1="158.2" y2="158.2" stroke="#2c2c2a" stroke-width="1"/>
+<text x="42" y="162.2" text-anchor="end" font-size="11" fill="#898781">10,000</text>
+<line x1="48" x2="568" y1="84.4" y2="84.4" stroke="#2c2c2a" stroke-width="1"/>
+<text x="42" y="88.4" text-anchor="end" font-size="11" fill="#898781">20,000</text>
+<text x="184.3" y="252" text-anchor="middle" font-size="11" fill="#898781">100s</text>
+<text x="328.7" y="252" text-anchor="middle" font-size="11" fill="#898781">200s</text>
+<text x="473.1" y="252" text-anchor="middle" font-size="11" fill="#898781">300s</text>
+<path d="M48.1,231.8L55.4,231.8L62.6,231.8L69.8,167.3L77.0,138.3L84.2,128.1L91.5,139.8L98.7,113.2L105.9,76.0L113.1,110.6L120.3,100.9L127.6,102.5L134.8,84.6L142.0,72.4L149.2,113.2L156.4,80.9L163.7,87.0L170.9,72.6L178.1,87.6L185.3,87.5L192.5,90.2L199.8,83.5L207.0,59.1L214.2,113.0L221.4,76.8L228.6,68.6L235.9,78.4L243.1,72.3L250.3,108.7L257.5,58.1L264.8,63.7L272.0,73.6L279.2,86.8L286.4,94.9L293.6,52.9L300.9,80.8L308.1,75.1L315.3,91.3L322.5,53.1L329.7,78.1L337.0,66.9L344.2,95.3L351.4,60.4L358.6,87.9L365.8,44.0L373.1,101.4L380.3,58.4L387.5,98.1L394.7,39.6L401.9,73.0L409.2,111.1L416.4,53.7L423.6,83.0L430.8,51.5L438.0,69.2L445.3,90.2L452.5,50.2L459.7,69.7L466.9,87.8L474.1,54.4L481.4,88.2L488.6,53.1L495.8,54.5L503.0,77.9L510.2,83.5L517.5,46.6L524.7,96.5L531.9,46.8L539.1,93.4L546.3,60.5L553.6,77.3L560.8,62.4L568.0,69.2" fill="none" stroke="#3987e5" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="572" y="73.2" font-size="11" fill="#c3c2b7">a-colocated</text>
+<path d="M48.0,231.8L55.2,231.8L62.4,231.5L69.7,215.6L76.9,194.5L84.1,175.9L91.3,170.7L98.5,161.3L105.8,174.7L113.0,156.8L120.2,138.2L127.4,100.2L134.6,92.1L141.9,100.9L149.1,134.3L156.3,105.9L163.5,107.3L170.7,100.9L178.0,98.2L185.2,128.5L192.4,128.2L199.6,74.6L206.8,80.0L214.1,139.2L221.3,117.5L228.5,74.4L235.7,87.2L242.9,110.0L250.2,109.6L257.4,96.2L264.6,100.7L271.8,86.9L279.0,86.9L286.3,110.8L293.5,118.4L300.7,59.7L307.9,99.4L315.1,80.6L322.4,122.8L329.6,124.9L336.8,66.0L344.0,103.3L351.2,84.4L358.5,104.3L365.7,97.7L372.9,74.2L380.1,96.5L387.4,101.2L394.6,101.0L401.8,68.7L409.0,105.5L416.2,69.8L423.5,105.6L430.7,101.2L437.9,81.8L445.1,63.8L452.3,106.2L459.6,108.8L466.8,83.8L474.0,63.6L481.2,98.2L488.4,81.9L495.7,102.2L502.9,71.5L510.1,98.7L517.3,66.6L524.5,74.0L531.8,87.1L539.0,55.9L546.2,98.4L553.4,58.2L560.6,78.4L567.9,82.0" fill="none" stroke="#d95926" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="572" y="86.0" font-size="11" fill="#c3c2b7">a-separate</text>
+</svg>

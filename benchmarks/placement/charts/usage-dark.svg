@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 260" width="640" height="260" font-family="system-ui, -apple-system, Segoe UI, sans-serif" role="img" aria-label="PVC usage (% of quota)">
+<rect width="640" height="260" rx="8" fill="#1a1a19"/>
+<text x="48" y="18" font-size="13" font-weight="600" fill="#ffffff">PVC usage (% of quota)</text>
+<line x1="536" x2="550" y1="14" y2="14" stroke="#d95926" stroke-width="2"/>
+<text x="554" y="18" font-size="11" fill="#c3c2b7">a-separate</text>
+<line x1="437" x2="451" y1="14" y2="14" stroke="#3987e5" stroke-width="2"/>
+<text x="455" y="18" font-size="11" fill="#c3c2b7">a-colocated</text>
+<line x1="48" x2="568" y1="232.0" y2="232.0" stroke="#383835" stroke-width="1"/>
+<text x="42" y="236.0" text-anchor="end" font-size="11" fill="#898781">0%</text>
+<line x1="48" x2="568" y1="181.5" y2="181.5" stroke="#2c2c2a" stroke-width="1"/>
+<text x="42" y="185.5" text-anchor="end" font-size="11" fill="#898781">25%</text>
+<line x1="48" x2="568" y1="131.0" y2="131.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="42" y="135.0" text-anchor="end" font-size="11" fill="#898781">50%</text>
+<line x1="48" x2="568" y1="80.5" y2="80.5" stroke="#2c2c2a" stroke-width="1"/>
+<text x="42" y="84.5" text-anchor="end" font-size="11" fill="#898781">75%</text>
+<line x1="48" x2="568" y1="30.0" y2="30.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="42" y="34.0" text-anchor="end" font-size="11" fill="#898781">100%</text>
+<text x="189.6" y="252" text-anchor="middle" font-size="11" fill="#898781">100s</text>
+<text x="332.0" y="252" text-anchor="middle" font-size="11" fill="#898781">200s</text>
+<text x="474.4" y="252" text-anchor="middle" font-size="11" fill="#898781">300s</text>
+<line x1="48" x2="568" y1="60.3" y2="60.3" stroke="#898781" stroke-width="1" stroke-dasharray="4 3"/>
+<line x1="48" x2="568" y1="90.6" y2="90.6" stroke="#898781" stroke-width="1" stroke-dasharray="4 3"/>
+<path d="M48.0,232.0L55.1,232.0L62.2,232.0L69.4,232.0L76.5,232.0L83.6,227.2L90.7,227.2L97.8,215.9L105.0,215.9L112.1,208.9L119.2,208.9L126.3,199.5L133.5,199.5L140.6,199.5L147.7,199.5L154.8,191.0L161.9,191.0L169.1,189.3L176.2,189.3L183.3,183.2L190.4,183.2L197.5,179.9L204.7,179.9L211.8,177.0L218.9,177.0L226.0,171.5L233.2,171.5L240.3,169.4L247.4,169.4L254.5,161.8L261.6,161.8L268.8,160.9L275.9,160.9L283.0,153.8L290.1,153.8L297.2,153.8L304.4,153.8L311.5,146.7L318.6,146.7L325.7,146.7L332.9,146.7L340.0,140.8L347.1,140.8L354.2,139.6L361.3,139.6L368.5,136.6L375.6,136.6L382.7,132.6L389.8,132.6L396.9,131.8L404.1,131.8L411.2,125.5L418.3,125.5L425.4,125.5L432.6,125.5L439.7,118.4L446.8,118.4L453.9,118.4L461.0,118.4L468.2,111.8L475.3,111.8L482.4,111.4L489.5,111.4L496.6,106.8L503.8,106.8L510.9,104.3L518.0,104.3L525.1,104.3L532.3,104.3L539.4,104.3L546.5,104.3L553.6,104.3L560.7,104.3L567.9,104.3" fill="none" stroke="#3987e5" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="572" y="108.3" font-size="11" fill="#c3c2b7">a-colocated</text>
+<path d="M48.1,232.0L55.3,232.0L62.4,232.0L69.5,232.0L76.6,232.0L83.7,232.0L90.9,222.5L98.0,222.5L105.1,211.9L112.2,211.9L119.4,200.9L126.5,200.9L133.6,195.0L140.7,195.0L147.8,195.0L155.0,195.0L162.1,186.6L169.2,186.6L176.3,186.1L183.4,186.1L190.6,179.1L197.7,179.1L204.8,174.6L211.9,174.6L219.1,173.1L226.2,173.1L233.3,166.7L240.4,166.7L247.5,166.7L254.7,166.7L261.8,158.7L268.9,158.7L276.0,158.7L283.1,158.7L290.3,154.3L297.4,154.3L304.5,150.7L311.6,150.7L318.8,150.6L325.9,150.6L333.0,140.6L340.1,140.6L347.2,140.6L354.4,140.6L361.5,134.0L368.6,134.0L375.7,133.5L382.8,133.5L390.0,130.7L397.1,130.7L404.2,125.9L411.3,125.9L418.5,125.9L425.6,125.9L432.7,118.5L439.8,118.5L446.9,118.4L454.1,118.4L461.2,112.7L468.3,112.7L475.4,109.6L482.5,109.6L489.7,106.9L496.8,106.9L503.9,102.5L511.0,102.5L518.2,102.5L525.3,102.5L532.4,102.5L539.5,102.5L546.6,102.5L553.8,102.5L560.9,102.5L568.0,102.5" fill="none" stroke="#d95926" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="572" y="130.5" font-size="11" fill="#c3c2b7">a-separate</text>
+<text x="54" y="56.3" font-size="11" fill="#898781" stroke="#1a1a19" stroke-width="3" paint-order="stroke">cleanup 85%</text>
+<text x="54" y="86.6" font-size="11" fill="#898781" stroke="#1a1a19" stroke-width="3" paint-order="stroke">target 70%</text>
+</svg>

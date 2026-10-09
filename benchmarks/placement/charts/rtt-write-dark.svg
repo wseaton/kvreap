@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 260" width="640" height="260" font-family="system-ui, -apple-system, Segoe UI, sans-serif" role="img" aria-label="vLLM WRITE RTT (mean ms per op, 10 s windows)">
+<rect width="640" height="260" rx="8" fill="#1a1a19"/>
+<text x="48" y="18" font-size="13" font-weight="600" fill="#ffffff">vLLM WRITE RTT (mean ms per op, 10 s windows)</text>
+<line x1="536" x2="550" y1="14" y2="14" stroke="#d95926" stroke-width="2"/>
+<text x="554" y="18" font-size="11" fill="#c3c2b7">a-separate</text>
+<line x1="437" x2="451" y1="14" y2="14" stroke="#3987e5" stroke-width="2"/>
+<text x="455" y="18" font-size="11" fill="#c3c2b7">a-colocated</text>
+<line x1="48" x2="568" y1="232.0" y2="232.0" stroke="#383835" stroke-width="1"/>
+<text x="42" y="236.0" text-anchor="end" font-size="11" fill="#898781">0 ms</text>
+<line x1="48" x2="568" y1="154.4" y2="154.4" stroke="#2c2c2a" stroke-width="1"/>
+<text x="42" y="158.4" text-anchor="end" font-size="11" fill="#898781">2 ms</text>
+<line x1="48" x2="568" y1="76.8" y2="76.8" stroke="#2c2c2a" stroke-width="1"/>
+<text x="42" y="80.8" text-anchor="end" font-size="11" fill="#898781">4 ms</text>
+<text x="185.6" y="252" text-anchor="middle" font-size="11" fill="#898781">100s</text>
+<text x="358.9" y="252" text-anchor="middle" font-size="11" fill="#898781">200s</text>
+<text x="532.1" y="252" text-anchor="middle" font-size="11" fill="#898781">300s</text>
+<path d="M48.0,57.3L65.3,55.8L82.7,54.2L100.0,51.9M134.6,52.5L152.0,52.5L169.3,49.7L186.6,51.5L203.9,48.3L221.3,50.6L238.6,39.6L255.9,51.4L273.3,50.8L290.6,51.4M325.2,44.0L342.6,40.0L359.9,52.1L377.2,48.7L394.6,43.1L411.9,46.1M446.5,49.2M481.2,44.4L498.5,45.6L515.8,43.8L533.2,43.2L550.5,44.7L567.8,47.3" fill="none" stroke="#3987e5" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="572" y="51.3" font-size="11" fill="#c3c2b7">a-colocated</text>
+<path d="M48.2,51.3L65.5,54.7L82.8,54.7L100.2,56.2L117.5,56.7L134.8,57.4L152.1,56.1L169.5,60.2L186.8,56.0L204.1,57.4L221.4,53.8L238.8,56.5L256.1,55.6L273.4,57.0M308.1,54.9L325.4,54.1L342.7,56.6L360.1,52.5M394.7,53.0M429.4,51.5L446.7,51.0L464.0,53.3L481.4,52.5M516.0,54.9L533.3,53.0L550.7,56.7L568.0,56.5" fill="none" stroke="#d95926" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="572" y="72.5" font-size="11" fill="#c3c2b7">a-separate</text>
+</svg>
