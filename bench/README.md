@@ -19,6 +19,6 @@ uv run kvbench run --variant c --image quay.io/wseaton/kvreap:c-<sha> --chart $C
 uv run kvbench report results/a results/b results/c --out reports/<name>
 ```
 
-`kvbench report` writes `REPORT.md` with light/dark SVG charts and the full
+`kvbench report` writes `README.md` with light/dark SVG charts and the full
 metrics table; `kvbench analyze` prints the table only. Pass chart overrides
 with `--evictor-values '{"config": {"deletionMaxFilesPerSecond": 200}}'`.

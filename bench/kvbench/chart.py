@@ -146,6 +146,7 @@ def line_chart(
     y_max: float | None = None,
     rules: list[Rule] | None = None,
     bands: list[tuple[float, float]] | None = None,
+    direct_labels: bool = True,
 ) -> str:
     rules = rules or []
     out = svg_open(theme, title) + legend(theme, [(s.name, s.idx) for s in series])
@@ -215,7 +216,7 @@ def line_chart(
             f'<path d="{"".join(d)}" fill="none" stroke="{color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>'
         )
         last = next((p for p in reversed(s.points) if p[1] is not None), None)
-        if last is not None and last[1] is not None and len(series) <= 4:
+        if direct_labels and last is not None and last[1] is not None and len(series) <= 4:
             y = sy(last[1]) + 4
             while any(abs(y - other) < 12 for other in label_ys):
                 y += 12
@@ -229,7 +230,10 @@ def line_chart(
 
 
 def grouped_bars(theme: Theme, title: str, rows: list[tuple[str, int, dict[str, float]]], unit: str = "/s") -> str:
-    ops = sorted({op for _, _, vals in rows for op in vals}, key=lambda op: -max(v.get(op, 0.0) for _, _, v in rows))
+    ops = sorted(
+        {op for _, _, vals in rows for op, v in vals.items() if v >= 0.05},
+        key=lambda op: -max(v.get(op, 0.0) for _, _, v in rows),
+    )
     bh, gap = 10, 2
     group = len(rows) * (bh + gap) + 12
     top = 30
@@ -374,6 +378,7 @@ def charts(runs: list[RunSeries], theme: Theme) -> dict[str, str]:
             x_unit=" ms",
             log_x=True,
             y_max=100,
+            direct_labels=False,
         ),
         "evictor-op-types": grouped_bars(
             theme, "Evictor NFS ops by type (mean ops/s)", [(r.name, i, r.op_types) for i, r in enumerate(runs)]
@@ -407,7 +412,33 @@ def picture(name: str, alt: str) -> str:
     )
 
 
-def render(dirs: list[Path], out_dir: Path, title: str) -> Path:
+SETUP_KEYS = (
+    ("model", "model"),
+    ("vllm_image", "vLLM image"),
+    ("pvc_size", "PVC size"),
+    ("storage_class", "storage class"),
+    ("duration_s", "load duration (s)"),
+    ("offload_block_tokens", "offload block (tokens)"),
+    ("cpu_tier_bytes", "CPU tier (bytes)"),
+    ("gpu_blocks", "GPU KV blocks"),
+    ("churn_input_len", "churn prompt length"),
+    ("churn_concurrency", "churn concurrency"),
+    ("hot_prefixes", "hot prefixes"),
+    ("hot_prefix_len", "hot prefix length"),
+    ("hot_request_rate", "hot request rate (req/s)"),
+)
+
+
+def setup_table(dirs: list[Path]) -> list[str]:
+    metas = [json.loads((d / "meta.json").read_text()) for d in dirs]
+    lines = ["| setting | value |", "|---|---|"]
+    for key, label in SETUP_KEYS:
+        values = {str(m.get(key)) for m in metas}
+        lines.append(f"| {label} | {' / '.join(sorted(values))} |")
+    return lines
+
+
+def render(dirs: list[Path], out_dir: Path, title: str, notes: Path | None = None) -> Path:
     summaries = [summarize(d) for d in dirs]
     runs = [run_series(d, s) for d, s in zip(dirs, summaries, strict=True)]
     chart_dir = out_dir / "charts"
@@ -418,18 +449,21 @@ def render(dirs: list[Path], out_dir: Path, title: str) -> Path:
 
     lines = [f"# {title}", "", "| run | evictor image |", "|---|---|"]
     lines += [f"| {r.name} | `{r.image}` |" for r in runs]
-    lines += ["", "Time axes are seconds since the load generator started.", ""]
+    lines += [""]
+    if notes is not None:
+        lines += [notes.read_text().rstrip(), ""]
+    lines += ["## Setup", "", *setup_table(dirs), "", "Time axes are seconds since the load generator started.", ""]
     for name, heading in CHART_ORDER:
         lines += [f"## {heading}", "", picture(name, heading), ""]
     lines += ["## All metrics", "", report(summaries), ""]
-    md = out_dir / "REPORT.md"
+    md = out_dir / "README.md"
     md.write_text("\n".join(lines))
     for s in summaries:
         (out_dir / f"summary-{s.variant}.json").write_text(json.dumps(s, default=lambda o: o.__dict__, indent=2))
     return md
 
 
-def main(dirs: list[Path], out_dir: Path, title: str) -> int:
-    md = render(dirs, out_dir, title)
+def main(dirs: list[Path], out_dir: Path, title: str, notes: Path | None = None) -> int:
+    md = render(dirs, out_dir, title, notes)
     print(f"wrote {md}")
     return 0

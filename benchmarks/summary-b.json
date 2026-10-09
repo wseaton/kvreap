@@ -1,0 +1,243 @@
+{
+  "variant": "b",
+  "duration_s": 1249.9977362155914,
+  "evictor_ops": {
+    "ACCESS": {
+      "count": 199104,
+      "per_sec": 159.41073126066473,
+      "p95_10s_per_sec": 384.5000091671946,
+      "mean_rtt_ms": 0.27563484410157507
+    },
+    "FSINFO": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null
+    },
+    "FSSTAT": {
+      "count": 3755,
+      "per_sec": 3.0064051746011935,
+      "p95_10s_per_sec": 3.099999039173424,
+      "mean_rtt_ms": 0.7997336884154461
+    },
+    "GETATTR": {
+      "count": 637201,
+      "per_sec": 510.1689437179907,
+      "p95_10s_per_sec": 1328.5001266956451,
+      "mean_rtt_ms": 0.40318831891349827
+    },
+    "LOOKUP": {
+      "count": 152872,
+      "per_sec": 122.39551846914345,
+      "p95_10s_per_sec": 338.00012893681674,
+      "mean_rtt_ms": 0.7824127374535559
+    },
+    "NULL": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null
+    },
+    "PATHCONF": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null
+    },
+    "READDIRPLUS": {
+      "count": 184353,
+      "per_sec": 147.60048286371608,
+      "p95_10s_per_sec": 364.5998522234562,
+      "mean_rtt_ms": 1.120947313035318
+    },
+    "REMOVE": {
+      "count": 132300,
+      "per_sec": 105.92474157116855,
+      "p95_10s_per_sec": 286.7999384594096,
+      "mean_rtt_ms": 2.3135600907029477
+    },
+    "RMDIR": {
+      "count": 255989,
+      "per_sec": 204.95516757416377,
+      "p95_10s_per_sec": 474.40026014342266,
+      "mean_rtt_ms": 1.8569274461011998
+    }
+  },
+  "evictor_total": [
+    1565574,
+    1253.4619906314485
+  ],
+  "vllm_ops": {
+    "ACCESS": {
+      "count": 576448,
+      "per_sec": 461.5276233310766,
+      "p95_10s_per_sec": 1014.0998307538315,
+      "mean_rtt_ms": 0.36592199122904406
+    },
+    "CREATE": {
+      "count": 180292,
+      "per_sec": 144.34907964917298,
+      "p95_10s_per_sec": 326.6000311470061,
+      "mean_rtt_ms": 1.4322876223015997
+    },
+    "FSINFO": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null
+    },
+    "FSSTAT": {
+      "count": 1263,
+      "per_sec": 1.0112089698761202,
+      "p95_10s_per_sec": 1.0999998950958352,
+      "mean_rtt_ms": 0.6801266825019794
+    },
+    "GETATTR": {
+      "count": 496468,
+      "per_sec": 397.49239497740115,
+      "p95_10s_per_sec": 780.9000930905453,
+      "mean_rtt_ms": 0.3757160582353747
+    },
+    "LOOKUP": {
+      "count": 1304662,
+      "per_sec": 1044.5652549932847,
+      "p95_10s_per_sec": 2347.2996642160897,
+      "mean_rtt_ms": 0.43426113430145125
+    },
+    "MKDIR": {
+      "count": 176845,
+      "per_sec": 141.58927179552057,
+      "p95_10s_per_sec": 311.3999480295268,
+      "mean_rtt_ms": 1.9455568435635726
+    },
+    "NULL": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null
+    },
+    "PATHCONF": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null
+    },
+    "READ": {
+      "count": 293261,
+      "per_sec": 234.79663793732453,
+      "p95_10s_per_sec": 614.9998826980815,
+      "mean_rtt_ms": 1.8328997036769294
+    },
+    "REMOVE": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null
+    },
+    "RENAME": {
+      "count": 180291,
+      "per_sec": 144.3482790086584,
+      "p95_10s_per_sec": 326.6000311470061,
+      "mean_rtt_ms": 2.258742810234565
+    },
+    "SETATTR": {
+      "count": 180291,
+      "per_sec": 144.3482790086584,
+      "p95_10s_per_sec": 326.6000311470061,
+      "mean_rtt_ms": 0.6615249790616281
+    },
+    "WRITE": {
+      "count": 360582,
+      "per_sec": 288.6965580173168,
+      "p95_10s_per_sec": 653.1000622844756,
+      "mean_rtt_ms": 4.614800516942055
+    }
+  },
+  "vllm_rtt_deleting": {
+    "LOOKUP": 0.48982397670827604,
+    "GETATTR": 0.36877251024890595,
+    "CREATE": 1.4334089925084297,
+    "RENAME": 2.2617857377156727,
+    "WRITE": 4.607376452296449,
+    "READ": 1.4950547357815975
+  },
+  "vllm_rtt_idle": {
+    "LOOKUP": 0.396042024862511,
+    "GETATTR": 0.3796913058213527,
+    "CREATE": 1.431466374564008,
+    "RENAME": 2.2565144701948574,
+    "WRITE": 4.620237231625119,
+    "READ": 1.9626846651248406
+  },
+  "prune_cycles": [
+    {
+      "start": 1791567790.189114,
+      "seconds": 100.18578696250916,
+      "usage_start": 85.96875,
+      "usage_end": 68.73828125
+    },
+    {
+      "start": 1791567961.012877,
+      "seconds": 90.16500091552734,
+      "usage_start": 87.2490234375,
+      "usage_end": 68.0673828125
+    },
+    {
+      "start": 1791568111.80718,
+      "seconds": 90.1763710975647,
+      "usage_start": 84.8642578125,
+      "usage_end": 68.5888671875
+    },
+    {
+      "start": 1791568272.621581,
+      "seconds": 110.20038986206055,
+      "usage_start": 86.1474609375,
+      "usage_end": 66.9208984375
+    },
+    {
+      "start": 1791568453.47314,
+      "seconds": 90.66180396080017,
+      "usage_start": 87.41796875,
+      "usage_end": 67.7724609375
+    }
+  ],
+  "max_usage_pct": 87.41796875,
+  "pct_time_above_cleanup": 4.8,
+  "errors": {
+    "quota_exceeded": 0,
+    "store_failed": 0,
+    "load_failed": 140
+  },
+  "bench": {
+    "hot_requests": 1600,
+    "hot_failed": 0,
+    "hot_ttft_p50_ms": 509.5113019924611,
+    "hot_ttft_p90_ms": 2123.5658960067667,
+    "hot_ttft_p99_ms": 3474.5352170139086,
+    "churn_input_tok_per_s": 26749.625370258575
+  },
+  "metrics": {
+    "vllm:external_prefix_cache_hits_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 878944.0,
+    "vllm:external_prefix_cache_queries_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 15124505.0,
+    "vllm:kv_offload_allocation_failure_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 23666.0,
+    "vllm:kv_offload_load_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 100804329472.0,
+    "vllm:kv_offload_load_time_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 2.846118594586843,
+    "vllm:kv_offload_store_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 493459341312.0,
+    "vllm:kv_offload_store_time_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 13.583001546107209,
+    "vllm:kv_offload_tiering_cascade_job_failures_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 1.0,
+    "vllm:kv_offload_tiering_chunk_hits_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 60593.0,
+    "vllm:kv_offload_tiering_chunk_queries_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"0:primary\"}": 945280.0,
+    "vllm:kv_offload_tiering_chunk_queries_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 64618.0,
+    "vllm:kv_offload_tiering_promotion_allocation_failures_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 1577.0,
+    "vllm:kv_offload_tiering_promotion_job_failures_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 139.0,
+    "vllm:kv_offload_tiering_read_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 111680421888.0,
+    "vllm:kv_offload_tiering_read_time_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 232.1578084131179,
+    "vllm:kv_offload_tiering_write_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 493222625280.0,
+    "vllm:kv_offload_tiering_write_time_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",tier=\"1:fs\"}": 2326.7511961909768,
+    "vllm:kv_offload_total_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",transfer_type=\"CPU_to_GPU\"}": 100804329472.0,
+    "vllm:kv_offload_total_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",transfer_type=\"GPU_to_CPU\"}": 493459341312.0,
+    "vllm:kv_offload_total_time_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",transfer_type=\"CPU_to_GPU\"}": 2.846118594586843,
+    "vllm:kv_offload_total_time_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\",transfer_type=\"GPU_to_CPU\"}": 13.583001546107209,
+    "vllm:prefix_cache_queries_total{engine=\"0\",model_name=\"Qwen/Qwen3-0.6B\"}": 15124505.0
+  }
+}
