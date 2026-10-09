@@ -19,6 +19,18 @@ ERROR_PATTERNS = {
     "store_failed": re.compile(r"(failed|error).{0,40}(store|write)", re.IGNORECASE),
     "load_failed": re.compile(r"(failed|error).{0,40}(load|read)", re.IGNORECASE),
 }
+CHAIN_COUNTERS = (
+    ("deleted_heads", "chain deletions: heads (root + orphan)"),
+    ("deleted_root", "chain deletions: root"),
+    ("deleted_orphan", "chain deletions: orphan (parent gone)"),
+    ("deleted_internal", "chain deletions: internal"),
+    ("deleted_leaf", "chain deletions: leaf"),
+    ("deleted_untracked", "chain deletions: untracked"),
+    ("deferrals", "chain deferrals"),
+    ("event_batches", "KV event batches received"),
+    ("decode_errors", "KV event decode errors"),
+)
+KV_PAIR = re.compile(r"(\w+)=(\d+)\b")
 TS_PREFIX = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s")
 
 
@@ -135,6 +147,16 @@ def percentile(values: list[float], q: float) -> float | None:
     return v[min(len(v) - 1, int(q * (len(v) - 1) + 0.5))]
 
 
+def chain_counters(evictor_log: Path) -> dict[str, int]:
+    """Counters from kvreap's last `chains` status line, empty without one."""
+    if not evictor_log.exists():
+        return {}
+    last = next((ln for ln in reversed(evictor_log.read_text().splitlines()) if " chains " in ln), None)
+    if last is None:
+        return {}
+    return {k: int(v) for k, v in KV_PAIR.findall(last)}
+
+
 def load_bench(dir_: Path) -> dict[str, Any]:
     hot_ttfts: list[float] = []
     hot_failed = 0
@@ -186,6 +208,7 @@ class RunSummary:
     errors: dict[str, int] = field(default_factory=dict)
     bench: dict[str, Any] = field(default_factory=dict)
     metrics: dict[str, float] = field(default_factory=dict)
+    chains: dict[str, int] = field(default_factory=dict)
 
 
 def rtt_in_windows(samples: list[Sample], op: str, windows: list[tuple[float, float]], inside: bool) -> float | None:
@@ -236,6 +259,7 @@ def summarize(dir_: Path, cleanup_pct: float = 85.0) -> RunSummary:
     s.errors = {k: len(p.findall(log)) for k, p in ERROR_PATTERNS.items()}
     s.bench = load_bench(dir_ / "loadgen" if (dir_ / "loadgen").exists() else dir_)
     s.metrics = metric_deltas(vllm)
+    s.chains = chain_counters(dir_ / "evictor.log")
     return s
 
 
@@ -306,6 +330,9 @@ def report(summaries: list[RunSummary]) -> str:
     row("churn input tok/s", [fmt(s.bench.get("churn_input_tok_per_s"), 0) for s in summaries])
     for k in ERROR_PATTERNS:
         row(f"vLLM log: {k}", [fmt(s.errors.get(k, 0)) for s in summaries])
+    if any(s.chains for s in summaries):
+        for k, label in CHAIN_COUNTERS:
+            row(label, [fmt(s.chains.get(k)) for s in summaries])
     metric_names = sorted({k for s in summaries for k in s.metrics})
     for k in metric_names:
         row(f"`{k}` Δ", [fmt(s.metrics.get(k), 0) for s in summaries])

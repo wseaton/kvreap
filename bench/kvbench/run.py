@@ -31,6 +31,7 @@ NO_ISTIO = {"sidecar.istio.io/inject": "false"}
 SAMPLER_IMAGE = "docker.io/library/python:3.12-slim"
 KV_MOUNT = "/kv-cache"
 CACHE_DIRECTORY = "kv/model-cache/models"
+KV_EVENTS_PORT = 5557
 
 Manifest = dict[str, Any]
 Placement = Literal["any", "colocated", "separate"]
@@ -92,6 +93,8 @@ class RunConfig:
     evictor_values: dict[str, Any] = field(default_factory=dict)
     placement: Placement = "any"
     share_nfs_client: bool = False
+    kv_events: bool = False
+    evictor_env: dict[str, str] = field(default_factory=dict)
 
     @property
     def run_id(self) -> str:
@@ -100,6 +103,10 @@ class RunConfig:
     @property
     def kv_pvc(self) -> str:
         return f"{self.run_id}-kv"
+
+    @property
+    def kv_events_endpoint(self) -> str:
+        return f"tcp://{self.run_id}-vllm:{KV_EVENTS_PORT}"
 
 
 def labels(cfg: RunConfig, role: str) -> dict[str, str]:
@@ -199,6 +206,20 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
     }
     lbl = labels(cfg, "vllm")
     name = f"{cfg.run_id}-vllm"
+    args = [
+        "--port=8000",
+        "--max-model-len=8192",
+        "--gpu-memory-utilization=0.3",
+        f"--num-gpu-blocks-override={cfg.gpu_blocks}",
+        f"--kv-transfer-config={json.dumps(kv_config)}",
+    ]
+    ports = [{"containerPort": 8000}]
+    svc_ports = [{"name": "http", "port": 8000, "targetPort": 8000}]
+    if cfg.kv_events:
+        events = {"enable_kv_cache_events": True, "publisher": "zmq", "endpoint": f"tcp://*:{KV_EVENTS_PORT}"}
+        args.append(f"--kv-events-config={json.dumps(events)}")
+        ports.append({"containerPort": KV_EVENTS_PORT})
+        svc_ports.append({"name": "kv-events", "port": KV_EVENTS_PORT, "targetPort": KV_EVENTS_PORT})
     pod = {
         "apiVersion": "v1",
         "kind": "Pod",
@@ -216,19 +237,13 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
                     "name": "vllm",
                     "image": cfg.vllm_image,
                     "command": ["vllm", "serve", cfg.model],
-                    "args": [
-                        "--port=8000",
-                        "--max-model-len=8192",
-                        "--gpu-memory-utilization=0.3",
-                        f"--num-gpu-blocks-override={cfg.gpu_blocks}",
-                        f"--kv-transfer-config={json.dumps(kv_config)}",
-                    ],
+                    "args": args,
                     "env": [
                         {"name": "HF_HOME", "value": "/models/hf"},
                         {"name": "HOME", "value": "/tmp"},
                         {"name": "VLLM_LOGGING_LEVEL", "value": "INFO"},
                     ],
-                    "ports": [{"containerPort": 8000}],
+                    "ports": ports,
                     "readinessProbe": {"httpGet": {"path": "/health", "port": 8000}, "periodSeconds": 5},
                     "resources": {
                         "requests": {"nvidia.com/gpu": "1", "cpu": "16", "memory": "64Gi"},
@@ -255,7 +270,7 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
         "apiVersion": "v1",
         "kind": "Service",
         "metadata": {"name": name, "labels": lbl},
-        "spec": {"selector": lbl, "ports": [{"port": 8000, "targetPort": 8000}]},
+        "spec": {"selector": lbl, "ports": svc_ports},
     }
     return [pod, svc]
 
@@ -388,6 +403,12 @@ def evictor_manifests(cfg: RunConfig) -> list[Manifest]:
         spec = tmpl["spec"]
         spec["imagePullSecrets"] = [{"name": cfg.pull_secret}]
         spec["volumes"] += [bench_volume(cfg), SAMPLES_VOLUME]
+        env = dict(cfg.evictor_env)
+        if cfg.kv_events:
+            env.setdefault("KV_EVENTS_ENDPOINTS", cfg.kv_events_endpoint)
+        for c in spec["containers"]:
+            if c["name"] == "evictor":
+                c.setdefault("env", []).extend({"name": k, "value": v} for k, v in env.items())
         spec["containers"].append(sampler_container("kv-cache-storage"))
         if cfg.placement != "any":
             kind = "podAffinity" if cfg.placement == "colocated" else "podAntiAffinity"

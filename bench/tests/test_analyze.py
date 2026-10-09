@@ -89,3 +89,28 @@ def test_report_has_a_column_per_run(run_dir: Path) -> None:
     header = out.splitlines()[0]
     assert header == "| metric | c | c |"
     assert "evictor REMOVE/s (mean / p95 10s)" in out
+
+
+def test_chain_counters_come_from_the_last_chains_line(run_dir: Path) -> None:
+    log = run_dir / "evictor.log"
+    log.write_text(
+        log.read_text() + f"{iso(T0 + 30)} INFO chains policy=TailFirst index_blocks=5 event_batches=1 decode_errors=0 "
+        "deleted_heads=9 deleted_root=9 deleted_orphan=0 deleted_internal=0 deleted_leaf=0 deferrals=0\n"
+        + f"{iso(T0 + 90)} INFO chains policy=TailFirst index_blocks=5 event_batches=40 decode_errors=0 "
+        "blocks_stored=900 deleted_heads=12 deleted_root=10 deleted_orphan=2 deleted_internal=3 "
+        "deleted_leaf=70 deleted_untracked=1 deferrals=55\n" + f"{iso(T0 + 91)} INFO status files_deleted=86\n"
+    )
+    s = summarize(run_dir)
+    assert s.chains["deleted_heads"] == 12
+    assert s.chains["deleted_leaf"] == 70
+    assert s.chains["deferrals"] == 55
+    assert "policy" not in s.chains
+    out = report([s])
+    assert "| chain deletions: heads (root + orphan) | 12 |" in out
+    assert "| chain deletions: leaf | 70 |" in out
+
+
+def test_no_chain_rows_without_a_chains_line(run_dir: Path) -> None:
+    s = summarize(run_dir)
+    assert s.chains == {}
+    assert "chain deletions" not in report([s])

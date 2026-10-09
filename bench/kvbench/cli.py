@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from kvbench import analyze, chart
-from kvbench.run import Cluster, RunConfig, run
+from kvbench.run import KV_EVENTS_PORT, Cluster, RunConfig, run
 
 
 def main() -> int:
@@ -41,6 +41,20 @@ def main() -> int:
         help="mount like shared-vast (no nosharecache): co-located pods share one NFS client and counters merge",
     )
 
+    r.add_argument(
+        "--kv-events",
+        action="store_true",
+        help=f"run vLLM with --kv-events-config (ZMQ PUB on :{KV_EVENTS_PORT}) and point the evictor's "
+        "KV_EVENTS_ENDPOINTS at it",
+    )
+    r.add_argument(
+        "--evictor-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra env var on the evictor container, repeatable, e.g. CHAIN_EVICTION=observe",
+    )
+
     a = sub.add_parser("analyze", help="summarize and compare run directories")
     a.add_argument("dirs", type=Path, nargs="+")
 
@@ -58,6 +72,12 @@ def main() -> int:
 
     if args.variant != "none" and (args.image is None or args.chart is None):
         p.error("--image and --chart are required unless --variant none")
+    evictor_env: dict[str, str] = {}
+    for kv in args.evictor_env:
+        key, sep, value = kv.partition("=")
+        if not sep or not key:
+            p.error(f"--evictor-env takes KEY=VALUE, got {kv!r}")
+        evictor_env[key] = value
     cfg = RunConfig(
         variant=args.variant,
         out=args.out,
@@ -72,6 +92,8 @@ def main() -> int:
         evictor_values=json.loads(args.evictor_values),
         placement=args.placement,
         share_nfs_client=args.share_nfs_client,
+        kv_events=args.kv_events,
+        evictor_env=evictor_env,
         storage_class="kvreap-bench-vast-shared" if args.share_nfs_client else "kvreap-bench-vast",
     )
     run(cfg, keep=args.keep)
