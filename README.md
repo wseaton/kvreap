@@ -64,6 +64,13 @@ publishes storage-tier stores under the vLLM pod's identity with medium
 `STORAGE`, while evictor removals go to the `SHARED_STORAGE` topic, which
 only the old `llmd_fs_backend` (<= 0.23) used for its stores.
 
+## Filesystems
+
+See [docs/filesystems.md](docs/filesystems.md) for what kvreap assumes from
+the filesystem, VAST and local NVMe behavior measured on CoreWeave, and
+planned portability changes. Benchmark results are in
+[benchmarks/](benchmarks/README.md).
+
 ## Development
 
 ```bash
