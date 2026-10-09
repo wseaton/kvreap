@@ -58,7 +58,6 @@ struct Candidate {
     size: u64,
     atime: SystemTime,
     sampled_at: Instant,
-    leaf_files: usize,
 }
 
 /// Cold files ordered by atime, capped at `cap` by evicting the youngest.
@@ -101,6 +100,10 @@ impl Pool {
         Some(c)
     }
 
+    fn is_empty(&self) -> bool {
+        self.by_age.is_empty()
+    }
+
     fn clear(&mut self) {
         self.by_age.clear();
         self.keys.clear();
@@ -132,12 +135,14 @@ pub struct Worker {
     fruitless_rounds: u32,
     backoff: Duration,
     evict_credit: f64,
+    reaped: usize,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RoundResult {
     sampled: usize,
     evicted: usize,
+    reaped: usize,
 }
 
 impl Worker {
@@ -151,6 +156,7 @@ impl Worker {
             fruitless_rounds: 0,
             backoff: BACKOFF_MIN,
             evict_credit: 0.0,
+            reaped: 0,
         }
     }
 
@@ -189,9 +195,11 @@ impl Worker {
         tracing::info!(worker = self.id, "worker stopped");
     }
 
-    /// Updates backoff state; returns how long to back off, if at all.
+    /// Updates backoff state; returns how long to back off, if at all. A round
+    /// that deleted a file or a directory, or left cold candidates in the pool
+    /// waiting for credit, is not fruitless.
     fn after_round(&mut self, r: &RoundResult) -> Option<Duration> {
-        if r.evicted > 0 {
+        if r.evicted > 0 || r.reaped > 0 || !self.pool.is_empty() {
             self.fruitless_rounds = 0;
             self.backoff = BACKOFF_MIN;
             return None;
@@ -271,6 +279,7 @@ impl Worker {
 
     /// One sample-then-evict round. `None` when there is nothing to sample.
     fn round(&mut self) -> io::Result<Option<RoundResult>> {
+        self.reaped = 0;
         let stale = self
             .index
             .refreshed_at
@@ -295,7 +304,11 @@ impl Worker {
         let quota = self.evict_credit.floor();
         self.evict_credit -= quota;
         let evicted = self.evict(quota as usize);
-        Ok(Some(RoundResult { sampled, evicted }))
+        Ok(Some(RoundResult {
+            sampled,
+            evicted,
+            reaped: self.reaped,
+        }))
     }
 
     /// Stats every block in `bucket` into the pool and, if the walk finished,
@@ -358,7 +371,6 @@ impl Worker {
                     size: meta.size,
                     atime: meta.atime,
                     sampled_at: Instant::now(),
-                    leaf_files: files.len(),
                 });
             }
         }
@@ -421,27 +433,11 @@ impl Worker {
                 hash: c.hash,
             });
         }
-        if c.leaf_files == 1
-            && let Some(leaf) = c.path.parent()
-        {
-            self.try_rmdir(leaf);
-        }
         true
     }
 
-    fn try_rmdir(&self, dir: &Path) {
-        if !self.ctx.config.enable_dir_cleanup || !self.acquire() {
-            return;
-        }
-        Stats::add(&self.ctx.stats.rmdir_ops, 1);
-        match fsops::rmdir_path(dir) {
-            Ok(()) => Stats::add(&self.ctx.stats.dirs_removed, 1),
-            Err(e) if fsops::is_not_found(&e) || fsops::is_not_empty(&e) => {}
-            Err(e) => tracing::debug!(dir = %dir.display(), error = %e, "rmdir failed"),
-        }
-    }
-
-    fn reap_if_stale(&self, dir: &Path) {
+    /// Removes `dir` if it is empty and unchanged for `DIR_CLEANUP_TTL_SECONDS`.
+    fn reap_if_stale(&mut self, dir: &Path) {
         if !self.ctx.config.enable_dir_cleanup || !self.acquire() {
             return;
         }
@@ -451,8 +447,17 @@ impl Worker {
         let age = SystemTime::now()
             .duration_since(meta.mtime)
             .unwrap_or(Duration::ZERO);
-        if age >= self.ctx.config.dir_cleanup_ttl {
-            self.try_rmdir(dir);
+        if age < self.ctx.config.dir_cleanup_ttl || !self.acquire() {
+            return;
+        }
+        Stats::add(&self.ctx.stats.rmdir_ops, 1);
+        match fsops::rmdir_path(dir) {
+            Ok(()) => {
+                self.reaped += 1;
+                Stats::add(&self.ctx.stats.dirs_removed, 1);
+            }
+            Err(e) if fsops::is_not_found(&e) || fsops::is_not_empty(&e) => {}
+            Err(e) => tracing::debug!(dir = %dir.display(), error = %e, "rmdir failed"),
         }
     }
 }
@@ -473,7 +478,10 @@ mod tests {
     use crate::layout::{BlockHash, Shard};
     use crate::shutdown::Shutdown;
     use crate::stats::Stats;
-    use crate::worker::{Candidate, Context, Pool, RankDir, Removed, Worker};
+    use crate::worker::{
+        BACKOFF_MIN, Candidate, Context, FRUITLESS_ROUNDS_BEFORE_BACKOFF, Pool, RankDir, Removed,
+        RoundResult, Worker,
+    };
 
     fn candidate(path: &str, age_secs: u64) -> Candidate {
         Candidate {
@@ -486,7 +494,6 @@ mod tests {
             size: 1,
             atime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - age_secs),
             sampled_at: Instant::now(),
-            leaf_files: 2,
         }
     }
 
@@ -726,18 +733,42 @@ mod tests {
     }
 
     #[test]
-    fn removes_leaf_dir_emptied_by_last_file() {
+    fn emptied_leaf_is_left_for_ttl_reaping() {
         let fx = fixture(1, 0);
+        let leaf = fx.cache.join("org-model_abcdef012345_r0/100/00_g0");
         let mut h = harness(config(&fx.cache, &[]));
         h.shared.set_mode(Mode::Evicting);
+        h.worker.round().expect("round");
+        h.worker.evict(1);
+        assert!(bins(&fx.cache).is_empty());
+        assert!(
+            leaf.is_dir(),
+            "unlinking the last file must not rmdir its leaf"
+        );
+        assert_eq!(Stats::get(&h.stats.rmdir_ops), 0);
+
         run_rounds(&mut h, 5);
-        let leaf = fx.cache.join("org-model_abcdef012345_r0/100/00_g0");
-        assert!(!leaf.exists());
+        assert!(
+            !leaf.exists(),
+            "empty leaf is reaped when sampling finds it"
+        );
         assert!(
             !leaf.parent().expect("bucket").exists(),
             "emptied bucket is reaped on a later round"
         );
         assert_eq!(Stats::get(&h.stats.dirs_removed), 2);
+    }
+
+    #[test]
+    fn emptied_leaf_younger_than_ttl_survives() {
+        let fx = fixture(1, 0);
+        let leaf = fx.cache.join("org-model_abcdef012345_r0/100/00_g0");
+        let mut h = harness(config(&fx.cache, &[("DIR_CLEANUP_TTL_SECONDS", "3600")]));
+        h.shared.set_mode(Mode::Evicting);
+        run_rounds(&mut h, 10);
+        assert!(bins(&fx.cache).is_empty());
+        assert!(leaf.is_dir());
+        assert_eq!(Stats::get(&h.stats.rmdir_ops), 0);
     }
 
     #[test]
@@ -882,6 +913,48 @@ mod tests {
 
         h.samples.record(BucketSample::default());
         assert!(h.samples.estimated_used_bytes().is_some_and(|b| b < 4000));
+    }
+
+    #[test]
+    fn backoff_only_when_nothing_was_deleted_reaped_or_pending() {
+        let fx = fixture(1, 0);
+        let mut h = harness(config(&fx.cache, &[]));
+        let idle = RoundResult::default();
+        for _ in 0..FRUITLESS_ROUNDS_BEFORE_BACKOFF - 1 {
+            assert_eq!(h.worker.after_round(&idle), None);
+        }
+        assert_eq!(h.worker.after_round(&idle), Some(BACKOFF_MIN));
+        assert_eq!(h.worker.after_round(&idle), Some(BACKOFF_MIN * 2));
+
+        let reaped = RoundResult {
+            reaped: 1,
+            ..RoundResult::default()
+        };
+        assert_eq!(h.worker.after_round(&reaped), None);
+        assert_eq!(h.worker.fruitless_rounds, 0);
+        assert_eq!(h.worker.backoff, BACKOFF_MIN);
+
+        h.worker.pool.insert(candidate("/pending", 10));
+        for _ in 0..2 * FRUITLESS_ROUNDS_BEFORE_BACKOFF {
+            assert_eq!(
+                h.worker.after_round(&idle),
+                None,
+                "a pending cold candidate is not a reason to back off"
+            );
+        }
+    }
+
+    #[test]
+    fn rounds_report_reaped_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(cache.join("m_abcdef012345_r0/abc/de_g0")).expect("mkdir");
+        let mut h = harness(config(&cache, &[]));
+        h.shared.set_mode(Mode::Evicting);
+        let r = h.worker.round().expect("round").expect("bucket");
+        assert_eq!(r.reaped, 1, "empty leaf");
+        let r = h.worker.round().expect("round").expect("bucket");
+        assert_eq!(r.reaped, 1, "then the empty bucket");
     }
 
     #[test]
