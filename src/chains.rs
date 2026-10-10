@@ -19,7 +19,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::config::ChainPolicy;
@@ -29,7 +29,9 @@ use crate::stats::Stats;
 
 pub const INDEX_CAP: usize = 4 << 20;
 const SUBTREE_BUDGET: usize = 4096;
-const RECV_TIMEOUT_MS: i32 = 500;
+const RECV_TIMEOUT: Duration = Duration::from_millis(500);
+const RECONNECT_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const MAX_DEPTH: usize = 16;
 const MEDIUM_STORAGE: &str = "STORAGE";
 
@@ -771,45 +773,84 @@ pub fn decode_batch(payload: &[u8]) -> Result<Vec<KvEvent>, DecodeError> {
 }
 
 /// Subscribes to every endpoint and feeds decoded batches into `chains` until shutdown.
+///
+/// Each endpoint gets its own SUB socket, so one vLLM that is down or slow does
+/// not hold up the others. Connections retry with backoff; hostnames are
+/// resolved again on every reconnect.
 pub fn subscribe(
     endpoints: &[String],
-    chains: &Arc<Chains>,
+    chains: &Chains,
     shutdown: &Shutdown,
-) -> Result<(), zmq::Error> {
-    let ctx = zmq::Context::new();
-    let sub = ctx.socket(zmq::SUB)?;
-    sub.set_subscribe(b"")?;
-    sub.set_rcvtimeo(RECV_TIMEOUT_MS)?;
-    sub.set_rcvhwm(0)?;
-    for endpoint in endpoints {
-        sub.connect(endpoint)?;
-        tracing::info!(endpoint, "subscribed to KV cache events");
+) -> std::io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        for endpoint in endpoints {
+            tokio::spawn(follow(endpoint.clone(), tx.clone()));
+        }
+        drop(tx);
+        while !shutdown.is_set() {
+            match tokio::time::timeout(RECV_TIMEOUT, rx.recv()).await {
+                Ok(Some(payload)) => apply_payload(chains, &payload),
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+    });
+    Ok(())
+}
+
+fn apply_payload(chains: &Chains, payload: &[u8]) {
+    match decode_batch(payload) {
+        Ok(events) => {
+            Stats::add(&chains.stats.batches, 1);
+            chains.apply(&events);
+        }
+        Err(e) => {
+            Stats::add(&chains.stats.decode_errors, 1);
+            tracing::debug!(error = %e, "undecodable KV events batch");
+        }
     }
-    while !shutdown.is_set() {
-        let frames = match sub.recv_multipart(0) {
-            Ok(f) => f,
-            Err(zmq::Error::EAGAIN) => continue,
-            Err(e) => {
-                tracing::warn!(error = %e, "KV events receive failed");
-                shutdown.wait(Duration::from_millis(100));
-                continue;
-            }
+}
+
+/// Forwards the payload (last frame of `[topic, seq, payload]`) of every
+/// message from `endpoint` to `tx`.
+async fn follow(endpoint: String, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
+    use zeromq::{Socket, SocketRecv, SubSocket};
+
+    let mut wait = RECONNECT_MIN;
+    loop {
+        let mut sub = SubSocket::new();
+        let connected = match sub.subscribe("").await {
+            Ok(()) => sub.connect(&endpoint).await,
+            Err(e) => Err(e),
         };
-        let Some(payload) = frames.last() else {
+        if let Err(e) = connected {
+            tracing::warn!(endpoint, error = %e, retry_in = ?wait, "KV events connect failed");
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(RECONNECT_MAX);
             continue;
-        };
-        match decode_batch(payload) {
-            Ok(events) => {
-                Stats::add(&chains.stats.batches, 1);
-                chains.apply(&events);
-            }
-            Err(e) => {
-                Stats::add(&chains.stats.decode_errors, 1);
-                tracing::debug!(error = %e, "undecodable KV events batch");
+        }
+        tracing::info!(endpoint, "subscribed to KV cache events");
+        loop {
+            match sub.recv().await {
+                Ok(message) => {
+                    let Some(payload) = message.into_vec().pop() else {
+                        continue;
+                    };
+                    if tx.send(payload.to_vec()).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(endpoint, error = %e, "KV events receive failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1246,45 +1287,131 @@ mod tests {
         assert!(dead < unshared.min(shared).min(leaf), "dead blocks first");
     }
 
+    /// Binds a real ZMQ PUB on localhost and publishes `[topic, seq, payload]`
+    /// frames until `done` says to stop.
+    fn publish_until(payloads: Vec<Vec<u8>>, done: impl Fn() -> bool + Send + 'static) -> String {
+        use zeromq::{PubSocket, Socket, SocketSend, ZmqMessage};
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                let mut publisher = PubSocket::new();
+                let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
+                tx.send(endpoint.to_string()).expect("endpoint");
+                let mut seq = 0u64;
+                while !done() {
+                    for payload in &payloads {
+                        seq += 1;
+                        let frames = vec![
+                            bytes::Bytes::new(),
+                            bytes::Bytes::copy_from_slice(&seq.to_be_bytes()),
+                            bytes::Bytes::copy_from_slice(payload),
+                        ];
+                        let message = ZmqMessage::try_from(frames).expect("frames");
+                        publisher.send(message).await.expect("send");
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            });
+        });
+        rx.recv().expect("bound")
+    }
+
     #[test]
     fn subscriber_applies_batches_from_a_real_pub_socket() {
-        let ctx = zmq::Context::new();
-        let publisher = ctx.socket(zmq::PUB).expect("pub");
-        publisher.bind("tcp://127.0.0.1:*").expect("bind");
-        let endpoint = publisher
-            .get_last_endpoint()
-            .expect("endpoint")
-            .expect("utf8");
         let chains = Arc::new(Chains::new(100, ChainPolicy::TailFirst, 2, None));
         let shutdown = Arc::new(Shutdown::default());
+        let endpoint = {
+            let chains = Arc::clone(&chains);
+            publish_until(vec![unhex(GOLDEN_V031), b"\xc1".to_vec()], move || {
+                Stats::get(&chains.stats.batches) > 0 && Stats::get(&chains.stats.decode_errors) > 0
+            })
+        };
         let handle = {
             let (chains, shutdown) = (Arc::clone(&chains), Arc::clone(&shutdown));
             std::thread::spawn(move || subscribe(&[endpoint], &chains, &shutdown))
         };
-        let payload = unhex(GOLDEN_V031);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Stats::get(&chains.stats.batches) == 0 && Instant::now() < deadline {
-            publisher
-                .send_multipart([b"".as_slice(), &1u64.to_be_bytes(), &payload], 0)
-                .expect("send");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        publisher
-            .send_multipart([b"".as_slice(), &2u64.to_be_bytes(), b"\xc1"], 0)
-            .expect("send");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Stats::get(&chains.stats.decode_errors) == 0 && Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while (Stats::get(&chains.stats.batches) == 0
+            || Stats::get(&chains.stats.decode_errors) == 0)
+            && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(20));
         }
         shutdown.trigger();
         handle.join().expect("join").expect("subscribe");
         assert!(Stats::get(&chains.stats.batches) >= 1);
-        assert_eq!(Stats::get(&chains.stats.decode_errors), 1);
+        assert!(Stats::get(&chains.stats.decode_errors) >= 1);
         assert_eq!(
             chains.rank(h(0x12), 0),
             Rank::Childless,
             "0x13 removed from STORAGE"
         );
         assert_eq!(chains.deleted(h(0x11)), Position::Root);
+    }
+
+    #[test]
+    fn subscriber_waits_for_an_endpoint_that_comes_up_late() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port")
+            .port();
+        let chains = Arc::new(Chains::new(100, ChainPolicy::TailFirst, 2, None));
+        let shutdown = Arc::new(Shutdown::default());
+        let handle = {
+            let (chains, shutdown) = (Arc::clone(&chains), Arc::clone(&shutdown));
+            let endpoint = format!("tcp://127.0.0.1:{port}");
+            std::thread::spawn(move || subscribe(&[endpoint], &chains, &shutdown))
+        };
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(Stats::get(&chains.stats.batches), 0);
+
+        let late = {
+            let chains = Arc::clone(&chains);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                use zeromq::{PubSocket, Socket, SocketSend, ZmqMessage};
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                runtime.block_on(async move {
+                    let mut publisher = PubSocket::new();
+                    publisher
+                        .bind(&format!("tcp://127.0.0.1:{port}"))
+                        .await
+                        .expect("bind");
+                    tx.send(()).expect("bound");
+                    while Stats::get(&chains.stats.batches) == 0 {
+                        let frames = vec![
+                            bytes::Bytes::new(),
+                            bytes::Bytes::copy_from_slice(&1u64.to_be_bytes()),
+                            bytes::Bytes::from(unhex(GOLDEN_LEGACY)),
+                        ];
+                        publisher
+                            .send(ZmqMessage::try_from(frames).expect("frames"))
+                            .await
+                            .expect("send");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                });
+            });
+            rx
+        };
+        late.recv().expect("bound");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Stats::get(&chains.stats.batches) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        shutdown.trigger();
+        handle.join().expect("join").expect("subscribe");
+        assert!(
+            Stats::get(&chains.stats.batches) >= 1,
+            "never received after the PUB came up"
+        );
     }
 }

@@ -26,9 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::budget::{Budget, OpKind};
 use crate::capacity::{BucketSample, Samples};
-#[cfg(feature = "events")]
 use crate::chains::{Chains, LeafEdge, Rank};
-#[cfg(feature = "events")]
 use crate::config::ChainPolicy;
 use crate::config::Config;
 use crate::controller::{Mode, SharedState};
@@ -46,7 +44,6 @@ const EMPTY_INDEX_RETRY: Duration = Duration::from_secs(5);
 const FRUITLESS_ROUNDS_BEFORE_BACKOFF: u32 = 16;
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
-#[cfg(feature = "events")]
 const CHAIN_WINDOW: usize = 8;
 
 /// A deleted block, reported to the events publisher when the `events` feature is on.
@@ -126,7 +123,6 @@ impl Pool {
 struct BucketIndex {
     buckets: Vec<(Arc<RankDir>, CString)>,
     /// Every rank dir found, including ones with no bucket in this shard.
-    #[cfg(feature = "events")]
     ranks: Vec<Arc<RankDir>>,
     refreshed_at: Option<Instant>,
 }
@@ -139,7 +135,6 @@ pub struct Context {
     pub samples: Arc<Samples>,
     pub shutdown: Arc<Shutdown>,
     pub events: Option<Sender<Removed>>,
-    #[cfg(feature = "events")]
     pub chains: Option<Arc<Chains>>,
 }
 
@@ -262,14 +257,12 @@ impl Worker {
         let cache = self.ctx.config.cache_path();
         let bucket_len = self.ctx.config.hex_bucket_len;
         let mut buckets = Vec::new();
-        #[cfg(feature = "events")]
         let mut ranks = Vec::new();
         for path in discover_rank_dirs(&cache) {
             let rank = Arc::new(RankDir {
                 model_base: model_base_dir(&path),
                 path,
             });
-            #[cfg(feature = "events")]
             ranks.push(Arc::clone(&rank));
             let listed = fsops::open_dir(&rank.path)
                 .and_then(|fd| self.timed(OpKind::Readdir, || fsops::list(&fd)));
@@ -293,7 +286,6 @@ impl Worker {
         );
         self.index = BucketIndex {
             buckets,
-            #[cfg(feature = "events")]
             ranks,
             refreshed_at: Some(Instant::now()),
         };
@@ -397,7 +389,6 @@ impl Worker {
     }
 
     fn evict(&mut self, quota: usize) -> usize {
-        #[cfg(feature = "events")]
         if let Some(chains) = self.ordering_chains() {
             return match chains.policy {
                 ChainPolicy::Subtree => self.evict_subtrees(quota, &chains),
@@ -419,7 +410,6 @@ impl Worker {
 
     /// The chain index when it should reorder eviction. Emergency mode
     /// ignores chain order.
-    #[cfg(feature = "events")]
     fn ordering_chains(&self) -> Option<Arc<Chains>> {
         self.ctx
             .chains
@@ -430,7 +420,6 @@ impl Worker {
 
     /// Deletes the best subtree root in the window, then every on-disk block
     /// below it: none of them is reachable by a prefix lookup once it is gone.
-    #[cfg(feature = "events")]
     fn evict_subtrees(&mut self, quota: usize, chains: &Chains) -> usize {
         let mut window: Vec<Candidate> = std::iter::from_fn(|| self.pool.pop_oldest())
             .take(quota.saturating_mul(CHAIN_WINDOW))
@@ -455,7 +444,6 @@ impl Worker {
 
     /// Deletes `root` and every on-disk block below it, in every rank dir of
     /// its model. Returns files removed.
-    #[cfg(feature = "events")]
     fn delete_subtree(&mut self, root: Candidate, chains: &Chains) -> usize {
         let (hash, size, rank) = (root.hash, root.size, Arc::clone(&root.rank));
         let group = leaf_group(&root.path);
@@ -497,7 +485,6 @@ impl Worker {
     }
 
     /// Unlinks block file `name` from each of `ranks`; returns files removed.
-    #[cfg(feature = "events")]
     fn remove_named(
         &mut self,
         ranks: &[Arc<RankDir>],
@@ -524,7 +511,6 @@ impl Worker {
     /// shared prefix, the oldest edge below it), deleted leaf first. Edges
     /// with a block younger than the hot threshold wait; if the round still
     /// falls short, the least recently written of them go anyway.
-    #[cfg(feature = "events")]
     fn evict_radix(&mut self, quota: usize, chains: &Chains) -> usize {
         let mut window: Vec<Candidate> = std::iter::from_fn(|| self.pool.pop_oldest())
             .take(quota.saturating_mul(CHAIN_WINDOW))
@@ -589,14 +575,12 @@ impl Worker {
         evicted
     }
 
-    #[cfg(feature = "events")]
     fn evicting(&self) -> bool {
         self.ctx.shared.should_delete() && !self.ctx.shutdown.is_set()
     }
 
     /// Deletes `edge` leaf first in every rank dir of `c`'s model. Returns
     /// files removed and whether `c` itself was one of them.
-    #[cfg(feature = "events")]
     fn delete_edge(&mut self, c: &Candidate, edge: &LeafEdge, chains: &Chains) -> (usize, bool) {
         let Some(group) = leaf_group(&c.path) else {
             return (0, false);
@@ -638,7 +622,6 @@ impl Worker {
     /// Ranks are recomputed after every deletion: removing a leaf can turn
     /// its parent into one. Interiors with deferrals left are never deleted;
     /// the round evicts less instead.
-    #[cfg(feature = "events")]
     fn evict_tail_first(&mut self, quota: usize, chains: &Chains) -> usize {
         let mut window: Vec<Candidate> = std::iter::from_fn(|| self.pool.pop_oldest())
             .take(quota.saturating_mul(CHAIN_WINDOW))
@@ -689,7 +672,6 @@ impl Worker {
 
     /// Other rank dirs of `rank`'s model. Tensor-parallel ranks each hold a
     /// shard of every block, and a block is useless once any shard is gone.
-    #[cfg(feature = "events")]
     fn sibling_ranks(&self, rank: &RankDir) -> Vec<Arc<RankDir>> {
         let Some(base) = &rank.model_base else {
             return Vec::new();
@@ -733,12 +715,9 @@ impl Worker {
         Stats::add(&self.ctx.stats.files_deleted, 1);
         Stats::add(&self.ctx.stats.bytes_freed, size);
         self.ctx.shared.freed(size);
-        #[cfg(feature = "events")]
         if let Some(chains) = self.ctx.chains.as_ref().filter(|_| record_chain) {
             chains.deleted(hash);
         }
-        #[cfg(not(feature = "events"))]
-        let _ = record_chain;
         if let (Some(tx), Some(base)) = (&self.ctx.events, &rank.model_base) {
             let _ = tx.send(Removed {
                 model_base: base.clone(),
@@ -772,14 +751,12 @@ impl Worker {
 }
 
 /// `g0` from `.../<hh>_g0/<hash>.bin`.
-#[cfg(feature = "events")]
 fn leaf_group(block: &Path) -> Option<String> {
     let leaf = block.parent()?.file_name()?.to_str()?;
     leaf.rsplit_once("_g").map(|(_, g)| g.to_owned())
 }
 
 /// `<rank>/<hhh>/<hh>_g<group>/<name>` for a block file `name`.
-#[cfg(feature = "events")]
 fn block_path(rank: &Path, name: &str, bucket_len: usize, group: &str) -> Option<PathBuf> {
     let bucket = name.get(..bucket_len)?;
     let leaf = name.get(bucket_len..bucket_len + 2)?;
@@ -928,7 +905,6 @@ mod tests {
             samples: Arc::clone(&samples),
             shutdown: Arc::new(Shutdown::default()),
             events: Some(tx),
-            #[cfg(feature = "events")]
             chains: None,
         };
         Harness {
@@ -1276,7 +1252,6 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 
-    #[cfg(feature = "events")]
     mod chain_fixtures {
         use std::fs;
         use std::path::{Path, PathBuf};
@@ -1342,7 +1317,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "events")]
     #[test]
     fn tail_first_deletes_a_chain_from_the_leaf_back() {
         use crate::config::ChainPolicy;
@@ -1377,7 +1351,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "events")]
     #[test]
     fn observe_policy_evicts_oldest_first_and_counts_dead_tails() {
         use crate::config::ChainPolicy;
@@ -1399,7 +1372,6 @@ mod tests {
         assert_eq!(Stats::get(&s.deferrals), 0);
     }
 
-    #[cfg(feature = "events")]
     #[test]
     fn tail_first_prefers_childless_blocks_over_older_interiors() {
         use crate::config::ChainPolicy;
@@ -1422,7 +1394,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "events")]
     #[test]
     fn interior_alone_is_deferred_a_bounded_number_of_rounds() {
         use crate::config::ChainPolicy;
@@ -1443,7 +1414,6 @@ mod tests {
         assert_eq!(bins(&cache), names(&[2]));
     }
 
-    #[cfg(feature = "events")]
     #[test]
     fn tail_first_deletes_dead_blocks_before_older_live_ones() {
         use crate::config::ChainPolicy;
@@ -1469,7 +1439,6 @@ mod tests {
         assert_eq!(Stats::get(&chains(&h).stats.deleted_leaf), 0);
     }
 
-    #[cfg(feature = "events")]
     #[test]
     fn subtree_policy_deletes_the_unshared_chain_whole_and_spares_the_shared_prefix() {
         use crate::config::ChainPolicy;
@@ -1501,7 +1470,6 @@ mod tests {
         assert_eq!(Stats::get(&h.stats.files_deleted), 3);
     }
 
-    #[cfg(feature = "events")]
     #[test]
     fn subtree_cascade_skips_blocks_without_a_digest_and_missing_files() {
         use crate::chains::KvEvent;
@@ -1527,7 +1495,6 @@ mod tests {
         assert_eq!(Stats::get(&h.stats.errors), 0);
     }
 
-    #[cfg(feature = "events")]
     #[test]
     fn subtree_policy_deletes_every_tensor_parallel_shard_once() {
         use crate::config::ChainPolicy;
@@ -1561,7 +1528,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "events")]
     fn radix_harness(cache: &Path, hot_minutes: &str) -> Harness {
         use crate::config::ChainPolicy;
         use crate::worker::tests::chain_fixtures::{chain_harness, chains, stored};
@@ -1577,7 +1543,6 @@ mod tests {
         h
     }
 
-    #[cfg(feature = "events")]
     #[test]
     fn radix_keeps_a_shared_prompt_while_it_has_continuations() {
         use crate::worker::tests::chain_fixtures::{bucket, chains, names};
@@ -1605,7 +1570,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "events")]
     #[test]
     fn radix_falls_back_to_the_least_recently_written_young_edges() {
         use crate::worker::tests::chain_fixtures::{bucket, chains, names};
@@ -1629,7 +1593,6 @@ mod tests {
         assert_eq!(Stats::get(&s.young_fallbacks), 2);
     }
 
-    #[cfg(feature = "events")]
     #[test]
     fn radix_deletes_a_dead_candidate_with_its_subtree() {
         use crate::worker::tests::chain_fixtures::{bucket, chains, hash, names};
@@ -1647,7 +1610,6 @@ mod tests {
         assert_eq!(Stats::get(&chains(&h).stats.cascaded), 1);
     }
 
-    #[cfg(feature = "events")]
     #[test]
     fn subtree_cascade_stops_at_the_byte_budget() {
         use crate::config::ChainPolicy;
@@ -1673,7 +1635,6 @@ mod tests {
         assert!(!h.shared.should_delete());
     }
 
-    #[cfg(feature = "events")]
     #[test]
     fn block_path_rebuilds_the_fs_tier_layout() {
         use std::path::Path;
@@ -1690,7 +1651,6 @@ mod tests {
         assert_eq!(block_path(Path::new("/r"), "ab", 3, "0"), None);
     }
 
-    #[cfg(feature = "events")]
     #[test]
     fn emergency_mode_ignores_chain_order() {
         use crate::config::ChainPolicy;

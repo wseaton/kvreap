@@ -1,7 +1,6 @@
 mod atime;
 mod budget;
 mod capacity;
-#[cfg(feature = "events")]
 mod chains;
 mod config;
 mod controller;
@@ -241,10 +240,8 @@ fn spawn<F: FnOnce() + Send + 'static>(name: String, f: F) -> anyhow::Result<Joi
 
 type EventsHandle = (Option<mpsc::Sender<Removed>>, Option<JoinHandle<()>>);
 
-#[cfg(feature = "events")]
 type ChainsHandle = (Option<Arc<chains::Chains>>, Option<JoinHandle<()>>);
 
-#[cfg(feature = "events")]
 fn start_chains(config: &Config, shutdown: &Arc<Shutdown>) -> anyhow::Result<ChainsHandle> {
     if config.kv_events_endpoints.is_empty() {
         return Ok((None, None));
@@ -275,19 +272,6 @@ fn start_chains(config: &Config, shutdown: &Arc<Shutdown>) -> anyhow::Result<Cha
         })?
     };
     Ok((Some(chains), Some(handle)))
-}
-
-#[cfg(not(feature = "events"))]
-fn warn_chains_unsupported(config: &Config) {
-    if !config.kv_events_endpoints.is_empty() {
-        tracing::warn!(
-            endpoints = config.kv_events_endpoints.join(","),
-            policy = ?config.chain_policy,
-            max_deferrals = config.chain_max_deferrals,
-            disk_medium = config.kv_events_disk_medium.as_deref(),
-            "KV_EVENTS_ENDPOINTS is set but this build has no events support; evicting oldest-first"
-        );
-    }
 }
 
 #[cfg(feature = "events")]
@@ -355,10 +339,7 @@ fn run(config: Config) -> anyhow::Result<()> {
     let budget = Arc::new(Budget::new(config.max_files_per_second));
 
     let (events_tx, events_thread) = start_events(&config)?;
-    #[cfg(feature = "events")]
     let (chains, chains_thread) = start_chains(&config, &shutdown)?;
-    #[cfg(not(feature = "events"))]
-    warn_chains_unsupported(&config);
     let (source, sampler) = start_usage_source(&config, &samples, &stats, &shutdown)?;
 
     let controller = {
@@ -382,7 +363,6 @@ fn run(config: Config) -> anyhow::Result<()> {
             samples: Arc::clone(&samples),
             shutdown: Arc::clone(&shutdown),
             events: events_tx.clone(),
-            #[cfg(feature = "events")]
             chains: chains.clone(),
         };
         workers.push(spawn(format!("worker-{id}"), move || {
@@ -393,7 +373,6 @@ fn run(config: Config) -> anyhow::Result<()> {
 
     while !shutdown.wait(STATUS_INTERVAL) {
         log_status(&shared, &budget, &stats);
-        #[cfg(feature = "events")]
         if let Some(c) = &chains {
             c.log_status();
         }
@@ -409,14 +388,12 @@ fn run(config: Config) -> anyhow::Result<()> {
     if let Some(t) = events_thread {
         let _ = t.join();
     }
-    #[cfg(feature = "events")]
     if let Some(t) = chains_thread {
         let _ = t.join();
     }
     signal_handle.close();
     let _ = signal_thread.join();
     log_status(&shared, &budget, &stats);
-    #[cfg(feature = "events")]
     if let Some(c) = &chains {
         c.log_status();
     }

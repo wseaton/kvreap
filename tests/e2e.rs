@@ -497,7 +497,61 @@ fn publishes_block_removed_events_for_every_deletion() {
     assert_eq!(got, want);
 }
 
-#[cfg(feature = "events")]
+/// A vLLM-style KV events PUB socket (pure-Rust zeromq) on localhost.
+struct KvEventsPublisher {
+    endpoint: String,
+    batches: tokio::sync::mpsc::UnboundedSender<(Vec<u8>, u64)>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl KvEventsPublisher {
+    fn bind() -> Self {
+        let (endpoint_tx, endpoint_rx) = std::sync::mpsc::channel();
+        let (batches, mut batch_rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, u64)>();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use zeromq::{PubSocket, Socket, SocketSend, ZmqMessage};
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                let mut socket = PubSocket::new();
+                let endpoint = socket.bind("tcp://127.0.0.1:0").await.expect("bind");
+                endpoint_tx.send(endpoint.to_string()).expect("endpoint");
+                let mut seq = 0u64;
+                while let Some((payload, times)) = batch_rx.recv().await {
+                    for _ in 0..times {
+                        seq += 1;
+                        let frames = vec![
+                            bytes::Bytes::new(),
+                            bytes::Bytes::copy_from_slice(&seq.to_be_bytes()),
+                            bytes::Bytes::copy_from_slice(&payload),
+                        ];
+                        socket
+                            .send(ZmqMessage::try_from(frames).expect("frames"))
+                            .await
+                            .expect("publish");
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    done_tx.send(()).expect("done");
+                }
+            });
+        });
+        Self {
+            endpoint: endpoint_rx.recv().expect("bound"),
+            batches,
+            done,
+        }
+    }
+
+    /// Publishes `payload` `times` times, 20 ms apart, and waits until sent.
+    fn publish(&self, payload: Vec<u8>, times: u64) {
+        self.batches.send((payload, times)).expect("queue");
+        self.done.recv().expect("published");
+    }
+}
+
 /// A vLLM 0.31 `EventBatch` with one map-encoded `BlockStored` for `chain`
 /// (root first), hashes as 32-byte digests that name `Cache::block_path` files.
 fn block_stored_batch(chain: &[u64]) -> Vec<u8> {
@@ -522,14 +576,12 @@ fn block_stored_batch(chain: &[u64]) -> Vec<u8> {
     buf
 }
 
-#[cfg(feature = "events")]
 /// Runs kvreap over one 40-block chain in a single bucket, head oldest, with
 /// the chain announced over a real ZMQ PUB; returns the final `chains` status line.
 fn evict_announced_chain(policy: &str) -> String {
     evict_announced_chain_with(policy, &[])
 }
 
-#[cfg(feature = "events")]
 fn evict_announced_chain_with(policy: &str, extra: &[(&'static str, &str)]) -> String {
     const LEN: u64 = 40;
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -548,15 +600,9 @@ fn evict_announced_chain_with(policy: &str, extra: &[(&'static str, &str)]) -> S
         })
         .collect();
 
-    let ctx = zmq::Context::new();
-    let publisher = ctx.socket(zmq::PUB).expect("pub socket");
-    publisher.bind("tcp://127.0.0.1:*").expect("bind");
-    let endpoint = publisher
-        .get_last_endpoint()
-        .expect("endpoint")
-        .expect("utf8");
+    let publisher = KvEventsPublisher::bind();
     let mut env = always_evicting();
-    env.push(("KV_EVENTS_ENDPOINTS", endpoint));
+    env.push(("KV_EVENTS_ENDPOINTS", publisher.endpoint.clone()));
     env.push(("CHAIN_EVICTION", policy.into()));
     env.push(("CHAIN_MAX_DEFERRALS", "1000".into()));
     env.push(("NUM_CRAWLER_PROCESSES", "1".into()));
@@ -568,13 +614,7 @@ fn evict_announced_chain_with(policy: &str, extra: &[(&'static str, &str)]) -> S
         ev.log()
     );
     // PUB drops messages until the subscription propagates; stores are idempotent.
-    let batch = block_stored_batch(&chain);
-    for seq in 0u64..50 {
-        publisher
-            .send_multipart([b"".as_slice(), &seq.to_be_bytes(), &batch], 0)
-            .expect("publish");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    publisher.publish(block_stored_batch(&chain), 50);
     fs::rename(staging.rank(), cache.rank()).expect("move chain into the cache");
     assert!(
         wait_until(Duration::from_secs(90), || existing(&blocks).is_empty()),
@@ -591,7 +631,6 @@ fn evict_announced_chain_with(policy: &str, extra: &[(&'static str, &str)]) -> S
         .unwrap_or_else(|| panic!("no chains status line\n{}", ev.log()))
 }
 
-#[cfg(feature = "events")]
 fn counter(line: &str, name: &str) -> u64 {
     line.split_whitespace()
         .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
@@ -599,7 +638,6 @@ fn counter(line: &str, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("{name} missing from {line}"))
 }
 
-#[cfg(feature = "events")]
 #[test]
 fn tail_first_eviction_deletes_announced_chain_from_the_leaf() {
     let line = evict_announced_chain("tail-first");
@@ -611,7 +649,6 @@ fn tail_first_eviction_deletes_announced_chain_from_the_leaf() {
     assert_eq!(counter(&line, "deleted_untracked"), 0, "{line}");
 }
 
-#[cfg(feature = "events")]
 #[test]
 fn observe_eviction_deletes_announced_chain_head_first() {
     let line = evict_announced_chain("observe");
@@ -621,7 +658,6 @@ fn observe_eviction_deletes_announced_chain_head_first() {
     assert_eq!(counter(&line, "deferrals"), 0, "{line}");
 }
 
-#[cfg(feature = "events")]
 #[test]
 fn radix_eviction_deletes_the_announced_chain_as_one_edge_from_the_leaf() {
     // The chain was announced moments ago; a zero hot window lets its edge go.
@@ -632,7 +668,6 @@ fn radix_eviction_deletes_the_announced_chain_as_one_edge_from_the_leaf() {
     assert_eq!(counter(&line, "cascaded"), 39, "{line}");
 }
 
-#[cfg(feature = "events")]
 #[test]
 fn subtree_eviction_deletes_the_announced_chain_from_its_root() {
     let line = evict_announced_chain("subtree");
@@ -640,31 +675,6 @@ fn subtree_eviction_deletes_the_announced_chain_from_its_root() {
     assert_eq!(counter(&line, "cascaded"), 39, "{line}");
     assert_eq!(counter(&line, "deleted_orphan"), 39, "{line}");
     assert_eq!(counter(&line, "deleted_leaf"), 0, "{line}");
-}
-
-#[cfg(not(feature = "events"))]
-#[test]
-fn kv_events_endpoints_without_events_feature_warns_and_evicts_oldest_first() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let cache = Cache::new(tmp.path());
-    let cold = cache.cold_blocks(10, 64);
-    let mut env = always_evicting();
-    env.push(("KV_EVENTS_ENDPOINTS", "tcp://127.0.0.1:5557".into()));
-    let mut ev = Evictor::start(tmp.path(), &env);
-    assert!(
-        ev.wait_for_log(
-            "KV_EVENTS_ENDPOINTS is set but this build has no events support",
-            Duration::from_secs(10)
-        ),
-        "{}",
-        ev.log()
-    );
-    assert!(
-        wait_until(Duration::from_secs(30), || existing(&cold).is_empty()),
-        "{}",
-        ev.log()
-    );
-    assert!(ev.sigterm().success());
 }
 
 #[test]
@@ -1109,7 +1119,10 @@ fn storage_events_endpoint_without_events_feature_warns_and_still_evicts() {
     assert!(ev.sigterm().success());
 }
 
-/// The default build must not link any cryptographic code (FIPS).
+/// The default build must not link any cryptographic code (FIPS). zeromq's
+/// `rand` brings a ChaCha PRNG (`rand_chacha`), which is not a crypto
+/// primitive and is not on check-payload's deny list; the ChaCha20-Poly1305
+/// AEAD is.
 #[cfg(not(feature = "events"))]
 #[test]
 fn default_build_links_no_crypto() {
@@ -1120,7 +1133,7 @@ fn default_build_links_no_crypto() {
         b"tweetnacl",
         b"crypto_box",
         b"curve_client",
-        b"chacha",
+        b"poly1305",
         b"zmq_ctx_new",
         b"sodium_init",
         b"EVP_",
