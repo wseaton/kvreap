@@ -43,7 +43,6 @@ const RECHECK_AFTER: Duration = Duration::from_secs(5);
 const INDEX_REFRESH: Duration = Duration::from_secs(300);
 const IDLE_POLL: Duration = Duration::from_millis(250);
 const EMPTY_INDEX_RETRY: Duration = Duration::from_secs(5);
-const FRUITLESS_ROUNDS_BEFORE_BACKOFF: u32 = 16;
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const CHAIN_WINDOW: usize = 8;
@@ -170,12 +169,34 @@ impl Pool {
     }
 }
 
+/// The shard's buckets, sampled in passes: each pass visits every bucket once
+/// in a fresh random order.
 #[derive(Debug, Default)]
 struct BucketIndex {
     buckets: Vec<(Arc<RankDir>, CString)>,
     /// Every rank dir found, including ones with no bucket in this shard.
     ranks: Vec<Arc<RankDir>>,
     refreshed_at: Option<Instant>,
+    /// Indices into `buckets` for the current pass, and how many are visited.
+    pass: Vec<usize>,
+    visited: usize,
+}
+
+impl BucketIndex {
+    fn next(&mut self) -> Option<(Arc<RankDir>, CString)> {
+        if self.visited >= self.pass.len() {
+            self.pass = (0..self.buckets.len()).collect();
+            fastrand::shuffle(&mut self.pass);
+            self.visited = 0;
+        }
+        let i = *self.pass.get(self.visited)?;
+        self.visited += 1;
+        self.buckets.get(i).cloned()
+    }
+
+    fn pass_done(&self) -> bool {
+        self.visited >= self.pass.len()
+    }
 }
 
 pub struct Context {
@@ -299,7 +320,8 @@ pub struct Worker {
     ctx: Context,
     pool: Pool,
     index: BucketIndex,
-    fruitless_rounds: u32,
+    /// Files evicted so far in the current pass over the buckets.
+    pass_evicted: usize,
     backoff: Duration,
     /// Sampled files not yet matched by an eviction, below `SAMPLED_PER_EVICTION`.
     evict_carry: usize,
@@ -319,7 +341,7 @@ impl Worker {
             ctx,
             pool: Pool::new(POOL_CAP),
             index: BucketIndex::default(),
-            fruitless_rounds: 0,
+            pass_evicted: 0,
             backoff: BACKOFF_MIN,
             evict_carry: 0,
         }
@@ -332,7 +354,7 @@ impl Worker {
                 self.pool.clear();
                 self.evict_carry = 0;
                 self.index.refreshed_at = None;
-                self.fruitless_rounds = 0;
+                self.pass_evicted = 0;
                 self.backoff = BACKOFF_MIN;
                 self.ctx.shutdown.wait(IDLE_POLL);
                 continue;
@@ -364,15 +386,19 @@ impl Worker {
         tracing::info!(worker = self.id, "worker stopped");
     }
 
-    /// Updates backoff state; returns how long to back off, if at all.
+    /// Updates backoff state; returns how long to back off, if at all. A
+    /// worker backs off only after a whole pass over its buckets evicted
+    /// nothing.
     fn after_round(&mut self, r: &RoundResult) -> Option<Duration> {
+        self.pass_evicted += r.evicted;
         if r.evicted > 0 {
-            self.fruitless_rounds = 0;
             self.backoff = BACKOFF_MIN;
+        }
+        if !self.index.pass_done() {
             return None;
         }
-        self.fruitless_rounds += 1;
-        if self.fruitless_rounds < FRUITLESS_ROUNDS_BEFORE_BACKOFF {
+        let evicted = std::mem::take(&mut self.pass_evicted);
+        if evicted > 0 {
             return None;
         }
         self.index.refreshed_at = None;
@@ -434,6 +460,7 @@ impl Worker {
             buckets,
             ranks,
             refreshed_at: Some(Instant::now()),
+            ..BucketIndex::default()
         };
     }
 
@@ -446,11 +473,9 @@ impl Worker {
         if stale {
             self.refresh_index();
         }
-        if self.index.buckets.is_empty() {
+        let Some((rank, bucket)) = self.index.next() else {
             return Ok(None);
-        }
-        let (rank, bucket) =
-            self.index.buckets[fastrand::usize(..self.index.buckets.len())].clone();
+        };
         let sampled = match self.sample_bucket(&rank, &bucket) {
             Ok(n) => n,
             Err(e) if fsops::is_not_found(&e) => {
@@ -1927,5 +1952,35 @@ mod tests {
             let left = targets.iter().filter(|t| t.path.exists()).count();
             assert_eq!(left, 40 - deleted, "fanout {fanout}");
         }
+    }
+
+    #[test]
+    fn a_pass_visits_every_bucket_once_before_repeating() {
+        use std::collections::HashSet;
+        use std::ffi::CString;
+
+        use crate::worker::{BucketIndex, RankDir};
+
+        let rank = Arc::new(RankDir {
+            path: PathBuf::from("/r"),
+            model_base: None,
+        });
+        let mut index = BucketIndex {
+            buckets: (0..9)
+                .map(|i| {
+                    (
+                        Arc::clone(&rank),
+                        CString::new(format!("{i:03x}")).expect("name"),
+                    )
+                })
+                .collect(),
+            ..BucketIndex::default()
+        };
+        for _ in 0..3 {
+            let pass: HashSet<CString> = (0..9).map(|_| index.next().expect("bucket").1).collect();
+            assert_eq!(pass.len(), 9, "each bucket once per pass");
+            assert!(index.pass_done());
+        }
+        assert!(BucketIndex::default().next().is_none());
     }
 }
