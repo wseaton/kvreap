@@ -3,9 +3,16 @@
 //! ```text
 //!   ops/s = min(cap, aimd)            cap = 2 x DELETION_MAX_FILES_PER_SECOND (stat + unlink)
 //!
-//!   every tick (1s):  latency EWMA per op kind vs. its rolling-minimum baseline
-//!     any kind > CONGESTION_RATIO x baseline (and > LATENCY_FLOOR)  -> aimd /= 2
-//!     otherwise                                                     -> aimd += step
+//!   every tick (1s), per op kind: mean latency of the tick's samples vs. the
+//!   lowest tick mean of the last BASELINE_WINDOW ticks
+//!
+//!     fewer than MIN_SAMPLES samples         -> hold (no signal, no growth)
+//!     settling after a cut                   -> hold
+//!     > CONGESTION_RATIO x baseline, and > LATENCY_FLOOR:
+//!         first time                         -> aimd /= 2, settle SETTLE_TICKS
+//!         still >= RESPONSE_RATIO x the latency that caused the last cut
+//!                                            -> not ours: undo the cut, baseline = now
+//!     otherwise                              -> aimd += step
 //! ```
 
 use std::collections::VecDeque;
@@ -36,42 +43,73 @@ impl OpKind {
 const START_RATE: f64 = 500.0;
 const MIN_RATE: f64 = 20.0;
 const ADDITIVE_STEP: f64 = 50.0;
-const EWMA_ALPHA: f64 = 0.2;
 const CONGESTION_RATIO: f64 = 3.0;
+const RESPONSE_RATIO: f64 = 0.8;
 const LATENCY_FLOOR: Duration = Duration::from_millis(2);
 const BASELINE_WINDOW: usize = 120;
+const MIN_SAMPLES: u32 = 5;
+const SETTLE_TICKS: u32 = 2;
 pub const TICK: Duration = Duration::from_secs(1);
+
+/// What a tick did to the rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Increased,
+    Held,
+    Halved,
+    /// Latency stayed up after a cut, so the cut was undone and the baseline moved.
+    Reanchored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Signal {
+    Quiet,
+    Healthy,
+    Congested(f64),
+}
 
 #[derive(Debug, Default, Clone)]
 struct LatencyTrack {
-    ewma: Option<f64>,
-    observed_since_tick: bool,
+    sum: f64,
+    count: u32,
     history: VecDeque<f64>,
+    /// Tick latency that triggered the last cut, until a healthy tick clears it.
+    cut_at: Option<f64>,
 }
 
 impl LatencyTrack {
     fn observe(&mut self, secs: f64) {
-        self.ewma = Some(match self.ewma {
-            Some(prev) => prev + EWMA_ALPHA * (secs - prev),
-            None => secs,
-        });
-        self.observed_since_tick = true;
+        self.sum += secs;
+        self.count += 1;
     }
 
-    /// True if this tick's EWMA is well above the rolling minimum; ticks without samples are skipped.
-    fn congested_and_roll(&mut self) -> bool {
-        let Some(ewma) = self.ewma.filter(|_| self.observed_since_tick) else {
-            return false;
-        };
-        self.observed_since_tick = false;
+    fn roll(&mut self) -> Signal {
+        let (sum, count) = (self.sum, self.count);
+        (self.sum, self.count) = (0.0, 0);
+        if count < MIN_SAMPLES {
+            return Signal::Quiet;
+        }
+        let mean = sum / f64::from(count);
         let baseline = self.history.iter().copied().fold(f64::INFINITY, f64::min);
-        self.history.push_back(ewma);
+        self.history.push_back(mean);
         if self.history.len() > BASELINE_WINDOW {
             self.history.pop_front();
         }
-        baseline.is_finite()
-            && ewma > LATENCY_FLOOR.as_secs_f64()
-            && ewma > baseline * CONGESTION_RATIO
+        if baseline.is_finite()
+            && mean > LATENCY_FLOOR.as_secs_f64()
+            && mean > baseline * CONGESTION_RATIO
+        {
+            Signal::Congested(mean)
+        } else {
+            self.cut_at = None;
+            Signal::Healthy
+        }
+    }
+
+    fn reanchor(&mut self, latency: f64) {
+        self.history.clear();
+        self.history.push_back(latency);
+        self.cut_at = None;
     }
 }
 
@@ -80,6 +118,8 @@ pub struct Aimd {
     rate: f64,
     cap: Option<f64>,
     tracks: [LatencyTrack; 3],
+    settling: u32,
+    rate_before_cut: Option<f64>,
 }
 
 impl Aimd {
@@ -88,6 +128,8 @@ impl Aimd {
             rate: START_RATE,
             cap,
             tracks: Default::default(),
+            settling: 0,
+            rate_before_cut: None,
         };
         aimd.clamp();
         aimd
@@ -106,19 +148,46 @@ impl Aimd {
         self.tracks[kind.index()].observe(latency.as_secs_f64());
     }
 
-    /// Returns true if the rate was cut.
-    pub fn tick(&mut self) -> bool {
-        let congested = OpKind::ALL
-            .iter()
-            .map(|k| self.tracks[k.index()].congested_and_roll())
-            .fold(false, |acc, c| acc | c);
-        if congested {
-            self.rate /= 2.0;
-        } else {
-            self.rate += ADDITIVE_STEP;
+    pub fn tick(&mut self) -> Verdict {
+        let signals = OpKind::ALL.map(|k| self.tracks[k.index()].roll());
+        if self.settling > 0 {
+            self.settling -= 1;
+            return Verdict::Held;
         }
+        let mut ours = false;
+        let mut external = false;
+        for (track, signal) in self.tracks.iter_mut().zip(signals) {
+            let Signal::Congested(latency) = signal else {
+                continue;
+            };
+            match track.cut_at {
+                Some(cut_at) if latency >= cut_at * RESPONSE_RATIO => {
+                    track.reanchor(latency);
+                    external = true;
+                }
+                _ => {
+                    track.cut_at = Some(latency);
+                    ours = true;
+                }
+            }
+        }
+        let verdict = if ours {
+            self.rate_before_cut = Some(self.rate);
+            self.rate /= 2.0;
+            self.settling = SETTLE_TICKS;
+            Verdict::Halved
+        } else if external {
+            self.rate = self.rate_before_cut.take().unwrap_or(self.rate);
+            Verdict::Reanchored
+        } else if signals.contains(&Signal::Healthy) {
+            self.rate_before_cut = None;
+            self.rate += ADDITIVE_STEP;
+            Verdict::Increased
+        } else {
+            Verdict::Held
+        };
         self.clamp();
-        congested
+        verdict
     }
 }
 
@@ -168,11 +237,16 @@ impl Budget {
             let now = Instant::now();
             if now.duration_since(g.last_tick) >= TICK {
                 g.last_tick = now;
-                if g.aimd.tick() {
-                    tracing::info!(
+                match g.aimd.tick() {
+                    Verdict::Halved => tracing::info!(
                         rate = g.aimd.rate(),
                         "metadata latency rising, halving op rate"
-                    );
+                    ),
+                    Verdict::Reanchored => tracing::info!(
+                        rate = g.aimd.rate(),
+                        "metadata latency stayed up after slowing down, restoring op rate"
+                    ),
+                    Verdict::Increased | Verdict::Held => {}
                 }
             }
             if unpaced {
@@ -197,7 +271,9 @@ impl Budget {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use crate::budget::{ADDITIVE_STEP, Aimd, Budget, MIN_RATE, OpKind, START_RATE};
+    use crate::budget::{
+        ADDITIVE_STEP, Aimd, Budget, MIN_RATE, OpKind, SETTLE_TICKS, START_RATE, Verdict,
+    };
     use crate::shutdown::Shutdown;
 
     fn ms(v: u64) -> Duration {
@@ -228,7 +304,7 @@ mod tests {
         for _ in 0..30 {
             a.observe(OpKind::Unlink, ms(20));
         }
-        assert!(a.tick());
+        assert_eq!(a.tick(), Verdict::Halved);
         assert_eq!(a.rate(), before / 2.0);
     }
 
@@ -239,22 +315,28 @@ mod tests {
         for _ in 0..30 {
             a.observe(OpKind::Stat, ms(1));
         }
-        assert!(!a.tick(), "1ms is below the floor even at 100x baseline");
+        assert_eq!(
+            a.tick(),
+            Verdict::Increased,
+            "1ms is below the floor even at 100x baseline"
+        );
     }
 
     #[test]
     fn any_op_kind_can_trigger_backoff() {
         let mut a = Aimd::new(None);
         for _ in 0..5 {
-            a.observe(OpKind::Unlink, ms(3));
-            a.observe(OpKind::Readdir, ms(4));
+            for _ in 0..10 {
+                a.observe(OpKind::Unlink, ms(3));
+                a.observe(OpKind::Readdir, ms(4));
+            }
             a.tick();
         }
         for _ in 0..30 {
             a.observe(OpKind::Readdir, ms(50));
+            a.observe(OpKind::Unlink, ms(3));
         }
-        a.observe(OpKind::Unlink, ms(3));
-        assert!(a.tick());
+        assert_eq!(a.tick(), Verdict::Halved);
     }
 
     #[test]
@@ -281,12 +363,81 @@ mod tests {
     }
 
     #[test]
-    fn ticks_without_samples_do_not_count_as_congestion() {
+    fn ticks_without_enough_samples_neither_cut_nor_grow() {
         let mut a = Aimd::new(None);
         steady(&mut a, OpKind::Unlink, ms(3), 3);
         let before = a.rate();
-        assert!(!a.tick());
-        assert_eq!(a.rate(), before + ADDITIVE_STEP);
+        assert_eq!(a.tick(), Verdict::Held, "idle");
+        for _ in 0..4 {
+            a.observe(OpKind::Unlink, ms(500));
+        }
+        assert_eq!(a.tick(), Verdict::Held, "4 slow samples are not a signal");
+        assert_eq!(a.rate(), before);
+    }
+
+    #[test]
+    fn halves_once_then_waits_for_samples_at_the_new_rate() {
+        let mut a = Aimd::new(None);
+        steady(&mut a, OpKind::Unlink, ms(3), 5);
+        let before = a.rate();
+        steady(&mut a, OpKind::Unlink, ms(30), 1);
+        assert_eq!(a.rate(), before / 2.0);
+        for _ in 0..SETTLE_TICKS {
+            for _ in 0..10 {
+                a.observe(OpKind::Unlink, ms(30));
+            }
+            assert_eq!(a.tick(), Verdict::Held);
+        }
+        assert_eq!(a.rate(), before / 2.0, "one cut for one congestion event");
+    }
+
+    #[test]
+    fn latency_that_does_not_respond_restores_the_rate_and_moves_the_baseline() {
+        let mut a = Aimd::new(None);
+        steady(&mut a, OpKind::Unlink, ms(3), 5);
+        let before = a.rate();
+        // The filesystem slows down for everyone and stays slow.
+        steady(&mut a, OpKind::Unlink, ms(20), 1 + SETTLE_TICKS as usize);
+        for _ in 0..10 {
+            a.observe(OpKind::Unlink, ms(20));
+        }
+        assert_eq!(a.tick(), Verdict::Reanchored);
+        assert_eq!(a.rate(), before, "the cut did not help, so it is undone");
+        for _ in 0..10 {
+            a.observe(OpKind::Unlink, ms(21));
+        }
+        assert_eq!(a.tick(), Verdict::Increased, "20ms is the new normal");
+    }
+
+    #[test]
+    fn latency_that_responds_keeps_backing_off() {
+        let mut a = Aimd::new(None);
+        steady(&mut a, OpKind::Unlink, ms(3), 5);
+        let before = a.rate();
+        steady(&mut a, OpKind::Unlink, ms(40), 1 + SETTLE_TICKS as usize);
+        for _ in 0..10 {
+            a.observe(OpKind::Unlink, ms(20));
+        }
+        assert_eq!(
+            a.tick(),
+            Verdict::Halved,
+            "halving the rate halved latency, so the load was ours"
+        );
+        assert_eq!(a.rate(), before / 4.0);
+    }
+
+    #[test]
+    fn a_long_external_slowdown_costs_one_cut_at_most() {
+        let mut a = Aimd::new(None);
+        steady(&mut a, OpKind::Unlink, ms(3), 10);
+        let before = a.rate();
+        let mut lowest = before;
+        for _ in 0..300 {
+            steady(&mut a, OpKind::Unlink, ms(25), 1);
+            lowest = lowest.min(a.rate());
+        }
+        assert_eq!(lowest, before / 2.0, "5 minutes at 25ms");
+        assert!(a.rate() > before);
     }
 
     #[test]
