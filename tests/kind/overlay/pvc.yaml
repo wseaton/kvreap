@@ -1,0 +1,27 @@
+# A 1 GiB tmpfs that e2e.sh mounts in the kind node, so statvfs reports the
+# volume's real size as it does on a provisioned PVC.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kvreap-e2e-kv-cache
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: /kv-e2e
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: e2e-kv-cache
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: kvreap-e2e-kv-cache
+  resources:
+    requests:
+      storage: 1Gi
