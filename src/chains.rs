@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::ChainPolicy;
@@ -82,7 +82,7 @@ struct Node {
     gone: bool,
     generation: u64,
     /// Full block hash, which names the block's file.
-    digest: Option<Box<[u8]>>,
+    digest: Option<Arc<[u8]>>,
     /// When the block was last marked on disk.
     stored_at: Option<Instant>,
 }
@@ -104,11 +104,61 @@ pub struct LeafEdge {
     pub newest_store: Option<Instant>,
 }
 
-/// A block below a subtree root, with the file name of its digest if known.
+/// A block below a subtree root, with its digest if known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Descendant {
     pub hash: BlockHash,
-    pub file_name: Option<String>,
+    pub digest: Option<Arc<[u8]>>,
+}
+
+impl Descendant {
+    /// `<hex digest>.bin`, the block's file name.
+    pub fn file_name(&self) -> Option<String> {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = self.digest.as_deref()?;
+        let mut name = String::with_capacity(digest.len() * 2 + 4);
+        for b in digest {
+            name.push(char::from(HEX[usize::from(b >> 4)]));
+            name.push(char::from(HEX[usize::from(b & 0xf)]));
+        }
+        name.push_str(".bin");
+        Some(name)
+    }
+}
+
+/// Where radix eviction ranks a block, first to go first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RadixKey {
+    Dead,
+    /// Not on disk in the index, or its edge is longer than the walk budget.
+    Untracked,
+    /// On a leaf edge whose newest block was marked on disk at this instant.
+    Edge(Option<Instant>),
+}
+
+/// A block one worker is deleting from; released on drop.
+#[derive(Debug)]
+pub struct Claim<'a> {
+    chains: &'a Chains,
+    hash: BlockHash,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.chains
+            .claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.hash);
+    }
+}
+
+/// What became of a block kvreap went to delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gone {
+    Deleted,
+    /// Its file was already gone.
+    Vanished,
 }
 
 /// Bounded `block -> parent` map with on-disk child counts. When over `cap`,
@@ -245,12 +295,54 @@ impl ChainIndex {
     }
 
     fn descendant(&self, hash: BlockHash) -> Descendant {
-        let file_name = self
-            .nodes
-            .get(&hash)
-            .and_then(|n| n.digest.as_deref())
-            .map(|d| d.iter().map(|b| format!("{b:02x}")).collect::<String>() + ".bin");
-        Descendant { hash, file_name }
+        let digest = self.nodes.get(&hash).and_then(|n| n.digest.clone());
+        Descendant { hash, digest }
+    }
+
+    /// Visits the leaf edge `hash` maps to from its leaf up to its top;
+    /// `false` when `hash` is not on disk or the walk exceeds `budget`.
+    fn walk_edge(&self, hash: BlockHash, budget: usize, mut visit: impl FnMut(BlockHash)) -> bool {
+        if !self.on_disk(hash) {
+            return false;
+        }
+        let mut leaf = hash;
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            if steps > budget {
+                return false;
+            }
+            let oldest_child = self
+                .on_disk_children(leaf)
+                .min_by_key(|c| self.nodes.get(c).and_then(|n| n.stored_at));
+            match oldest_child {
+                Some(c) => leaf = c,
+                None => break,
+            }
+        }
+        visit(leaf);
+        let (mut top, mut len) = (leaf, 1);
+        while let Some(p) = self.nodes.get(&top).and_then(|n| n.parent) {
+            let single = self.on_disk(p) && self.on_disk_children(p).take(2).count() == 1;
+            if !single || len >= budget {
+                break;
+            }
+            visit(p);
+            top = p;
+            len += 1;
+        }
+        true
+    }
+
+    /// The newest on-disk mark on the leaf edge `hash` maps to, without
+    /// building the edge.
+    pub fn edge_newest(&self, hash: BlockHash, budget: usize) -> Option<Option<Instant>> {
+        let mut newest = None;
+        let walked = self.walk_edge(hash, budget, |b| {
+            let stored = self.nodes.get(&b).and_then(|n| n.stored_at);
+            newest = newest.max(stored);
+        });
+        walked.then_some(newest)
     }
 
     /// The leaf edge `hash` maps to: its own edge when nothing forks below
@@ -262,39 +354,16 @@ impl ChainIndex {
     ///              └── b1            hash = s0  → edge [b1] (if b1 is older)
     /// ```
     pub fn leaf_edge(&self, hash: BlockHash, budget: usize) -> Option<LeafEdge> {
-        if !self.on_disk(hash) {
+        let mut blocks = Vec::new();
+        let mut newest_store = None;
+        let walked = self.walk_edge(hash, budget, |b| {
+            newest_store = newest_store.max(self.nodes.get(&b).and_then(|n| n.stored_at));
+            blocks.push(self.descendant(b));
+        });
+        if !walked {
             return None;
         }
-        let mut leaf = hash;
-        let mut steps = 0;
-        loop {
-            steps += 1;
-            if steps > budget {
-                return None;
-            }
-            let oldest_child = self
-                .on_disk_children(leaf)
-                .min_by_key(|c| self.nodes.get(c).and_then(|n| n.stored_at));
-            match oldest_child {
-                Some(c) => leaf = c,
-                None => break,
-            }
-        }
-        let mut blocks = vec![self.descendant(leaf)];
-        let mut top = leaf;
-        while let Some(p) = self.nodes.get(&top).and_then(|n| n.parent) {
-            let single = self.on_disk(p) && self.on_disk_children(p).take(2).count() == 1;
-            if !single || blocks.len() >= budget {
-                break;
-            }
-            blocks.push(self.descendant(p));
-            top = p;
-        }
         blocks.reverse();
-        let newest_store = blocks
-            .iter()
-            .filter_map(|b| self.nodes.get(&b.hash).and_then(|n| n.stored_at))
-            .max();
         Some(LeafEdge {
             blocks,
             newest_store,
@@ -421,6 +490,8 @@ pub struct ChainStats {
     pub events_lost: AtomicU64,
     /// Blocks the index had on disk whose files were already gone when kvreap went to delete them.
     pub vanished: AtomicU64,
+    /// Edges or subtrees skipped because another worker was deleting them.
+    pub claim_conflicts: AtomicU64,
     pub events_lock: LockStats,
     pub worker_lock: LockStats,
     /// Most batches waiting in the subscriber's queue since the last status line.
@@ -495,6 +566,8 @@ impl<G> Drop for Held<'_, G> {
 #[derive(Debug)]
 pub struct Chains {
     index: RwLock<ChainIndex>,
+    /// Leaves of the edges and roots of the subtrees workers are deleting.
+    claims: Mutex<HashSet<BlockHash>>,
     pub policy: ChainPolicy,
     pub max_deferrals: u32,
     /// When set, only `BlockStored` events of this medium mark blocks on
@@ -512,6 +585,7 @@ impl Chains {
     ) -> Self {
         Self {
             index: RwLock::new(ChainIndex::new(cap)),
+            claims: Mutex::default(),
             policy,
             max_deferrals,
             disk_medium,
@@ -566,22 +640,64 @@ impl Chains {
         self.index().on_disk(hash)
     }
 
+    /// Reserves `hash` for one worker until the claim drops; `None` while
+    /// another worker holds it.
+    pub fn claim(&self, hash: BlockHash) -> Option<Claim<'_>> {
+        let mut claims = self.claims.lock().unwrap_or_else(PoisonError::into_inner);
+        if claims.insert(hash) {
+            Some(Claim { chains: self, hash })
+        } else {
+            Stats::add(&self.stats.claim_conflicts, 1);
+            None
+        }
+    }
+
+    pub fn radix_key(&self, hash: BlockHash) -> RadixKey {
+        let index = self.index();
+        if index.rank(hash, 0, self.max_deferrals) == Rank::Dead {
+            return RadixKey::Dead;
+        }
+        match index.edge_newest(hash, SUBTREE_BUDGET) {
+            Some(newest) => RadixKey::Edge(newest),
+            None => RadixKey::Untracked,
+        }
+    }
+
     /// Drops a block whose file is gone although kvreap did not delete it.
     pub fn vanished(&self, hash: BlockHash) {
-        if self.write(&self.stats.worker_lock).remove(hash) != Position::Untracked {
-            Stats::add(&self.stats.vanished, 1);
-        }
+        self.record(&[(hash, Gone::Vanished)]);
     }
 
     /// Records a deletion by kvreap and counts its chain position.
     pub fn deleted(&self, hash: BlockHash) -> Position {
-        let position = self.write(&self.stats.worker_lock).remove(hash);
-        let counter = match position {
-            Position::Untracked => &self.stats.deleted_untracked,
-            Position::Root => &self.stats.deleted_root,
-            Position::Orphan => &self.stats.deleted_orphan,
-            Position::Internal => &self.stats.deleted_internal,
-            Position::Leaf => &self.stats.deleted_leaf,
+        self.note(
+            &mut self.write(&self.stats.worker_lock),
+            hash,
+            Gone::Deleted,
+        )
+    }
+
+    /// Records blocks kvreap deleted or found gone, in order, under one lock.
+    pub fn record(&self, gone: &[(BlockHash, Gone)]) {
+        if gone.is_empty() {
+            return;
+        }
+        let mut index = self.write(&self.stats.worker_lock);
+        for &(hash, what) in gone {
+            self.note(&mut index, hash, what);
+        }
+    }
+
+    fn note(&self, index: &mut ChainIndex, hash: BlockHash, what: Gone) -> Position {
+        let position = index.remove(hash);
+        let counter = match (what, position) {
+            (Gone::Vanished, Position::Untracked) => return position,
+            (Gone::Vanished, _) => &self.stats.vanished,
+            (Gone::Deleted, Position::Untracked) => &self.stats.deleted_untracked,
+            (Gone::Deleted, Position::Root) => &self.stats.deleted_root,
+            (Gone::Deleted, Position::Orphan) => &self.stats.deleted_orphan,
+            (Gone::Deleted, Position::Internal) => &self.stats.deleted_internal,
+            (Gone::Deleted, Position::Leaf) => &self.stats.deleted_leaf,
         };
         Stats::add(counter, 1);
         position
@@ -653,6 +769,7 @@ impl Chains {
             replay_failures = Stats::get(&s.replay_failures),
             events_lost = Stats::get(&s.events_lost),
             vanished = Stats::get(&s.vanished),
+            claim_conflicts = Stats::get(&s.claim_conflicts),
             events_lock_wait_ms = Stats::get(&s.events_lock.wait_us) / 1000,
             events_lock_max_wait_us = s.events_lock.max_wait_us.swap(0, Ordering::Relaxed),
             events_lock_hold_ms = Stats::get(&s.events_lock.hold_us) / 1000,
@@ -1652,7 +1769,7 @@ mod tests {
             below.iter().map(|d| d.hash.0).collect::<Vec<_>>(),
             vec![2, 3, 4, 5]
         );
-        assert_eq!(below[0].file_name.as_deref(), Some("ab02.bin"));
+        assert_eq!(below[0].file_name().as_deref(), Some("ab02.bin"));
         assert_eq!(ix.descendants(h(1), 2).len(), 2);
         assert!(ix.descendants(h(6), 100).is_empty());
 
@@ -1687,7 +1804,7 @@ mod tests {
             "a shared prefix maps to its oldest continuation, never to itself"
         );
         let edge = ix.leaf_edge(h(7), 100).expect("edge");
-        assert_eq!(edge.blocks[0].file_name.as_deref(), Some("05.bin"));
+        assert_eq!(edge.blocks[0].file_name().as_deref(), Some("05.bin"));
         assert_eq!(
             edge.newest_store,
             ix.nodes.get(&h(7)).and_then(|n| n.stored_at)
@@ -2232,5 +2349,103 @@ mod tests {
             write_wait >= 30_000,
             "the writer waited only {write_wait}us"
         );
+    }
+
+    #[test]
+    fn edge_newest_agrees_with_the_built_edge_everywhere() {
+        //   1 ── 2 ──┬── 3 ── 4
+        //            └── 5 ── 6 ── 7
+        let mut ix = ChainIndex::new(100);
+        ix.store(None, &[h(1), h(2), h(3), h(4)], true);
+        std::thread::sleep(Duration::from_millis(5));
+        ix.store(Some(h(2)), &[h(5), h(6), h(7)], true);
+        for n in 1..=7 {
+            assert_eq!(
+                ix.edge_newest(h(n), 100),
+                ix.leaf_edge(h(n), 100).map(|e| e.newest_store),
+                "block {n}"
+            );
+        }
+        assert_eq!(ix.edge_newest(h(99), 100), None);
+        assert_eq!(ix.edge_newest(h(1), 2), None, "budget");
+    }
+
+    #[test]
+    fn file_names_are_lowercase_hex_digests() {
+        use crate::chains::Descendant;
+
+        let d = Descendant {
+            hash: h(1),
+            digest: Some(Arc::from(&[0x00, 0x0f, 0xa0, 0xff][..])),
+        };
+        assert_eq!(d.file_name().as_deref(), Some("000fa0ff.bin"));
+        assert_eq!(
+            Descendant {
+                hash: h(1),
+                digest: None
+            }
+            .file_name(),
+            None
+        );
+        let full: Vec<u8> = (0..32).collect();
+        let name: String = full.iter().map(|b| format!("{b:02x}")).collect::<String>() + ".bin";
+        let d = Descendant {
+            hash: h(1),
+            digest: Some(Arc::from(full.as_slice())),
+        };
+        assert_eq!(d.file_name(), Some(name));
+    }
+
+    #[test]
+    fn radix_key_orders_dead_untracked_then_edges_by_newest_write() {
+        use crate::chains::RadixKey;
+
+        let chains = Chains::new(100, ChainPolicy::Radix, 2, None);
+        chains.apply(&[stored(None, &[1, 2], "STORAGE")]);
+        std::thread::sleep(Duration::from_millis(5));
+        chains.apply(&[stored(None, &[3, 4], "STORAGE")]);
+        let (old, new) = (chains.radix_key(h(1)), chains.radix_key(h(3)));
+        assert!(matches!(old, RadixKey::Edge(Some(_))));
+        assert!(old < new, "the edge written first goes first");
+        assert_eq!(chains.radix_key(h(99)), RadixKey::Untracked);
+        chains.deleted(h(1));
+        assert_eq!(chains.radix_key(h(2)), RadixKey::Dead);
+        assert!(RadixKey::Dead < RadixKey::Untracked && RadixKey::Untracked < old);
+    }
+
+    #[test]
+    fn record_applies_a_batch_in_order_under_one_lock() {
+        use crate::chains::Gone;
+
+        let chains = Chains::new(100, ChainPolicy::Radix, 2, None);
+        chains.apply(&[stored(None, &[1, 2, 3], "STORAGE")]);
+        let before = Stats::get(&chains.stats.worker_lock.acquisitions);
+        chains.record(&[
+            (h(3), Gone::Deleted),
+            (h(2), Gone::Vanished),
+            (h(1), Gone::Deleted),
+            (h(9), Gone::Vanished),
+        ]);
+        assert_eq!(
+            Stats::get(&chains.stats.worker_lock.acquisitions),
+            before + 1
+        );
+        let s = &chains.stats;
+        assert_eq!(Stats::get(&s.deleted_leaf), 1, "3 went while 2 was on disk");
+        assert_eq!(Stats::get(&s.vanished), 1, "9 was never tracked");
+        assert_eq!(Stats::get(&s.deleted_root), 1);
+        assert_eq!(Stats::get(&s.deleted_internal), 0);
+        assert!(!chains.on_disk(h(1)) && !chains.on_disk(h(2)) && !chains.on_disk(h(3)));
+    }
+
+    #[test]
+    fn one_worker_at_a_time_claims_an_edge() {
+        let chains = Chains::new(100, ChainPolicy::Radix, 2, None);
+        let first = chains.claim(h(7)).expect("free");
+        assert!(chains.claim(h(7)).is_none(), "held by the first worker");
+        assert!(chains.claim(h(8)).is_some(), "other edges are independent");
+        drop(first);
+        assert!(chains.claim(h(7)).is_some(), "released on drop");
+        assert_eq!(Stats::get(&chains.stats.claim_conflicts), 1);
     }
 }

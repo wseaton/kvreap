@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::budget::{Budget, OpKind};
 use crate::capacity::{BucketSample, Samples};
-use crate::chains::{Chains, LeafEdge, Rank};
+use crate::chains::{Chains, Claim, Gone, LeafEdge, RadixKey, Rank};
 use crate::config::ChainPolicy;
 use crate::config::Config;
 use crate::controller::{Mode, SharedState};
@@ -94,25 +94,13 @@ impl Named {
     }
 }
 
-/// Radix eviction order of a candidate, first to go first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum RadixKey {
-    Dead,
-    Untracked,
-    /// On a leaf edge whose newest block was written at this instant.
-    Edge(Option<Instant>),
-}
-
-impl RadixKey {
-    fn of(chains: &Chains, c: &Candidate) -> Self {
-        if chains.rank(c.hash, 0) == Rank::Dead {
-            return Self::Dead;
-        }
-        match chains.leaf_edge(c.hash) {
-            Some(edge) => Self::Edge(edge.newest_store),
-            None => Self::Untracked,
-        }
-    }
+/// `hash`'s leaf edge, reserved for this worker: the edge is read again
+/// after claiming its leaf, so it is not one another worker just finished.
+fn claim_edge(chains: &Chains, hash: BlockHash) -> Option<(LeafEdge, Claim<'_>)> {
+    let leaf = chains.leaf_edge(hash)?.blocks.last()?.hash;
+    let claim = chains.claim(leaf)?;
+    let edge = chains.leaf_edge(hash)?;
+    (edge.blocks.last()?.hash == leaf).then_some((edge, claim))
 }
 
 /// Cold files ordered by atime, capped at `cap` by evicting the youngest.
@@ -499,6 +487,9 @@ impl Worker {
     /// its model. Returns files removed.
     fn delete_subtree(&mut self, root: Candidate, chains: &Chains) -> usize {
         let (hash, size, rank) = (root.hash, root.size, Arc::clone(&root.rank));
+        let Some(_claim) = chains.claim(hash) else {
+            return 0;
+        };
         let group = leaf_group(&root.path);
         let name = root
             .path
@@ -516,11 +507,12 @@ impl Worker {
         removed += self
             .remove_named(&siblings, &name, &group, hash, size)
             .deleted;
+        let mut gone = Vec::new();
         for d in chains.descendants(hash) {
             if !self.ctx.shared.should_delete() || self.ctx.shutdown.is_set() {
                 break;
             }
-            let Some(name) = d.file_name else {
+            let Some(name) = d.file_name() else {
                 continue;
             };
             let named = self.remove_named(
@@ -532,12 +524,13 @@ impl Worker {
             );
             if named.deleted > 0 {
                 removed += named.deleted;
-                chains.deleted(d.hash);
+                gone.push((d.hash, Gone::Deleted));
                 Stats::add(&chains.stats.cascaded, 1);
             } else if named.vanished() {
-                chains.vanished(d.hash);
+                gone.push((d.hash, Gone::Vanished));
             }
         }
+        chains.record(&gone);
         removed
     }
 
@@ -578,7 +571,7 @@ impl Worker {
     fn evict_radix(&mut self, quota: usize, chains: &Chains) -> usize {
         let mut window: Vec<(RadixKey, Candidate)> = std::iter::from_fn(|| self.pool.pop_oldest())
             .take(quota.saturating_mul(CHAIN_WINDOW))
-            .map(|c| (RadixKey::of(chains, &c), c))
+            .map(|c| (chains.radix_key(c.hash), c))
             .collect();
         window.sort_by_key(|(key, _)| *key);
         let mut window = window.into_iter();
@@ -588,7 +581,7 @@ impl Worker {
             let Some((key, c)) = window.next() else {
                 break;
             };
-            match (key, RadixKey::of(chains, &c)) {
+            match (key, chains.radix_key(c.hash)) {
                 (_, RadixKey::Dead) => evicted += self.delete_subtree(c, chains),
                 (_, RadixKey::Untracked) => {
                     if self.evict_one(c) {
@@ -600,7 +593,7 @@ impl Worker {
                     Stats::add(&chains.stats.young_edges, 1);
                 }
                 (_, RadixKey::Edge(newest)) => {
-                    let Some(edge) = chains.leaf_edge(c.hash) else {
+                    let Some((edge, _claim)) = claim_edge(chains, c.hash) else {
                         held.push(c);
                         continue;
                     };
@@ -658,11 +651,11 @@ impl Worker {
             .and_then(|n| n.to_str())
             .map(str::to_owned);
         let (mut files, mut candidate_gone) = (0, false);
+        let mut gone = Vec::new();
         for b in edge.blocks.iter().rev() {
             let is_candidate = b.hash == c.hash;
             let Some(name) = b
-                .file_name
-                .clone()
+                .file_name()
                 .or_else(|| own_name.clone().filter(|_| is_candidate))
             else {
                 break;
@@ -670,19 +663,20 @@ impl Worker {
             let named = self.remove_named(&ranks, &name, &group, b.hash, c.size);
             if named.deleted > 0 {
                 files += named.deleted;
-                chains.deleted(b.hash);
+                gone.push((b.hash, Gone::Deleted));
                 if is_candidate {
                     candidate_gone = true;
                 } else {
                     Stats::add(&chains.stats.cascaded, 1);
                 }
             } else if named.vanished() {
-                chains.vanished(b.hash);
+                gone.push((b.hash, Gone::Vanished));
                 candidate_gone |= is_candidate;
             } else if chains.on_disk(b.hash) {
                 break;
             }
         }
+        chains.record(&gone);
         (files, candidate_gone)
     }
 
