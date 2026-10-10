@@ -522,7 +522,6 @@ impl KvEventsPublisher {
                 let mut seq = 0u64;
                 while let Some((payload, times)) = batch_rx.recv().await {
                     for _ in 0..times {
-                        seq += 1;
                         let frames = vec![
                             bytes::Bytes::new(),
                             bytes::Bytes::copy_from_slice(&seq.to_be_bytes()),
@@ -532,6 +531,7 @@ impl KvEventsPublisher {
                             .send(ZmqMessage::try_from(frames).expect("frames"))
                             .await
                             .expect("publish");
+                        seq += 1;
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                     done_tx.send(()).expect("done");
@@ -666,6 +666,157 @@ fn radix_eviction_deletes_the_announced_chain_as_one_edge_from_the_leaf() {
     assert_eq!(counter(&line, "deleted_root"), 1, "{line}");
     assert_eq!(counter(&line, "deleted_orphan"), 0, "{line}");
     assert_eq!(counter(&line, "cascaded"), 39, "{line}");
+}
+
+#[test]
+fn radix_eviction_takes_the_least_recently_written_edge_first_whatever_the_atimes() {
+    const LEN: u64 = 20;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(tmp.path());
+    let staging = Cache::new(&tmp.path().join("staging"));
+    let chain = |base: u64| -> Vec<u64> { (0..LEN).map(|i| base + i).collect() };
+    let (stale, active) = (chain(0xa1a2_0000_0000_0000), chain(0xa1a1_0000_0000_0000));
+    // The active session's files are the oldest by atime, as a long session's first turns are.
+    for (i, &h) in active.iter().enumerate() {
+        staging.write_block(h, 64, Some(COLD_AGE * 2 + Duration::from_secs(i as u64)));
+    }
+    for (i, &h) in stale.iter().enumerate() {
+        staging.write_block(h, 64, Some(COLD_AGE + Duration::from_secs(i as u64)));
+    }
+    let blocks = |chain: &[u64]| -> Vec<Block> {
+        chain
+            .iter()
+            .map(|&hash| Block {
+                hash,
+                path: cache.block_path(hash),
+            })
+            .collect()
+    };
+    let (stale_blocks, active_blocks) = (blocks(&stale), blocks(&active));
+
+    let publisher = KvEventsPublisher::bind();
+    let mut env = always_evicting();
+    env.push(("KV_EVENTS_ENDPOINTS", publisher.endpoint.clone()));
+    env.push(("CHAIN_EVICTION", "radix".into()));
+    env.push(("FILE_ACCESS_TIME_THRESHOLD_MINUTES", "0".into()));
+    env.push(("NUM_CRAWLER_PROCESSES", "1".into()));
+    env.push(("DELETION_MAX_FILES_PER_SECOND", "10".into()));
+    let mut ev = Evictor::start(tmp.path(), &env);
+    assert!(
+        ev.wait_for_log("subscribed to KV cache events", Duration::from_secs(10)),
+        "{}",
+        ev.log()
+    );
+    publisher.publish(block_stored_batch(&stale), 50);
+    std::thread::sleep(Duration::from_millis(1500));
+    publisher.publish(block_stored_batch(&active), 50);
+    fs::rename(staging.rank(), cache.rank()).expect("move chains into the cache");
+
+    let mut stale_left_when_active_cut = None;
+    assert!(
+        wait_until(Duration::from_secs(90), || {
+            if stale_left_when_active_cut.is_none() && existing(&active_blocks).len() < active.len()
+            {
+                stale_left_when_active_cut = Some(existing(&stale_blocks).len());
+            }
+            existing(&stale_blocks).is_empty() && existing(&active_blocks).is_empty()
+        }),
+        "{}",
+        ev.log()
+    );
+    assert!(ev.sigterm().success());
+    assert_eq!(
+        stale_left_when_active_cut,
+        Some(0),
+        "the edge written last went first\n{}",
+        ev.log()
+    );
+    let line = ev
+        .log()
+        .lines()
+        .rev()
+        .find(|l| l.contains(" chains "))
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("no chains status line\n{}", ev.log()));
+    assert_eq!(counter(&line, "deleted_internal"), 0, "{line}");
+    assert_eq!(counter(&line, "deleted_orphan"), 0, "{line}");
+}
+
+#[test]
+fn radix_eviction_keeps_its_order_in_the_emergency_band() {
+    const LEN: u64 = 20;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(tmp.path());
+    let staging = Cache::new(&tmp.path().join("staging"));
+    let chain = |base: u64| -> Vec<u64> { (0..LEN).map(|i| base + i).collect() };
+    let (stale, active) = (chain(0xa1a2_0000_0000_0000), chain(0xa1a1_0000_0000_0000));
+    // Root oldest, as a long session's first turn is.
+    for (i, &h) in active.iter().enumerate() {
+        staging.write_block(
+            h,
+            64,
+            Some(COLD_AGE * 2 + Duration::from_secs(LEN - i as u64)),
+        );
+    }
+    for (i, &h) in stale.iter().enumerate() {
+        staging.write_block(h, 64, Some(COLD_AGE + Duration::from_secs(i as u64)));
+    }
+    let blocks = |chain: &[u64]| -> Vec<Block> {
+        chain
+            .iter()
+            .map(|&hash| Block {
+                hash,
+                path: cache.block_path(hash),
+            })
+            .collect()
+    };
+    let (stale_blocks, active_blocks) = (blocks(&stale), blocks(&active));
+
+    let publisher = KvEventsPublisher::bind();
+    // 40 blocks of 64 bytes are 98.5% of 2600 bytes.
+    let env = vec![
+        ("CAPACITY_BYTES", "2600".to_string()),
+        ("CLEANUP_THRESHOLD", "90".into()),
+        ("TARGET_THRESHOLD", "60".into()),
+        ("DIR_CLEANUP_TTL_SECONDS", "0".into()),
+        ("KV_EVENTS_ENDPOINTS", publisher.endpoint.clone()),
+        ("CHAIN_EVICTION", "radix".into()),
+        ("NUM_CRAWLER_PROCESSES", "1".into()),
+    ];
+    let mut ev = Evictor::start(tmp.path(), &env);
+    assert!(
+        ev.wait_for_log("subscribed to KV cache events", Duration::from_secs(10)),
+        "{}",
+        ev.log()
+    );
+    publisher.publish(block_stored_batch(&stale), 50);
+    std::thread::sleep(Duration::from_millis(1500));
+    publisher.publish(block_stored_batch(&active), 50);
+    fs::rename(staging.rank(), cache.rank()).expect("move chains into the cache");
+
+    assert!(
+        wait_until(Duration::from_secs(150), || existing(&stale_blocks)
+            .is_empty()),
+        "{}",
+        ev.log()
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(ev.sigterm().success());
+    let log = ev.log();
+    assert!(log.contains("usage in emergency band"), "{log}");
+    let kept: Vec<bool> = active_blocks.iter().map(|b| b.path.exists()).collect();
+    assert!(
+        kept.windows(2).all(|w| w[0] || !w[1]),
+        "the active chain lost blocks above its leaf end: {kept:?}\n{log}"
+    );
+    let line = log
+        .lines()
+        .rev()
+        .find(|l| l.contains(" chains "))
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("no chains status line\n{log}"));
+    assert_eq!(counter(&line, "deleted_internal"), 0, "{line}");
+    assert_eq!(counter(&line, "deleted_orphan"), 0, "{line}");
 }
 
 #[test]

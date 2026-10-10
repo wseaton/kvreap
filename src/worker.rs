@@ -70,6 +70,27 @@ struct Candidate {
     deferrals: u32,
 }
 
+/// Radix eviction order of a candidate, first to go first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RadixKey {
+    Dead,
+    Untracked,
+    /// On a leaf edge whose newest block was written at this instant.
+    Edge(Option<Instant>),
+}
+
+impl RadixKey {
+    fn of(chains: &Chains, c: &Candidate) -> Self {
+        if chains.rank(c.hash, 0) == Rank::Dead {
+            return Self::Dead;
+        }
+        match chains.leaf_edge(c.hash) {
+            Some(edge) => Self::Edge(edge.newest_store),
+            None => Self::Untracked,
+        }
+    }
+}
+
 /// Cold files ordered by atime, capped at `cap` by evicting the youngest.
 #[derive(Debug)]
 struct Pool {
@@ -116,6 +137,10 @@ impl Pool {
     fn clear(&mut self) {
         self.by_age.clear();
         self.keys.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_age.is_empty()
     }
 }
 
@@ -414,7 +439,11 @@ impl Worker {
         self.ctx
             .chains
             .as_ref()
-            .filter(|c| c.policy != ChainPolicy::Observe && !self.unpaced())
+            .filter(|c| match c.policy {
+                ChainPolicy::Observe => false,
+                ChainPolicy::Radix => true,
+                ChainPolicy::TailFirst | ChainPolicy::Subtree => !self.unpaced(),
+            })
             .cloned()
     }
 
@@ -511,68 +540,71 @@ impl Worker {
     /// shared prefix, the oldest edge below it), deleted leaf first. Edges
     /// with a block younger than the hot threshold wait; if the round still
     /// falls short, the least recently written of them go anyway.
+    /// Dead blocks first, then blocks the index does not know, then leaf
+    /// edges by their newest write, oldest first. Edges written within the
+    /// hot threshold are dropped from the pool so the sampler brings in
+    /// others, and only go when the pool has nothing else or usage is in the
+    /// emergency band.
     fn evict_radix(&mut self, quota: usize, chains: &Chains) -> usize {
-        let mut window: Vec<Candidate> = std::iter::from_fn(|| self.pool.pop_oldest())
+        let mut window: Vec<(RadixKey, Candidate)> = std::iter::from_fn(|| self.pool.pop_oldest())
             .take(quota.saturating_mul(CHAIN_WINDOW))
+            .map(|c| (RadixKey::of(chains, &c), c))
             .collect();
+        window.sort_by_key(|(key, _)| *key);
+        let mut window = window.into_iter();
         let mut held = Vec::new();
-        let mut young: Vec<(Option<Instant>, Candidate)> = Vec::new();
         let mut evicted = 0;
         while evicted < quota && self.evicting() {
-            if window.is_empty() {
+            let Some((key, c)) = window.next() else {
                 break;
-            }
-            let dead = window
-                .iter()
-                .position(|c| chains.rank(c.hash, 0) == Rank::Dead);
-            let c = window.remove(dead.unwrap_or(0));
-            if dead.is_some() {
-                evicted += self.delete_subtree(c, chains);
-                continue;
-            }
-            let Some(edge) = chains.leaf_edge(c.hash) else {
-                if self.evict_one(c) {
-                    evicted += 1;
+            };
+            match (key, RadixKey::of(chains, &c)) {
+                (_, RadixKey::Dead) => evicted += self.delete_subtree(c, chains),
+                (_, RadixKey::Untracked) => {
+                    if self.evict_one(c) {
+                        evicted += 1;
+                    }
                 }
-                continue;
-            };
-            if edge
-                .newest_store
-                .is_some_and(|t| t.elapsed() < self.ctx.config.hot_threshold)
-            {
-                Stats::add(&chains.stats.young_edges, 1);
-                young.push((edge.newest_store, c));
-                continue;
-            }
-            let (files, candidate_gone) = self.delete_edge(&c, &edge, chains);
-            evicted += files;
-            if !candidate_gone {
-                held.push(c);
-            }
-        }
-        young.sort_by_key(|(newest, _)| *newest);
-        let mut young = young.into_iter().map(|(_, c)| c);
-        while evicted < quota && self.evicting() {
-            let Some(c) = young.next() else {
-                break;
-            };
-            let Some(edge) = chains.leaf_edge(c.hash) else {
-                held.push(c);
-                continue;
-            };
-            let (files, candidate_gone) = self.delete_edge(&c, &edge, chains);
-            if files > 0 {
-                Stats::add(&chains.stats.young_fallbacks, 1);
-            }
-            evicted += files;
-            if !candidate_gone {
-                held.push(c);
+                (RadixKey::Edge(planned), RadixKey::Edge(now)) if now > planned => held.push(c),
+                (_, RadixKey::Edge(newest)) if self.holds_back(newest) => {
+                    Stats::add(&chains.stats.young_edges, 1);
+                }
+                (_, RadixKey::Edge(newest)) => {
+                    let Some(edge) = chains.leaf_edge(c.hash) else {
+                        held.push(c);
+                        continue;
+                    };
+                    let (files, candidate_gone) = self.delete_edge(&c, &edge, chains);
+                    if files > 0 && self.young(newest) {
+                        Stats::add(&chains.stats.young_fallbacks, 1);
+                    }
+                    evicted += files;
+                    if !candidate_gone {
+                        held.push(c);
+                    }
+                }
             }
         }
-        for c in window.into_iter().chain(held).chain(young) {
+        for (key, c) in window {
+            match key {
+                RadixKey::Edge(newest) if self.holds_back(newest) => {
+                    Stats::add(&chains.stats.young_edges, 1);
+                }
+                _ => self.pool.insert(c),
+            }
+        }
+        for c in held {
             self.pool.insert(c);
         }
         evicted
+    }
+
+    fn young(&self, newest_store: Option<Instant>) -> bool {
+        newest_store.is_some_and(|t| t.elapsed() < self.ctx.config.hot_threshold)
+    }
+
+    fn holds_back(&self, newest_store: Option<Instant>) -> bool {
+        self.young(newest_store) && !self.unpaced() && !self.pool.is_empty()
     }
 
     fn evicting(&self) -> bool {
@@ -603,9 +635,12 @@ impl Worker {
                 .clone()
                 .or_else(|| own_name.clone().filter(|_| is_candidate))
             else {
-                continue;
+                break;
             };
             let removed = self.remove_named(&ranks, &name, &group, b.hash, c.size);
+            if removed == 0 && chains.on_disk(b.hash) {
+                break;
+            }
             if removed > 0 {
                 files += removed;
                 chains.deleted(b.hash);
@@ -1589,7 +1624,11 @@ mod tests {
             "all edges are young, so the least recently written go first"
         );
         let s = &chains(&h).stats;
-        assert!(Stats::get(&s.young_edges) > 0);
+        assert_eq!(
+            Stats::get(&s.young_edges),
+            0,
+            "nothing else was sampled, so none is held back"
+        );
         assert_eq!(Stats::get(&s.young_fallbacks), 2);
     }
 
