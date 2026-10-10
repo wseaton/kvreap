@@ -20,8 +20,11 @@ kubectl kustomize deploy/kserve/example
 - `spec.kvCacheOffloading.secondary[0].fileSystem.pvc.ref` naming an RWX PVC.
   kvreap mounts the same PVC; set `data.pvc` in your `kvreap-target` ConfigMap
   to that name. If the ref sets a `path`, set kvreap's `CACHE_DIRECTORY` to it.
+- kvreap runs as uid/gid 1000 with `fsGroup: 1000`; change these to the uid
+  vLLM writes the cache with, or kvreap cannot unlink in its directories.
 - `spec.baseRefs: [{name: kv-offloading-kvreap}]`. The preset makes vLLM bind
-  its KV events PUB socket on 5557 (`tcp://*:5557`), send full block hashes
+  its KV events PUB socket on 5557 (`tcp://*:5557`) and replay socket on 5558,
+  send full block hashes
   (`VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`), and turn on the fs tier's own
   `STORAGE` events. It replaces the `--kv-transfer-config` KServe renders from
   `kvCacheOffloading`, because the rendered one has no `enable_kv_events`;
@@ -43,13 +46,21 @@ resolves it every 15 s and keeps one SUB socket per pod address, so pods that
 restart or scale are picked up without a restart. Comma-separate entries to
 follow several services.
 
+Each SUB socket tracks the publisher's sequence numbers the way llm-d's router
+does. On connect, on a gap, on joining mid-stream and when vLLM restarts
+(sequence goes backwards), kvreap asks the pod's replay socket
+(`KV_EVENTS_REPLAY_PORT`, 5558) for everything it has not applied; vLLM keeps
+the last 10,000 batches. A failed replay backs off 30 s. The `chains` status
+line counts `gaps`, `resets`, `replays`, `replay_failures` and `events_lost`
+(batches gone from the buffer before kvreap could fetch them).
+
 ## Security
 
 BlockStored events carry prompt token ids. kvreap implements no ZMQ
 authentication (NULL mechanism, no crypto in the binary); run both sides in
 the mesh so the sidecars provide mTLS, keep the port named `tcp-kv-events` so
 the mesh treats it as opaque TCP, and apply the NetworkPolicy, which allows
-5557 only from kvreap and the EPP. The policy selects the workload pods for
+5557 and 5558 only from kvreap and the EPP. The policy selects the workload pods for
 Ingress, so it lists 8000 as open to all; add any other port your workload
 serves before applying it.
 

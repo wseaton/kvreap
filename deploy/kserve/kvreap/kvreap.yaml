@@ -20,6 +20,10 @@ spec:
       port: 5557
       targetPort: 5557
       protocol: TCP
+    - name: tcp-kv-replay
+      port: 5558
+      targetPort: 5558
+      protocol: TCP
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -42,8 +46,14 @@ spec:
         app.kubernetes.io/name: LLMISVC_NAME
         app.kubernetes.io/component: kvreap
     spec:
+      # Run as the uid vLLM writes the cache with (or share its group), so
+      # kvreap can unlink in the directories vLLM creates.
       securityContext:
         runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -62,6 +72,8 @@ spec:
               value: "2"
             - name: KV_EVENTS_ENDPOINTS
               value: tcp://LLMISVC_NAME-kv-events:5557
+            - name: KV_EVENTS_REPLAY_PORT
+              value: "5558"
             - name: KV_EVENTS_DISK_MEDIUM
               value: STORAGE
             - name: CHAIN_EVICTION
@@ -85,8 +97,8 @@ spec:
             claimName: KV_CACHE_PVC
 ---
 # Selecting the workload pods for Ingress denies every port not listed, so
-# vLLM's 8000 stays open to all and only 5557 is limited to kvreap and the
-# EPP: BlockStored carries prompt token ids. Add any other port the workload
+# vLLM's 8000 stays open to all and only 5557 and 5558 (replay) are limited
+# to kvreap and the EPP: BlockStored carries prompt token ids. Add any other port the workload
 # serves before applying.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -118,4 +130,6 @@ spec:
               app.kubernetes.io/component: llminferenceservice-router-scheduler
       ports:
         - port: 5557
+          protocol: TCP
+        - port: 5558
           protocol: TCP

@@ -264,16 +264,18 @@ fn start_chains(config: &Config, shutdown: &Arc<Shutdown>) -> anyhow::Result<Cha
         policy = ?config.chain_policy,
         max_deferrals = config.chain_max_deferrals,
         disk_medium = config.kv_events_disk_medium.as_deref().unwrap_or("any"),
+        replay_port = ?config.kv_events_replay_port,
         "building prefix-chain index from KV cache events"
     );
     let handle = {
-        let (endpoints, chains, shutdown) = (
+        let (endpoints, replay_port, chains, shutdown) = (
             config.kv_events_endpoints.clone(),
+            config.kv_events_replay_port,
             Arc::clone(&chains),
             Arc::clone(shutdown),
         );
         spawn("kv-events".into(), move || {
-            if let Err(e) = chains::subscribe(&endpoints, &chains, &shutdown) {
+            if let Err(e) = chains::subscribe(&endpoints, replay_port, &chains, &shutdown) {
                 tracing::warn!(error = %e, "KV events subscriber failed, chain index stays empty");
             }
         })?

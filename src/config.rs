@@ -171,6 +171,8 @@ pub struct Config {
     pub capacity_bytes: Option<CapacityBytes>,
     /// vLLM `--kv-events-config` PUB endpoints to build the prefix-chain index from.
     pub kv_events_endpoints: Vec<String>,
+    /// Port of each publisher's `replay_endpoint`, for fetching missed batches.
+    pub kv_events_replay_port: Option<u16>,
     pub chain_policy: ChainPolicy,
     pub chain_max_deferrals: u32,
     /// Only `BlockStored` events of this medium mark blocks on disk (vLLM fs tier: `STORAGE`).
@@ -298,6 +300,16 @@ impl Config {
                 .filter(|e| !e.is_empty())
                 .map(str::to_owned)
                 .collect(),
+            kv_events_replay_port: optional("KV_EVENTS_REPLAY_PORT")
+                .map(|raw| {
+                    raw.trim()
+                        .parse::<u16>()
+                        .map_err(|_| ConfigError::NotANumber {
+                            var: "KV_EVENTS_REPLAY_PORT",
+                            value: raw,
+                        })
+                })
+                .transpose()?,
             chain_policy: ChainPolicy::parse(&get("CHAIN_EVICTION", "tail-first"))?,
             chain_max_deferrals: u32::try_from(int("CHAIN_MAX_DEFERRALS", "8")?.max(0))
                 .unwrap_or(u32::MAX),
@@ -344,6 +356,7 @@ mod tests {
         assert_eq!(c.storage_events_endpoint, None);
         assert_eq!(c.capacity_bytes, None);
         assert!(c.kv_events_endpoints.is_empty());
+        assert_eq!(c.kv_events_replay_port, None);
         assert_eq!(c.chain_policy, ChainPolicy::TailFirst);
         assert_eq!(c.chain_max_deferrals, 8);
         assert_eq!(c.kv_events_disk_medium, None);
@@ -366,6 +379,24 @@ mod tests {
                 .kv_events_endpoints
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn kv_events_replay_port_parses_and_rejects_junk() {
+        let c = cfg(&[("KV_EVENTS_REPLAY_PORT", " 5558 ")]).expect("parse");
+        assert_eq!(c.kv_events_replay_port, Some(5558));
+        for bad in ["70000", "-1", "port"] {
+            assert!(
+                matches!(
+                    cfg(&[("KV_EVENTS_REPLAY_PORT", bad)]),
+                    Err(ConfigError::NotANumber {
+                        var: "KV_EVENTS_REPLAY_PORT",
+                        ..
+                    })
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
