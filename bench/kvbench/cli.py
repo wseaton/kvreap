@@ -55,6 +55,9 @@ def main() -> int:
     r.add_argument("--agent-turns", type=int, default=10)
     r.add_argument("--agent-system-prompt-tokens", type=int, default=2048)
     r.add_argument("--kv-cache-dtype", help="vLLM --kv-cache-dtype, e.g. fp8")
+    r.add_argument(
+        "--vllm-memory-gib", type=int, default=96, help="vLLM pod memory limit; the CPU tier is pinned host memory"
+    )
     r.add_argument("--fs-read-threads", type=int, default=16, help="fs tier n_read_threads")
     r.add_argument("--churn-input-len", type=int, default=4096, help="tokens per churn prompt")
     r.add_argument("--hot-prefix-len", type=int, default=2048, help="tokens per repeated hot prefix")
@@ -128,6 +131,7 @@ def main() -> int:
         agent_system_prompt_tokens=args.agent_system_prompt_tokens,
         kv_cache_dtype=args.kv_cache_dtype,
         fs_read_threads=args.fs_read_threads,
+        vllm_memory_gib=args.vllm_memory_gib,
         churn_input_len=args.churn_input_len,
         hot_prefix_len=args.hot_prefix_len,
         max_model_len=args.max_model_len,

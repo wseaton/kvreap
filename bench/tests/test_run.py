@@ -145,3 +145,9 @@ def test_fp8_kv_and_read_threads_reach_vllm() -> None:
     assert json.loads(kv.split("=", 1)[1])["kv_connector_extra_config"]["secondary_tiers"][0]["n_read_threads"] == 64
     plain, _ = vllm_parts(cfg())
     assert not any(a.startswith("--kv-cache-dtype") for a in plain["args"])
+
+
+def test_vllm_memory_limit_follows_the_flag() -> None:
+    container, _ = vllm_parts(cfg(vllm_memory_gib=160))
+    assert container["resources"]["limits"]["memory"] == "160Gi"
+    assert vllm_parts(cfg())[0]["resources"]["limits"]["memory"] == "96Gi"

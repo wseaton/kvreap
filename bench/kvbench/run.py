@@ -111,6 +111,7 @@ class RunConfig:
     agent_system_prompt_tokens: int = 2048
     kv_cache_dtype: str | None = None
     fs_read_threads: int = 16
+    vllm_memory_gib: int = 96
     evictor_env: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -332,8 +333,12 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
                     "ports": ports,
                     "readinessProbe": {"httpGet": {"path": "/health", "port": 8000}, "periodSeconds": 5},
                     "resources": {
-                        "requests": {"nvidia.com/gpu": gpus, "cpu": "16", "memory": "64Gi"},
-                        "limits": {"nvidia.com/gpu": gpus, "memory": "96Gi"},
+                        "requests": {
+                            "nvidia.com/gpu": gpus,
+                            "cpu": "16",
+                            "memory": f"{min(64, cfg.vllm_memory_gib)}Gi",
+                        },
+                        "limits": {"nvidia.com/gpu": gpus, "memory": f"{cfg.vllm_memory_gib}Gi"},
                     },
                     "volumeMounts": [
                         {"name": "kv", "mountPath": KV_MOUNT},
