@@ -41,6 +41,10 @@ Deletions by chain position (from the evictor's `chains` counters):
 - **Subtree eviction cuts each chain once and deletes everything that cut made useless.** 99% of its deletions are dead blocks found through the index and unlinked by path, with no sampling or stat. Surviving chains stay whole, so 79% more prefix blocks are served from the fs tier, vLLM recomputes and rewrites 29% fewer bytes, and almost no promotion races a deletion.
 - **TTFT.** p99 halves. p50 is 14% worse: E reads 87% more KV from VAST, and for a 0.6B model reading a 2,048-token prefix back costs about the same as recomputing it on an H200. The extra hits pay off when prefill is expensive; a Qwen3-32B TP=2 pair is the follow-up measurement.
 
+## Follow-up: agentic workload
+
+Subtree eviction deletes every block below the one it picks, so a shared system prompt (written once, the oldest block on disk) would take every session that extends it. Radix eviction (`CHAIN_EVICTION=radix`) only deletes radix-tree leaf edges, the unshared tail of one cached prefix, aged by the session's last write. On a long-session agentic workload with a shared preamble (Qwen3-32B, after fixing vLLM's fs-tier read path), radix eviction completes 23% more requests and cuts returning-turn TTFT p90 from 6.6 s to 1.8 s against plain sampled LRU. See [chain-spike-agent.md](chain-spike-agent.md).
+
 ## Caveats
 
 - n = 1 per variant. E's hot generator completed 24 of 25 iterations (1,536 of 1,600 requests) in the window.

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 260" width="640" height="260" font-family="system-ui, -apple-system, Segoe UI, sans-serif" role="img" aria-label="Hot-prefix TTFT, cumulative % of requests">
+<rect width="640" height="260" rx="8" fill="#1a1a19"/>
+<text x="48" y="18" font-size="13" font-weight="600" fill="#ffffff">Hot-prefix TTFT, cumulative % of requests</text>
+<line x1="592" x2="606" y1="14" y2="14" stroke="#d95926" stroke-width="2"/>
+<text x="610" y="18" font-size="11" fill="#c3c2b7">wr</text>
+<line x1="556" x2="570" y1="14" y2="14" stroke="#3987e5" stroke-width="2"/>
+<text x="574" y="18" font-size="11" fill="#c3c2b7">wc</text>
+<text x="320.0" y="130.0" text-anchor="middle" font-size="12" fill="#898781">no data</text></svg>
