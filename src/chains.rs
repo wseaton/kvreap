@@ -417,6 +417,8 @@ pub struct ChainStats {
     pub replay_failures: AtomicU64,
     /// Batches never applied: skipped by the SUB socket and gone from the replay buffer.
     pub events_lost: AtomicU64,
+    /// Blocks the index had on disk whose files were already gone when kvreap went to delete them.
+    pub vanished: AtomicU64,
 }
 
 /// The index shared by the subscriber and every worker.
@@ -483,6 +485,13 @@ impl Chains {
 
     pub fn on_disk(&self, hash: BlockHash) -> bool {
         self.index().on_disk(hash)
+    }
+
+    /// Drops a block whose file is gone although kvreap did not delete it.
+    pub fn vanished(&self, hash: BlockHash) {
+        if self.index().remove(hash) != Position::Untracked {
+            Stats::add(&self.stats.vanished, 1);
+        }
     }
 
     /// Records a deletion by kvreap and counts its chain position.
@@ -564,6 +573,7 @@ impl Chains {
             replayed_batches = Stats::get(&s.replayed_batches),
             replay_failures = Stats::get(&s.replay_failures),
             events_lost = Stats::get(&s.events_lost),
+            vanished = Stats::get(&s.vanished),
             "chains"
         );
     }

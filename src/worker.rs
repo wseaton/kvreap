@@ -70,6 +70,30 @@ struct Candidate {
     deferrals: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unlink {
+    Deleted,
+    /// The file was already gone.
+    Missing,
+    /// Not attempted (grant spent, shutdown) or failed.
+    Skipped,
+}
+
+/// Outcome of unlinking one block's file in every rank dir.
+#[derive(Debug, Default, Clone, Copy)]
+struct Named {
+    deleted: usize,
+    missing: usize,
+    skipped: usize,
+}
+
+impl Named {
+    /// No rank had the file, so the block is gone without a deletion of ours.
+    fn vanished(self) -> bool {
+        self.deleted == 0 && self.skipped == 0 && self.missing > 0
+    }
+}
+
 /// Radix eviction order of a candidate, first to go first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum RadixKey {
@@ -489,7 +513,9 @@ impl Worker {
         let (Some(group), Some(name)) = (group, name) else {
             return removed;
         };
-        removed += self.remove_named(&siblings, &name, &group, hash, size);
+        removed += self
+            .remove_named(&siblings, &name, &group, hash, size)
+            .deleted;
         for d in chains.descendants(hash) {
             if !self.ctx.shared.should_delete() || self.ctx.shutdown.is_set() {
                 break;
@@ -497,23 +523,25 @@ impl Worker {
             let Some(name) = d.file_name else {
                 continue;
             };
-            let files = self.remove_named(
+            let named = self.remove_named(
                 &[std::slice::from_ref(&rank), siblings.as_slice()].concat(),
                 &name,
                 &group,
                 d.hash,
                 size,
             );
-            if files > 0 {
-                removed += files;
+            if named.deleted > 0 {
+                removed += named.deleted;
                 chains.deleted(d.hash);
                 Stats::add(&chains.stats.cascaded, 1);
+            } else if named.vanished() {
+                chains.vanished(d.hash);
             }
         }
         removed
     }
 
-    /// Unlinks block file `name` from each of `ranks`; returns files removed.
+    /// Unlinks block file `name` from each of `ranks`.
     fn remove_named(
         &mut self,
         ranks: &[Arc<RankDir>],
@@ -521,18 +549,20 @@ impl Worker {
         group: &str,
         hash: BlockHash,
         size: u64,
-    ) -> usize {
+    ) -> Named {
         let bucket_len = self.ctx.config.hex_bucket_len;
-        let mut removed = 0;
+        let mut out = Named::default();
         for r in ranks {
             let Some(path) = block_path(&r.path, name, bucket_len, group) else {
                 continue;
             };
-            if self.remove_block(&path, hash, size, r, false) {
-                removed += 1;
+            match self.remove_block(&path, hash, size, r, false) {
+                Unlink::Deleted => out.deleted += 1,
+                Unlink::Missing => out.missing += 1,
+                Unlink::Skipped => out.skipped += 1,
             }
         }
-        removed
+        out
     }
 
     /// Dead candidates take their whole subtree with them. Any other
@@ -637,18 +667,20 @@ impl Worker {
             else {
                 break;
             };
-            let removed = self.remove_named(&ranks, &name, &group, b.hash, c.size);
-            if removed == 0 && chains.on_disk(b.hash) {
-                break;
-            }
-            if removed > 0 {
-                files += removed;
+            let named = self.remove_named(&ranks, &name, &group, b.hash, c.size);
+            if named.deleted > 0 {
+                files += named.deleted;
                 chains.deleted(b.hash);
                 if is_candidate {
                     candidate_gone = true;
                 } else {
                     Stats::add(&chains.stats.cascaded, 1);
                 }
+            } else if named.vanished() {
+                chains.vanished(b.hash);
+                candidate_gone |= is_candidate;
+            } else if chains.on_disk(b.hash) {
+                break;
             }
         }
         (files, candidate_gone)
@@ -702,7 +734,7 @@ impl Worker {
                 Err(_) => return false,
             }
         }
-        self.remove_block(&c.path, c.hash, c.size, &c.rank, true)
+        self.remove_block(&c.path, c.hash, c.size, &c.rank, true) == Unlink::Deleted
     }
 
     /// Other rank dirs of `rank`'s model. Tensor-parallel ranks each hold a
@@ -728,23 +760,28 @@ impl Worker {
         size: u64,
         rank: &RankDir,
         record_chain: bool,
-    ) -> bool {
+    ) -> Unlink {
         if self.ctx.config.dry_run {
             tracing::debug!(path = %path.display(), "[DRY RUN] would delete");
             Stats::add(&self.ctx.stats.files_deleted, 1);
             self.ctx.shared.freed(size);
-            return true;
+            return Unlink::Deleted;
         }
         if !self.acquire() || !self.ctx.shared.should_delete() {
-            return false;
+            return Unlink::Skipped;
         }
         match self.timed(OpKind::Unlink, || fsops::unlink_path(path)) {
             Ok(()) => {}
-            Err(e) if fsops::is_not_found(&e) => return false,
+            Err(e) if fsops::is_not_found(&e) => {
+                if let Some(chains) = self.ctx.chains.as_ref().filter(|_| record_chain) {
+                    chains.vanished(hash);
+                }
+                return Unlink::Missing;
+            }
             Err(e) => {
                 Stats::add(&self.ctx.stats.errors, 1);
                 tracing::warn!(path = %path.display(), error = %e, "unlink failed");
-                return false;
+                return Unlink::Skipped;
             }
         }
         Stats::add(&self.ctx.stats.files_deleted, 1);
@@ -759,7 +796,7 @@ impl Worker {
                 hash,
             });
         }
-        true
+        Unlink::Deleted
     }
 
     /// Removes `dir` if it is empty and unchanged for `DIR_CLEANUP_TTL_SECONDS`.
@@ -1576,6 +1613,27 @@ mod tests {
         chains(&h).apply(&[stored(Some(2), &[4]), stored(Some(2), &[5])]);
         h.shared.set_mode(Mode::Evicting);
         h
+    }
+
+    #[test]
+    fn radix_steps_over_a_leaf_whose_file_is_already_gone() {
+        use crate::config::ChainPolicy;
+        use crate::worker::tests::chain_fixtures::{bucket, chain_harness, chains};
+
+        // Block 4's file is gone though the index still has it on disk.
+        let (_tmp, cache) = bucket(&[(1, Some(9000)), (2, Some(8999)), (3, Some(8998))]);
+        let mut h = chain_harness(&cache, ChainPolicy::Radix, &[1, 2, 3, 4]);
+        h.worker.ctx.config = Arc::new(config(
+            &cache,
+            &[("FILE_ACCESS_TIME_THRESHOLD_MINUTES", "0")],
+        ));
+        h.shared.set_mode(Mode::Evicting);
+        run_rounds(&mut h, 4);
+        assert!(bins(&cache).is_empty(), "left: {:?}", bins(&cache));
+        let s = &chains(&h).stats;
+        assert_eq!(Stats::get(&s.vanished), 1);
+        assert_eq!(Stats::get(&s.deleted_internal), 0);
+        assert_eq!(Stats::get(&s.deleted_orphan), 0);
     }
 
     #[test]
