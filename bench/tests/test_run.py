@@ -176,3 +176,41 @@ def test_striped_tier_ships_the_plugin_and_sizes_shm() -> None:
     assert "striped_fs.py" not in sampler_configmap(cfg())["data"]
     [shm] = [v for v in vllm_manifests(cfg())[0]["spec"]["volumes"] if v["name"] == "shm"]
     assert shm["emptyDir"]["sizeLimit"] == "16Gi"
+
+
+def test_host_path_cache_replaces_the_pvc_and_pins_the_node() -> None:
+    c = cfg(kv_host_path="/mnt/local/kvreap-bench", node="gd91fda", pvc_size="160Gi")
+    pod, _ = vllm_manifests(c)
+    spec = pod["spec"]
+    [kv] = [v for v in spec["volumes"] if v["name"] == "kv"]
+    assert kv == {"name": "kv", "hostPath": {"path": "/mnt/local/kvreap-bench/d", "type": "DirectoryOrCreate"}}
+    assert spec["nodeSelector"] == {"kubernetes.io/hostname": "gd91fda"}
+    [init] = spec["initContainers"]
+    assert init["securityContext"]["runAsUser"] == 0
+    assert "chown 1000:1000" in init["command"][-1] and "-delete" in init["command"][-1]
+    sampler = spec["containers"][1]["command"]
+    assert sampler[sampler.index("--capacity-bytes") + 1] == str(160 * 1024**3)
+
+
+def test_pvc_cache_has_no_init_container_or_node_pin() -> None:
+    pod, _ = vllm_manifests(cfg())
+    assert "initContainers" not in pod["spec"]
+    assert "nodeSelector" not in pod["spec"]
+    assert "--capacity-bytes" not in pod["spec"]["containers"][1]["command"]
+
+
+@needs_chart
+def test_host_path_evictor_runs_on_vllms_node_with_capacity_bytes() -> None:
+    c = cfg(kv_host_path="/mnt/local/kvreap-bench", pvc_size="160Gi")
+    [dep] = [o for o in evictor_manifests(c) if o["kind"] == "Deployment"]
+    spec = dep["spec"]["template"]["spec"]
+    assert not any(
+        "persistentVolumeClaim" in v and v["persistentVolumeClaim"]["claimName"] == c.kv_pvc for v in spec["volumes"]
+    )
+    assert {"path": "/mnt/local/kvreap-bench/d", "type": "DirectoryOrCreate"} in [
+        v.get("hostPath") for v in spec["volumes"]
+    ]
+    [term] = spec["affinity"]["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+    assert term["labelSelector"]["matchLabels"]["kvreap-bench/role"] == "vllm"
+    assert evictor_env(c)["CAPACITY_BYTES"] == str(160 * 1024**3)
+    assert "CAPACITY_BYTES" not in evictor_env(cfg())

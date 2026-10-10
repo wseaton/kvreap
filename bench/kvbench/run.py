@@ -1,17 +1,19 @@
 """Run one evictor variant end to end on a Kubernetes cluster.
 
 ```text
- kv PVC (VAST, nosharecache) ──────────────┬──────────────────────────┐
-   │                                       │                          │
- vLLM pod (1 GPU)                        evictor pod (Helm chart)     │
-   vllm serve + TieringOffloadingSpec      pvc-evictor / kvreap       │
-   sampler sidecar: mountstats,            sampler sidecar:           │
-     statvfs, /metrics                       mountstats               │
-   ▲                                                                  │
- loadgen pod: churn (unique prompts) + hot (repeated prefixes)        │
-                                                                      │
- nosharecache gives each pod its own NFS superblock, so each sampler ─┘
- sees only its own pod's NFS operations.
+ kv cache: PVC (VAST, nosharecache), or with --kv-host-path a dir on the node's
+ local NVMe shared by vLLM and the evictor on that node
+   │                                       │
+ vLLM pod (TP GPUs)                      evictor pod (Helm chart)
+   vllm serve + TieringOffloadingSpec      pvc-evictor / kvreap
+   sampler sidecar: mountstats,            sampler sidecar:
+     usage, /metrics                         mountstats, usage
+   ▲
+ loadgen pod: churn + hot prompts, or nyann-bench agent sessions
+
+ nosharecache gives each pod its own NFS superblock, so each sampler sees
+ only its own pod's NFS operations. On a host path, usage is the bytes under
+ the dir against --pvc-size.
 ```
 """
 
@@ -114,6 +116,8 @@ class RunConfig:
     vllm_memory_gib: int = 96
     fs_stripe_blocks: int = 0
     evictor_env: dict[str, str] = field(default_factory=dict)
+    kv_host_path: str | None = None
+    node: str | None = None
 
     @property
     def run_id(self) -> str:
@@ -124,8 +128,41 @@ class RunConfig:
         return f"{self.run_id}-kv"
 
     @property
+    def kv_dir(self) -> str | None:
+        return f"{self.kv_host_path}/{self.variant}" if self.kv_host_path else None
+
+    @property
+    def capacity_bytes(self) -> int:
+        return quantity_bytes(self.pvc_size)
+
+    @property
     def kv_events_endpoint(self) -> str:
         return f"tcp://{self.run_id}-vllm:{KV_EVENTS_PORT}"
+
+
+def quantity_bytes(q: str) -> int:
+    units = {"Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4}
+    for suffix, mult in units.items():
+        if q.endswith(suffix):
+            return int(q[: -len(suffix)]) * mult
+    return int(q)
+
+
+def kv_volume(cfg: RunConfig) -> Manifest:
+    if cfg.kv_dir:
+        return {"name": "kv", "hostPath": {"path": cfg.kv_dir, "type": "DirectoryOrCreate"}}
+    return {"name": "kv", "persistentVolumeClaim": {"claimName": cfg.kv_pvc}}
+
+
+def kv_dir_init(cfg: RunConfig) -> Manifest:
+    """Empties the run's hostPath dir and hands it to uid 1000; kubelet creates it root-owned."""
+    return {
+        "name": "kv-dir",
+        "image": SAMPLER_IMAGE,
+        "command": ["sh", "-c", f"find {KV_MOUNT} -mindepth 1 -delete && chown 1000:1000 {KV_MOUNT}"],
+        "securityContext": {"runAsUser": 0, "runAsGroup": 0},
+        "volumeMounts": [{"name": "kv", "mountPath": KV_MOUNT}],
+    }
 
 
 def labels(cfg: RunConfig, role: str) -> dict[str, str]:
@@ -251,10 +288,12 @@ def sampler_configmap(cfg: RunConfig) -> Manifest:
     }
 
 
-def sampler_container(kv_volume: str, scrape_url: str | None = None) -> Manifest:
+def sampler_container(kv_volume: str, scrape_url: str | None = None, capacity_bytes: int | None = None) -> Manifest:
     cmd = ["python3", "/bench/sampler.py", "--mount", KV_MOUNT, "--interval", "1", "--output", SAMPLES_FILE]
     if scrape_url:
         cmd += ["--scrape-url", scrape_url]
+    if capacity_bytes:
+        cmd += ["--capacity-bytes", str(capacity_bytes)]
     return {
         "name": "sampler",
         "image": SAMPLER_IMAGE,
@@ -368,10 +407,14 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
                         {"name": "shm", "mountPath": "/dev/shm"},
                     ],
                 },
-                sampler_container("kv", scrape_url="http://127.0.0.1:8000/metrics"),
+                sampler_container(
+                    "kv",
+                    scrape_url="http://127.0.0.1:8000/metrics",
+                    capacity_bytes=cfg.capacity_bytes if cfg.kv_dir else None,
+                ),
             ],
             "volumes": [
-                {"name": "kv", "persistentVolumeClaim": {"claimName": cfg.kv_pvc}},
+                kv_volume(cfg),
                 {"name": "hf", "persistentVolumeClaim": {"claimName": cfg.hf_pvc}},
                 {"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": f"{shm_gib(cfg)}Gi"}},
                 bench_volume(cfg),
@@ -379,6 +422,10 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
             ],
         },
     }
+    if cfg.kv_dir:
+        pod["spec"]["initContainers"] = [kv_dir_init(cfg)]
+    if cfg.node:
+        pod["spec"]["nodeSelector"] = {"kubernetes.io/hostname": cfg.node}
     svc = {
         "apiVersion": "v1",
         "kind": "Service",
@@ -557,17 +604,29 @@ def evictor_manifests(cfg: RunConfig) -> list[Manifest]:
         tmpl.setdefault("metadata", {}).setdefault("annotations", {}).update(NO_ISTIO)
         spec = tmpl["spec"]
         spec["imagePullSecrets"] = [{"name": cfg.pull_secret}]
+        if cfg.kv_dir:
+            spec["volumes"] = [
+                kv_volume(cfg) | {"name": v["name"]}
+                if v.get("persistentVolumeClaim", {}).get("claimName") == cfg.kv_pvc
+                else v
+                for v in spec["volumes"]
+            ]
         spec["volumes"] += [bench_volume(cfg), SAMPLES_VOLUME]
         env = dict(cfg.evictor_env)
+        if cfg.kv_dir:
+            env.setdefault("CAPACITY_BYTES", str(cfg.capacity_bytes))
         if cfg.kv_events:
             env.setdefault("KV_EVENTS_ENDPOINTS", cfg.kv_events_endpoint)
             env.setdefault("KV_EVENTS_DISK_MEDIUM", "STORAGE")
         for c in spec["containers"]:
             if c["name"] == "evictor":
                 c.setdefault("env", []).extend({"name": k, "value": v} for k, v in env.items())
-        spec["containers"].append(sampler_container("kv-cache-storage"))
-        if cfg.placement != "any":
-            kind = "podAffinity" if cfg.placement == "colocated" else "podAntiAffinity"
+        spec["containers"].append(
+            sampler_container("kv-cache-storage", capacity_bytes=cfg.capacity_bytes if cfg.kv_dir else None)
+        )
+        placement = "colocated" if cfg.kv_dir else cfg.placement
+        if placement != "any":
+            kind = "podAffinity" if placement == "colocated" else "podAntiAffinity"
             spec["affinity"] = {
                 kind: {
                     "requiredDuringSchedulingIgnoredDuringExecution": [
@@ -635,8 +694,14 @@ def teardown(cfg: RunConfig, evictor: list[Manifest]) -> None:
     c = cfg.cluster
     c.delete([loadgen_manifest(cfg)])
     c.delete(evictor)
+    if cfg.kv_dir:
+        c.kubectl(
+            "exec", f"{cfg.run_id}-vllm", "-c", "vllm", "--", "find", KV_MOUNT, "-mindepth", "1", "-delete", check=False
+        )
     c.delete(vllm_manifests(cfg))
-    c.delete([sampler_configmap(cfg), pvc(cfg.kv_pvc, cfg.storage_class, cfg.pvc_size, {})])
+    c.delete([sampler_configmap(cfg)])
+    if not cfg.kv_dir:
+        c.delete([pvc(cfg.kv_pvc, cfg.storage_class, cfg.pvc_size, {})])
 
 
 def run(cfg: RunConfig, keep: bool = False) -> None:
@@ -650,7 +715,9 @@ def run(cfg: RunConfig, keep: bool = False) -> None:
     teardown(cfg, evictor)
 
     events: dict[str, float] = {}
-    c.apply([pvc(cfg.kv_pvc, cfg.storage_class, cfg.pvc_size, labels(cfg, "kv")), sampler_configmap(cfg)])
+    if not cfg.kv_dir:
+        c.apply([pvc(cfg.kv_pvc, cfg.storage_class, cfg.pvc_size, labels(cfg, "kv"))])
+    c.apply([sampler_configmap(cfg)])
     c.apply(vllm_manifests(cfg))
     print(f"[{cfg.variant}] waiting for vLLM", flush=True)
     wait_pod_ready(c, f"{cfg.run_id}-vllm", timeout_s=1800)

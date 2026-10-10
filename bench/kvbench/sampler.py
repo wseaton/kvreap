@@ -60,6 +60,24 @@ def read_usage(mount: str) -> dict[str, int]:
     return {"total": total, "used": total - st.f_bfree * st.f_frsize}
 
 
+def du(path: str) -> int:
+    used, stack = 0, [path]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        else:
+                            used += e.stat(follow_symlinks=False).st_blocks * 512
+                    except FileNotFoundError:
+                        pass
+        except FileNotFoundError:
+            pass
+    return used
+
+
 METRIC_LINE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*(?:\{[^}]*\})?)\s+(\S+)")
 
 
@@ -84,6 +102,12 @@ def main() -> int:
     p.add_argument("--scrape-every", type=int, default=5, help="scrape every N intervals")
     p.add_argument("--scrape-keep", default=r"^vllm:(kv_offload|external_prefix_cache|prefix_cache)")
     p.add_argument("--output", help="append JSON lines to this file instead of stdout")
+    p.add_argument(
+        "--capacity-bytes",
+        type=int,
+        help="report usage as bytes under --mount against this size instead of statvfs",
+    )
+    p.add_argument("--du-every", type=int, default=10, help="walk --mount every N intervals")
     args = p.parse_args()
 
     keep = re.compile(args.scrape_keep)
@@ -96,10 +120,14 @@ def main() -> int:
             rec["ops"] = read_mountstats(args.mount)
         except OSError as e:
             rec["ops_error"] = str(e)
-        try:
-            rec["usage"] = read_usage(args.mount)
-        except OSError as e:
-            rec["usage_error"] = str(e)
+        if args.capacity_bytes:
+            if tick % args.du_every == 0:
+                rec["usage"] = {"total": args.capacity_bytes, "used": du(args.mount)}
+        else:
+            try:
+                rec["usage"] = read_usage(args.mount)
+            except OSError as e:
+                rec["usage_error"] = str(e)
         if args.scrape_url and tick % args.scrape_every == 0:
             try:
                 rec["metrics"] = scrape(args.scrape_url, keep)

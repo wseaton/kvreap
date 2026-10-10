@@ -20,7 +20,13 @@ def main() -> int:
     r.add_argument("--namespace", default="weaton-dev")
     r.add_argument("--model", default="Qwen/Qwen3-0.6B")
     r.add_argument("--vllm-image", default="docker.io/vllm/vllm-openai:v0.31.0")
-    r.add_argument("--pvc-size", default="100Gi")
+    r.add_argument("--pvc-size", default="100Gi", help="kv PVC size, or the cache budget with --kv-host-path")
+    r.add_argument(
+        "--kv-host-path",
+        help="put the kv cache in <path>/<variant> on the node instead of a PVC (CoreWeave: under /mnt/local); "
+        "the evictor runs on vLLM's node with CAPACITY_BYTES set to --pvc-size",
+    )
+    r.add_argument("--node", help="pin vLLM (and so a --kv-host-path evictor) to this node")
     r.add_argument("--duration", type=int, default=1200, help="load duration in seconds")
     r.add_argument("--offload-block-tokens", type=int, default=16)
     r.add_argument(
@@ -148,6 +154,8 @@ def main() -> int:
         hf_pvc=args.hf_pvc,
         hf_pvc_size=args.hf_pvc_size,
         evictor_env=evictor_env,
+        kv_host_path=args.kv_host_path,
+        node=args.node,
         storage_class="kvreap-bench-vast-shared" if args.share_nfs_client else "kvreap-bench-vast",
     )
     run(cfg, keep=args.keep)
