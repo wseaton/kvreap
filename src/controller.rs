@@ -10,7 +10,7 @@ use crate::config::{CapacityBytes, Percent};
 
 pub const EMERGENCY_FLOOR: f64 = 97.0;
 /// How long a deletion may take to show up in a usage reading.
-pub const USAGE_LAG: Duration = Duration::from_secs(5);
+pub const USAGE_LAG: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -128,6 +128,30 @@ impl Hysteresis {
             Mode::Evicting | Mode::Emergency if usage <= self.target => Mode::Idle,
             Mode::Evicting | Mode::Emergency => Mode::Evicting,
         }
+    }
+}
+
+/// The delete budget to publish after a usage reading.
+///
+/// A prune is granted what is above the target and spends it. Once spent, a
+/// new grant comes only from a reading taken after no deletions for
+/// `USAGE_LAG`, so a reading that lags the deletions is never mistaken for
+/// space still to free: a fast statvfs ends the prune as soon as the budget is
+/// spent, a lagging one pauses it until the reading settles.
+pub fn next_budget(
+    evicting: bool,
+    outstanding: u64,
+    above_target: u64,
+    recently_freed: u64,
+) -> u64 {
+    if !evicting {
+        0
+    } else if outstanding > 0 && outstanding != u64::MAX {
+        outstanding
+    } else if recently_freed == 0 {
+        above_target
+    } else {
+        0
     }
 }
 
@@ -283,25 +307,30 @@ mod tests {
     }
 
     #[test]
-    fn frees_hidden_by_a_lagging_reading_are_not_granted_twice() {
-        // VAST statvfs shows deletions ~2-4 s late: 400 bytes over target, 300
-        // freed 3 s ago and not visible yet, so only 100 may still be granted.
-        let t0 = Instant::now();
-        let mut r = RecentFrees::default();
-        r.observe(t0, 0, crate::controller::USAGE_LAG);
-        let recent = r.observe(
-            t0 + Duration::from_secs(3),
-            300,
-            crate::controller::USAGE_LAG,
-        );
-        let u = DiskUsage {
-            total_bytes: 1000,
-            used_bytes: 1100 - 400,
-        };
+    fn budget_is_spent_before_a_settled_reading_refills_it() {
+        use crate::controller::next_budget;
+
+        assert_eq!(next_budget(false, 500, 900, 0), 0, "idle");
+        assert_eq!(next_budget(true, u64::MAX, 900, 0), 900, "prune start");
         assert_eq!(
-            u.above(Percent::new("t", 30.0).expect("pct"))
-                .saturating_sub(recent),
-            100
+            next_budget(true, 400, 900, 500),
+            400,
+            "spending: readings ignored"
+        );
+        assert_eq!(
+            next_budget(true, 400, 0, 0),
+            400,
+            "an outstanding grant is not withdrawn"
+        );
+        assert_eq!(
+            next_budget(true, 0, 700, 300),
+            0,
+            "spent while the reading may still lag: wait"
+        );
+        assert_eq!(
+            next_budget(true, 0, 120, 0),
+            120,
+            "settled reading still above target: top up"
         );
     }
 
