@@ -25,7 +25,10 @@ kubectl kustomize deploy/kserve/example
   (`VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`), and turn on the fs tier's own
   `STORAGE` events. It replaces the `--kv-transfer-config` KServe renders from
   `kvCacheOffloading`, because the rendered one has no `enable_kv_events`;
-  keep `cpu_bytes_to_use` in line with `kvCacheOffloading.cpu`.
+  keep `cpu_bytes_to_use` in line with `kvCacheOffloading.cpu`. With a KServe
+  that has `secondary[].fileSystem.kvEvents` (wseaton/kserve branch
+  `llmisvc-fs-tier-kv-events`), set `kvEvents: true` on the tier and drop the
+  `--kv-transfer-config` from the preset.
 - The EPP in discovery mode, so it and kvreap both connect to each vLLM pod:
   in the precise prefix cache producer's `kvEventsConfig`, set
   `discoverPods: true` and `podDiscoveryConfig.socketPort: 5557`, and drop the
