@@ -20,8 +20,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::budget::{Budget, OpKind};
@@ -88,6 +89,18 @@ struct Named {
 }
 
 impl Named {
+    fn of(results: &[Unlink]) -> Self {
+        let mut out = Self::default();
+        for r in results {
+            match r {
+                Unlink::Deleted => out.deleted += 1,
+                Unlink::Missing => out.missing += 1,
+                Unlink::Skipped => out.skipped += 1,
+            }
+        }
+        out
+    }
+
     /// No rank had the file, so the block is gone without a deletion of ours.
     fn vanished(self) -> bool {
         self.deleted == 0 && self.skipped == 0 && self.missing > 0
@@ -173,6 +186,110 @@ pub struct Context {
     pub shutdown: Arc<Shutdown>,
     pub events: Option<Sender<Removed>>,
     pub chains: Option<Arc<Chains>>,
+}
+
+/// One block file to unlink.
+#[derive(Debug)]
+struct Target {
+    path: PathBuf,
+    hash: BlockHash,
+    size: u64,
+    rank: Arc<RankDir>,
+}
+
+impl Context {
+    fn acquire(&self) -> bool {
+        self.budget
+            .acquire(&self.shutdown, self.shared.mode() == Mode::Emergency)
+    }
+
+    fn timed<T>(&self, kind: OpKind, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        let start = Instant::now();
+        let out = f();
+        self.budget.observe(kind, start.elapsed());
+        let counter = match kind {
+            OpKind::Readdir => &self.stats.readdir_ops,
+            OpKind::Stat => &self.stats.stat_ops,
+            OpKind::Unlink => &self.stats.unlink_ops,
+        };
+        Stats::add(counter, 1);
+        out
+    }
+
+    /// Unlinks one block file and counts it as freed and as a removal event.
+    fn unlink(&self, t: &Target) -> Unlink {
+        if self.config.dry_run {
+            tracing::debug!(path = %t.path.display(), "[DRY RUN] would delete");
+            Stats::add(&self.stats.files_deleted, 1);
+            self.shared.freed(t.size);
+            return Unlink::Deleted;
+        }
+        if !self.acquire() || !self.shared.should_delete() {
+            return Unlink::Skipped;
+        }
+        match self.timed(OpKind::Unlink, || fsops::unlink_path(&t.path)) {
+            Ok(()) => {}
+            Err(e) if fsops::is_not_found(&e) => return Unlink::Missing,
+            Err(e) => {
+                Stats::add(&self.stats.errors, 1);
+                tracing::warn!(path = %t.path.display(), error = %e, "unlink failed");
+                return Unlink::Skipped;
+            }
+        }
+        Stats::add(&self.stats.files_deleted, 1);
+        Stats::add(&self.stats.bytes_freed, t.size);
+        self.shared.freed(t.size);
+        if let (Some(tx), Some(base)) = (&self.events, &t.rank.model_base) {
+            let _ = tx.send(Removed {
+                model_base: base.clone(),
+                hash: t.hash,
+            });
+        }
+        Unlink::Deleted
+    }
+
+    /// Unlinks `targets` in order with up to `DELETE_FANOUT` in flight, and
+    /// issues no new unlink once one is skipped. Unissued targets come back
+    /// `Skipped`.
+    fn unlink_all(&self, targets: &[Target]) -> Vec<Unlink> {
+        let lanes = self.config.delete_fanout.get().min(targets.len());
+        if lanes <= 1 {
+            let mut out = Vec::with_capacity(targets.len());
+            for t in targets {
+                let r = self.unlink(t);
+                out.push(r);
+                if r == Unlink::Skipped {
+                    break;
+                }
+            }
+            out.resize(targets.len(), Unlink::Skipped);
+            return out;
+        }
+        let next = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        let results: Vec<OnceLock<Unlink>> = targets.iter().map(|_| OnceLock::new()).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..lanes {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let (Some(t), Some(slot)) = (targets.get(i), results.get(i)) else {
+                            break;
+                        };
+                        let r = self.unlink(t);
+                        if r == Unlink::Skipped {
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                        let _ = slot.set(r);
+                    }
+                });
+            }
+        });
+        results
+            .into_iter()
+            .map(|r| r.into_inner().unwrap_or(Unlink::Skipped))
+            .collect()
+    }
 }
 
 pub struct Worker {
@@ -267,20 +384,11 @@ impl Worker {
     }
 
     fn acquire(&self) -> bool {
-        self.ctx.budget.acquire(&self.ctx.shutdown, self.unpaced())
+        self.ctx.acquire()
     }
 
     fn timed<T>(&self, kind: OpKind, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
-        let start = Instant::now();
-        let out = f();
-        self.ctx.budget.observe(kind, start.elapsed());
-        let counter = match kind {
-            OpKind::Readdir => &self.ctx.stats.readdir_ops,
-            OpKind::Stat => &self.ctx.stats.stat_ops,
-            OpKind::Unlink => &self.ctx.stats.unlink_ops,
-        };
-        Stats::add(counter, 1);
-        out
+        self.ctx.timed(kind, f)
     }
 
     fn is_hot(&self, atime: SystemTime) -> bool {
@@ -500,62 +608,60 @@ impl Worker {
             return 0;
         }
         let siblings = self.sibling_ranks(&rank);
-        let mut removed = 1;
         let (Some(group), Some(name)) = (group, name) else {
-            return removed;
+            return 1;
         };
-        removed += self
-            .remove_named(&siblings, &name, &group, hash, size)
-            .deleted;
-        let mut gone = Vec::new();
+        let all_ranks = [std::slice::from_ref(&rank), siblings.as_slice()].concat();
+        let mut targets = self.targets(&siblings, &name, &group, hash, size);
+        let mut spans = Vec::new();
         for d in chains.descendants(hash) {
-            if !self.ctx.shared.should_delete() || self.ctx.shutdown.is_set() {
-                break;
-            }
             let Some(name) = d.file_name() else {
                 continue;
             };
-            let named = self.remove_named(
-                &[std::slice::from_ref(&rank), siblings.as_slice()].concat(),
-                &name,
-                &group,
-                d.hash,
-                size,
-            );
+            let start = targets.len();
+            targets.extend(self.targets(&all_ranks, &name, &group, d.hash, size));
+            spans.push((d.hash, start..targets.len()));
+        }
+        let results = self.ctx.unlink_all(&targets);
+        let tally = |r: std::ops::Range<usize>| Named::of(results.get(r).unwrap_or_default());
+        let first = spans.first().map_or(targets.len(), |(_, r)| r.start);
+        let mut removed = 1 + tally(0..first).deleted;
+        let mut gone = Vec::new();
+        for (h, span) in spans {
+            let named = tally(span);
             if named.deleted > 0 {
                 removed += named.deleted;
-                gone.push((d.hash, Gone::Deleted));
+                gone.push((h, Gone::Deleted));
                 Stats::add(&chains.stats.cascaded, 1);
             } else if named.vanished() {
-                gone.push((d.hash, Gone::Vanished));
+                gone.push((h, Gone::Vanished));
             }
         }
         chains.record(&gone);
         removed
     }
 
-    /// Unlinks block file `name` from each of `ranks`.
-    fn remove_named(
-        &mut self,
+    /// The paths of block file `name` in each of `ranks`.
+    fn targets(
+        &self,
         ranks: &[Arc<RankDir>],
         name: &str,
         group: &str,
         hash: BlockHash,
         size: u64,
-    ) -> Named {
+    ) -> Vec<Target> {
         let bucket_len = self.ctx.config.hex_bucket_len;
-        let mut out = Named::default();
-        for r in ranks {
-            let Some(path) = block_path(&r.path, name, bucket_len, group) else {
-                continue;
-            };
-            match self.remove_block(&path, hash, size, r, false) {
-                Unlink::Deleted => out.deleted += 1,
-                Unlink::Missing => out.missing += 1,
-                Unlink::Skipped => out.skipped += 1,
-            }
-        }
-        out
+        ranks
+            .iter()
+            .filter_map(|r| {
+                Some(Target {
+                    path: block_path(&r.path, name, bucket_len, group)?,
+                    hash,
+                    size,
+                    rank: Arc::clone(r),
+                })
+            })
+            .collect()
     }
 
     /// Dead candidates take their whole subtree with them. Any other
@@ -650,8 +756,8 @@ impl Worker {
             .file_name()
             .and_then(|n| n.to_str())
             .map(str::to_owned);
-        let (mut files, mut candidate_gone) = (0, false);
-        let mut gone = Vec::new();
+        let mut targets = Vec::new();
+        let mut spans = Vec::new();
         for b in edge.blocks.iter().rev() {
             let is_candidate = b.hash == c.hash;
             let Some(name) = b
@@ -660,20 +766,28 @@ impl Worker {
             else {
                 break;
             };
-            let named = self.remove_named(&ranks, &name, &group, b.hash, c.size);
+            let start = targets.len();
+            targets.extend(self.targets(&ranks, &name, &group, b.hash, c.size));
+            spans.push((b.hash, is_candidate, start..targets.len()));
+        }
+        let results = self.ctx.unlink_all(&targets);
+        let (mut files, mut candidate_gone, mut stopped) = (0, false, false);
+        let mut gone = Vec::new();
+        for (hash, is_candidate, span) in spans {
+            let named = Named::of(results.get(span).unwrap_or_default());
             if named.deleted > 0 {
                 files += named.deleted;
-                gone.push((b.hash, Gone::Deleted));
+                gone.push((hash, Gone::Deleted));
                 if is_candidate {
                     candidate_gone = true;
                 } else {
                     Stats::add(&chains.stats.cascaded, 1);
                 }
-            } else if named.vanished() {
-                gone.push((b.hash, Gone::Vanished));
+            } else if named.vanished() && !stopped {
+                gone.push((hash, Gone::Vanished));
                 candidate_gone |= is_candidate;
-            } else if chains.on_disk(b.hash) {
-                break;
+            } else {
+                stopped = true;
             }
         }
         chains.record(&gone);
@@ -745,52 +859,33 @@ impl Worker {
             .collect()
     }
 
-    /// Unlinks one block file and records it everywhere a deletion is counted;
-    /// `record_chain` also marks the block gone in the chain index.
+    /// Unlinks one sampled block file; `record_chain` also marks the block
+    /// gone in the chain index.
     fn remove_block(
         &mut self,
         path: &Path,
         hash: BlockHash,
         size: u64,
-        rank: &RankDir,
+        rank: &Arc<RankDir>,
         record_chain: bool,
     ) -> Unlink {
-        if self.ctx.config.dry_run {
-            tracing::debug!(path = %path.display(), "[DRY RUN] would delete");
-            Stats::add(&self.ctx.stats.files_deleted, 1);
-            self.ctx.shared.freed(size);
-            return Unlink::Deleted;
-        }
-        if !self.acquire() || !self.ctx.shared.should_delete() {
-            return Unlink::Skipped;
-        }
-        match self.timed(OpKind::Unlink, || fsops::unlink_path(path)) {
-            Ok(()) => {}
-            Err(e) if fsops::is_not_found(&e) => {
-                if let Some(chains) = self.ctx.chains.as_ref().filter(|_| record_chain) {
-                    chains.vanished(hash);
-                }
-                return Unlink::Missing;
-            }
-            Err(e) => {
-                Stats::add(&self.ctx.stats.errors, 1);
-                tracing::warn!(path = %path.display(), error = %e, "unlink failed");
-                return Unlink::Skipped;
-            }
-        }
-        Stats::add(&self.ctx.stats.files_deleted, 1);
-        Stats::add(&self.ctx.stats.bytes_freed, size);
-        self.ctx.shared.freed(size);
+        let target = Target {
+            path: path.to_path_buf(),
+            hash,
+            size,
+            rank: Arc::clone(rank),
+        };
+        let r = self.ctx.unlink(&target);
         if let Some(chains) = self.ctx.chains.as_ref().filter(|_| record_chain) {
-            chains.deleted(hash);
+            match r {
+                Unlink::Deleted => {
+                    chains.deleted(hash);
+                }
+                Unlink::Missing => chains.vanished(hash),
+                Unlink::Skipped => {}
+            }
         }
-        if let (Some(tx), Some(base)) = (&self.ctx.events, &rank.model_base) {
-            let _ = tx.send(Removed {
-                model_base: base.clone(),
-                hash,
-            });
-        }
-        Unlink::Deleted
+        r
     }
 
     /// Removes `dir` if it is empty and unchanged for `DIR_CLEANUP_TTL_SECONDS`.
@@ -1767,5 +1862,74 @@ mod tests {
         pool.insert(c);
         pool.insert(candidate("/a", 10));
         assert_eq!(pool.pop_oldest().map(|c| c.deferrals), Some(3));
+    }
+
+    fn fanout_targets(dir: &Path, n: usize, missing: &[usize]) -> Vec<crate::worker::Target> {
+        use crate::worker::{RankDir, Target};
+
+        let rank = Arc::new(RankDir {
+            path: dir.to_path_buf(),
+            model_base: None,
+        });
+        (0..n)
+            .map(|i| {
+                let path = dir.join(format!("{i:04}.bin"));
+                if !missing.contains(&i) {
+                    fs::write(&path, b"x").expect("write");
+                }
+                Target {
+                    path,
+                    hash: BlockHash(i as u64),
+                    size: 100,
+                    rank: Arc::clone(&rank),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unlink_all_deletes_in_parallel_and_reports_each_file() {
+        use crate::worker::Unlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let h = harness(config(tmp.path(), &[("DELETE_FANOUT", "8")]));
+        h.shared.set_mode(Mode::Evicting);
+        let targets = fanout_targets(tmp.path(), 40, &[3, 17]);
+        let results = h.worker.ctx.unlink_all(&targets);
+        for (i, r) in results.iter().enumerate() {
+            let want = if [3, 17].contains(&i) {
+                Unlink::Missing
+            } else {
+                Unlink::Deleted
+            };
+            assert_eq!(*r, want, "target {i}");
+        }
+        assert!(targets.iter().all(|t| !t.path.exists()));
+        assert_eq!(Stats::get(&h.stats.files_deleted), 38);
+    }
+
+    #[test]
+    fn unlink_all_stops_issuing_once_the_grant_is_spent() {
+        use crate::worker::Unlink;
+
+        for (fanout, extra) in [("1", 0), ("4", 3)] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let h = harness(config(tmp.path(), &[("DELETE_FANOUT", fanout)]));
+            h.shared.set_mode(Mode::Evicting);
+            h.shared.set_to_free(300);
+            let targets = fanout_targets(tmp.path(), 40, &[]);
+            let results = h.worker.ctx.unlink_all(&targets);
+            let deleted = results.iter().filter(|r| **r == Unlink::Deleted).count();
+            assert!(
+                (3..=3 + extra).contains(&deleted),
+                "fanout {fanout}: {deleted} deleted for a 3-file grant"
+            );
+            if fanout == "1" {
+                assert_eq!(&results[..3], &[Unlink::Deleted; 3]);
+                assert!(results[3..].iter().all(|r| *r == Unlink::Skipped));
+            }
+            let left = targets.iter().filter(|t| t.path.exists()).count();
+            assert_eq!(left, 40 - deleted, "fanout {fanout}");
+        }
     }
 }

@@ -636,10 +636,6 @@ impl Chains {
         self.index().leaf_edge(hash, SUBTREE_BUDGET)
     }
 
-    pub fn on_disk(&self, hash: BlockHash) -> bool {
-        self.index().on_disk(hash)
-    }
-
     /// Reserves `hash` for one worker until the claim drops; `None` while
     /// another worker holds it.
     pub fn claim(&self, hash: BlockHash) -> Option<Claim<'_>> {
@@ -2435,7 +2431,8 @@ mod tests {
         assert_eq!(Stats::get(&s.vanished), 1, "9 was never tracked");
         assert_eq!(Stats::get(&s.deleted_root), 1);
         assert_eq!(Stats::get(&s.deleted_internal), 0);
-        assert!(!chains.on_disk(h(1)) && !chains.on_disk(h(2)) && !chains.on_disk(h(3)));
+        let index = chains.index();
+        assert!(!index.on_disk(h(1)) && !index.on_disk(h(2)) && !index.on_disk(h(3)));
     }
 
     #[test]

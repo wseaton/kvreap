@@ -1,4 +1,4 @@
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -161,6 +161,8 @@ pub struct Config {
     pub event_batch_size: usize,
     /// 0 means unlimited.
     pub max_files_per_second: f64,
+    /// Unlinks one worker keeps in flight while deleting an edge or subtree.
+    pub delete_fanout: NonZeroUsize,
     pub hot_threshold: Duration,
     pub hex_bucket_len: usize,
     pub enable_dir_cleanup: bool,
@@ -277,6 +279,19 @@ impl Config {
                 "DELETION_MAX_FILES_PER_SECOND",
                 num("DELETION_MAX_FILES_PER_SECOND", "0")?,
             )?,
+            delete_fanout: {
+                let n = int("DELETE_FANOUT", "16")?;
+                usize::try_from(n)
+                    .ok()
+                    .filter(|n| (1..=256).contains(n))
+                    .and_then(NonZeroUsize::new)
+                    .ok_or(ConfigError::OutOfRange {
+                        var: "DELETE_FANOUT",
+                        value: n as f64,
+                        min: 1.0,
+                        max: 256.0,
+                    })?
+            },
             hot_threshold: Duration::from_secs_f64(
                 non_negative(
                     "FILE_ACCESS_TIME_THRESHOLD_MINUTES",
@@ -379,6 +394,30 @@ mod tests {
                 .kv_events_endpoints
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn delete_fanout_defaults_to_16_and_stays_in_range() {
+        assert_eq!(cfg(&[]).expect("defaults").delete_fanout.get(), 16);
+        assert_eq!(
+            cfg(&[("DELETE_FANOUT", "1")])
+                .expect("parse")
+                .delete_fanout
+                .get(),
+            1
+        );
+        for bad in ["0", "257", "-3"] {
+            assert!(
+                matches!(
+                    cfg(&[("DELETE_FANOUT", bad)]),
+                    Err(ConfigError::OutOfRange {
+                        var: "DELETE_FANOUT",
+                        ..
+                    })
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
