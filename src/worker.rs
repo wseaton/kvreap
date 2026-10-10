@@ -4,7 +4,7 @@
 //!  loop while evicting:
 //!    bucket <- random <rank>/<hhh> owned by this worker's shard
 //!    statx every *.bin under bucket/*/  ──►  pool (oldest POOL_CAP cold files)
-//!    unlink the oldest sampled x EVICT_FRACTION from the pool (fractions carry over)
+//!    unlink the oldest (sampled / SAMPLED_PER_EVICTION) from the pool (remainders carry over)
 //! ```
 //!
 //! Work scales with the bytes to free, not with the size of the tree, and every
@@ -27,9 +27,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::budget::{Budget, OpKind};
 use crate::capacity::{BucketSample, Samples};
-use crate::chains::{Chains, Claim, Gone, LeafEdge, RadixKey, Rank};
-use crate::config::ChainPolicy;
-use crate::config::Config;
+use crate::chains::index::{LeafEdge, Rank};
+use crate::chains::{Chains, Claim, Gone, RadixKey};
+use crate::config::{ChainPolicy, Config, DeleteMode};
 use crate::controller::{Mode, SharedState};
 use crate::fsops::{self, EntryKind, Meta};
 use crate::layout::{BlockHash, Shard, block_files, discover_rank_dirs, model_base_dir};
@@ -37,7 +37,8 @@ use crate::shutdown::Shutdown;
 use crate::stats::Stats;
 
 const POOL_CAP: usize = 4096;
-const EVICT_FRACTION: f64 = 0.5;
+/// A round may evict one file for every this many it sampled.
+const SAMPLED_PER_EVICTION: usize = 2;
 const RECHECK_AFTER: Duration = Duration::from_secs(5);
 const INDEX_REFRESH: Duration = Duration::from_secs(300);
 const IDLE_POLL: Duration = Duration::from_millis(250);
@@ -218,7 +219,7 @@ impl Context {
 
     /// Unlinks one block file and counts it as freed and as a removal event.
     fn unlink(&self, t: &Target) -> Unlink {
-        if self.config.dry_run {
+        if self.config.delete_mode == DeleteMode::DryRun {
             tracing::debug!(path = %t.path.display(), "[DRY RUN] would delete");
             Stats::add(&self.stats.files_deleted, 1);
             self.shared.freed(t.size);
@@ -300,7 +301,8 @@ pub struct Worker {
     index: BucketIndex,
     fruitless_rounds: u32,
     backoff: Duration,
-    evict_credit: f64,
+    /// Sampled files not yet matched by an eviction, below `SAMPLED_PER_EVICTION`.
+    evict_carry: usize,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -319,7 +321,7 @@ impl Worker {
             index: BucketIndex::default(),
             fruitless_rounds: 0,
             backoff: BACKOFF_MIN,
-            evict_credit: 0.0,
+            evict_carry: 0,
         }
     }
 
@@ -328,7 +330,7 @@ impl Worker {
         while !self.ctx.shutdown.is_set() {
             if !self.ctx.shared.mode().is_evicting() {
                 self.pool.clear();
-                self.evict_credit = 0.0;
+                self.evict_carry = 0;
                 self.index.refreshed_at = None;
                 self.fruitless_rounds = 0;
                 self.backoff = BACKOFF_MIN;
@@ -394,8 +396,7 @@ impl Worker {
     fn is_hot(&self, atime: SystemTime) -> bool {
         SystemTime::now()
             .duration_since(atime)
-            .map(|age| age < self.ctx.config.hot_threshold)
-            .unwrap_or(true)
+            .map_or(true, |age| age < self.ctx.config.hot_threshold)
     }
 
     fn refresh_index(&mut self) {
@@ -458,10 +459,9 @@ impl Worker {
             }
             Err(e) => return Err(e),
         };
-        self.evict_credit += sampled as f64 * EVICT_FRACTION;
-        let quota = self.evict_credit.floor();
-        self.evict_credit -= quota;
-        let evicted = self.evict(quota as usize);
+        let owed = self.evict_carry + sampled;
+        self.evict_carry = owed % SAMPLED_PER_EVICTION;
+        let evicted = self.evict(owed / SAMPLED_PER_EVICTION);
         Ok(Some(RoundResult { sampled, evicted }))
     }
 
@@ -728,11 +728,11 @@ impl Worker {
         evicted
     }
 
-    fn young(&self, newest_store: Option<Instant>) -> bool {
-        newest_store.is_some_and(|t| t.elapsed() < self.ctx.config.hot_threshold)
+    fn young(&self, newest_store: Instant) -> bool {
+        newest_store.elapsed() < self.ctx.config.hot_threshold
     }
 
-    fn holds_back(&self, newest_store: Option<Instant>) -> bool {
+    fn holds_back(&self, newest_store: Instant) -> bool {
         self.young(newest_store) && !self.unpaced() && !self.pool.is_empty()
     }
 
@@ -842,7 +842,7 @@ impl Worker {
                 Err(_) => return false,
             }
         }
-        self.remove_block(&c.path, c.hash, c.size, &c.rank, true) == Unlink::Deleted
+        self.remove_block(&c) == Unlink::Deleted
     }
 
     /// Other rank dirs of `rank`'s model. Tensor-parallel ranks each hold a
@@ -859,29 +859,21 @@ impl Worker {
             .collect()
     }
 
-    /// Unlinks one sampled block file; `record_chain` also marks the block
-    /// gone in the chain index.
-    fn remove_block(
-        &mut self,
-        path: &Path,
-        hash: BlockHash,
-        size: u64,
-        rank: &Arc<RankDir>,
-        record_chain: bool,
-    ) -> Unlink {
+    /// Unlinks one sampled block file and marks it gone in the chain index.
+    fn remove_block(&self, c: &Candidate) -> Unlink {
         let target = Target {
-            path: path.to_path_buf(),
-            hash,
-            size,
-            rank: Arc::clone(rank),
+            path: c.path.clone(),
+            hash: c.hash,
+            size: c.size,
+            rank: Arc::clone(&c.rank),
         };
         let r = self.ctx.unlink(&target);
-        if let Some(chains) = self.ctx.chains.as_ref().filter(|_| record_chain) {
+        if let Some(chains) = &self.ctx.chains {
             match r {
                 Unlink::Deleted => {
-                    chains.deleted(hash);
+                    chains.deleted(c.hash);
                 }
-                Unlink::Missing => chains.vanished(hash),
+                Unlink::Missing => chains.vanished(c.hash),
                 Unlink::Skipped => {}
             }
         }
@@ -890,7 +882,10 @@ impl Worker {
 
     /// Removes `dir` if it is empty and unchanged for `DIR_CLEANUP_TTL_SECONDS`.
     fn reap_if_stale(&self, dir: &Path) {
-        if !self.ctx.config.enable_dir_cleanup || !self.acquire() {
+        let Some(ttl) = self.ctx.config.dir_cleanup else {
+            return;
+        };
+        if !self.acquire() {
             return;
         }
         let Ok(meta) = self.timed(OpKind::Stat, || fsops::stat_path(dir)) else {
@@ -899,7 +894,7 @@ impl Worker {
         let age = SystemTime::now()
             .duration_since(meta.mtime)
             .unwrap_or(Duration::ZERO);
-        if age < self.ctx.config.dir_cleanup_ttl || !self.acquire() {
+        if age < ttl || !self.acquire() {
             return;
         }
         Stats::add(&self.ctx.stats.rmdir_ops, 1);
@@ -1418,7 +1413,8 @@ mod tests {
         use std::path::{Path, PathBuf};
         use std::sync::Arc;
 
-        use crate::chains::{Chains, KvEvent};
+        use crate::chains::Chains;
+        use crate::chains::decode::KvEvent;
         use crate::config::ChainPolicy;
         use crate::layout::BlockHash;
         use crate::worker::tests::{Harness, age, config, harness};
@@ -1633,7 +1629,7 @@ mod tests {
 
     #[test]
     fn subtree_cascade_skips_blocks_without_a_digest_and_missing_files() {
-        use crate::chains::KvEvent;
+        use crate::chains::decode::KvEvent;
         use crate::config::ChainPolicy;
         use crate::worker::tests::chain_fixtures::{bucket, chain_harness, chains, hash, names};
 

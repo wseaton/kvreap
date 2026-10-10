@@ -135,28 +135,41 @@ impl Hysteresis {
 /// reading settles do not leave usage just above the target.
 pub const GRANT_MARGIN_PERCENT: u64 = 2;
 
-/// The delete budget to publish after a usage reading.
-///
-/// A prune is granted what is above the target plus `margin` and spends it.
-/// Once spent, a new grant comes only from a reading taken after no deletions
-/// for `USAGE_LAG`, so a reading that lags the deletions is never mistaken for
-/// space still to free: a fast statvfs ends the prune as soon as the budget is
-/// spent, a lagging one pauses it until the reading settles.
-pub fn next_budget(
-    evicting: bool,
-    outstanding: u64,
-    above_target: u64,
-    recently_freed: u64,
-    margin: u64,
-) -> u64 {
-    if !evicting {
-        0
-    } else if outstanding > 0 && outstanding != u64::MAX {
-        outstanding
-    } else if recently_freed == 0 && above_target > 0 {
-        above_target.saturating_add(margin)
-    } else {
-        0
+/// `SharedState::to_free` before the controller has granted anything.
+pub const UNGRANTED: u64 = u64::MAX;
+
+/// What the controller knows when it sets the delete budget after a reading.
+#[derive(Debug, Clone, Copy)]
+pub struct GrantInputs {
+    /// The mode the reading moves to.
+    pub mode: Mode,
+    /// Bytes left of the current grant.
+    pub outstanding: u64,
+    pub above_target: u64,
+    /// Bytes deleted within the last `USAGE_LAG`.
+    pub recently_freed: u64,
+    pub margin: u64,
+}
+
+impl GrantInputs {
+    /// The delete budget to publish.
+    ///
+    /// A prune is granted what is above the target plus `margin` and spends
+    /// it. Once spent, a new grant comes only from a reading taken after no
+    /// deletions for `USAGE_LAG`, so a reading that lags the deletions is
+    /// never mistaken for space still to free: a fast statvfs ends the prune
+    /// as soon as the budget is spent, a lagging one pauses it until the
+    /// reading settles.
+    pub fn next_grant(self) -> u64 {
+        if !self.mode.is_evicting() {
+            0
+        } else if self.outstanding > 0 && self.outstanding != UNGRANTED {
+            self.outstanding
+        } else if self.recently_freed == 0 && self.above_target > 0 {
+            self.above_target.saturating_add(self.margin)
+        } else {
+            0
+        }
     }
 }
 
@@ -189,7 +202,7 @@ impl RecentFrees {
 pub struct SharedState {
     mode: AtomicU8,
     usage_bits: AtomicU64,
-    /// Bytes still to delete before usage reaches the target; `u64::MAX` when unknown.
+    /// Bytes still to delete before usage reaches the target; `UNGRANTED` until the controller sets it.
     to_free: AtomicU64,
     freed_total: AtomicU64,
 }
@@ -199,7 +212,7 @@ impl Default for SharedState {
         Self {
             mode: AtomicU8::new(Mode::Idle.to_u8()),
             usage_bits: AtomicU64::new(0),
-            to_free: AtomicU64::new(u64::MAX),
+            to_free: AtomicU64::new(UNGRANTED),
             freed_total: AtomicU64::new(0),
         }
     }
@@ -243,7 +256,7 @@ impl SharedState {
     pub fn freed(&self, bytes: u64) {
         self.freed_total.fetch_add(bytes, Ordering::Relaxed);
         let mut left = self.to_free.load(Ordering::Acquire);
-        while left != u64::MAX {
+        while left != UNGRANTED {
             match self.to_free.compare_exchange_weak(
                 left,
                 left.saturating_sub(bytes),
@@ -266,7 +279,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::controller::{
-        DiskUsage, Hysteresis, Mode, RecentFrees, SharedState, UsageSource, disk_usage,
+        DiskUsage, Hysteresis, Mode, RecentFrees, SharedState, UNGRANTED, UsageSource, disk_usage,
     };
 
     fn h(cleanup: f64, target: f64) -> Hysteresis {
@@ -313,36 +326,47 @@ mod tests {
 
     #[test]
     fn budget_is_spent_before_a_settled_reading_refills_it() {
-        use crate::controller::next_budget;
+        use crate::controller::GrantInputs;
 
-        assert_eq!(next_budget(false, 500, 900, 0, 20), 0, "idle");
+        let grant = |mode, outstanding, above_target, recently_freed| {
+            GrantInputs {
+                mode,
+                outstanding,
+                above_target,
+                recently_freed,
+                margin: 20,
+            }
+            .next_grant()
+        };
+        let evicting = Mode::Evicting;
+        assert_eq!(grant(Mode::Idle, 500, 900, 0), 0, "idle");
         assert_eq!(
-            next_budget(true, u64::MAX, 900, 0, 20),
+            grant(evicting, UNGRANTED, 900, 0),
             920,
             "prune start: above target plus margin"
         );
         assert_eq!(
-            next_budget(true, 400, 900, 500, 20),
+            grant(evicting, 400, 900, 500),
             400,
             "spending: readings ignored"
         );
         assert_eq!(
-            next_budget(true, 400, 0, 0, 20),
+            grant(evicting, 400, 0, 0),
             400,
             "an outstanding grant is not withdrawn"
         );
         assert_eq!(
-            next_budget(true, 0, 700, 300, 20),
+            grant(evicting, 0, 700, 300),
             0,
             "spent while the reading may still lag: wait"
         );
         assert_eq!(
-            next_budget(true, 0, 120, 0, 20),
+            grant(Mode::Emergency, 0, 120, 0),
             140,
             "settled reading still above target: top up with margin"
         );
         assert_eq!(
-            next_budget(true, 0, 0, 0, 20),
+            grant(evicting, 0, 0, 0),
             0,
             "at or below target: nothing to grant, margin or not"
         );
@@ -355,7 +379,7 @@ mod tests {
         s.set_mode(Mode::Evicting);
         assert!(s.should_delete(), "no budget published yet: unbounded");
         s.freed(10);
-        assert_eq!(s.to_free(), u64::MAX, "an unbounded budget is not spent");
+        assert_eq!(s.to_free(), UNGRANTED, "an unbounded budget is not spent");
         s.set_to_free(250);
         s.freed(100);
         s.freed(100);

@@ -219,7 +219,7 @@ impl Budget {
     }
 
     pub fn rate(&self) -> f64 {
-        self.inner.lock().map(|g| g.aimd.rate()).unwrap_or(0.0)
+        self.inner.lock().map_or(0.0, |g| g.aimd.rate())
     }
 
     pub fn observe(&self, kind: OpKind, latency: Duration) {

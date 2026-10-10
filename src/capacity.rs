@@ -62,7 +62,7 @@ impl Samples {
     }
 
     fn len(&self) -> usize {
-        self.inner.lock().map(|w| w.samples.len()).unwrap_or(0)
+        self.inner.lock().map_or(0, |w| w.samples.len())
     }
 
     /// Estimated bytes of block files in the cache; `None` until the buckets

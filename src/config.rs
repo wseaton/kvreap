@@ -71,7 +71,15 @@ impl CapacityBytes {
     }
 }
 
-/// Number of worker threads, one per hex-modulo shard (mirrors NUM_CRAWLER_PROCESSES).
+/// What a deletion does to the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteMode {
+    Unlink,
+    /// Log and count deletions without unlinking (`DRY_RUN=true`).
+    DryRun,
+}
+
+/// Number of worker threads, one per hex-modulo shard (mirrors `NUM_CRAWLER_PROCESSES`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerCount(u8);
 
@@ -154,10 +162,12 @@ pub struct Config {
     pub cache_directory: PathBuf,
     pub cleanup_threshold: Percent,
     pub target_threshold: Percent,
-    pub dry_run: bool,
+    pub delete_mode: DeleteMode,
     pub log_level: LogLevel,
     pub workers: WorkerCount,
     pub usage_poll_interval: Duration,
+    /// Removed blocks per published event batch.
+    #[cfg(feature = "events")]
     pub event_batch_size: usize,
     /// 0 means unlimited.
     pub max_files_per_second: f64,
@@ -165,8 +175,9 @@ pub struct Config {
     pub delete_fanout: NonZeroUsize,
     pub hot_threshold: Duration,
     pub hex_bucket_len: usize,
-    pub enable_dir_cleanup: bool,
-    pub dir_cleanup_ttl: Duration,
+    /// How long an empty directory sits unchanged before it is removed;
+    /// `None` keeps empty directories.
+    pub dir_cleanup: Option<Duration>,
     pub log_file_path: Option<PathBuf>,
     pub storage_events_endpoint: Option<String>,
     /// When set, usage is estimated from bucket samples against this size instead of `statvfs`.
@@ -254,6 +265,7 @@ impl Config {
             });
         }
 
+        #[cfg(feature = "events")]
         let batch = int("DELETION_BATCH_SIZE", "100")?;
         let hex_len = int("HEX_BUCKET_LEN", "3")?;
         if !(1..=4).contains(&hex_len) {
@@ -270,10 +282,15 @@ impl Config {
             cache_directory: PathBuf::from(get("CACHE_DIRECTORY", "kv/model-cache/models")),
             cleanup_threshold: cleanup,
             target_threshold: target,
-            dry_run: flag("DRY_RUN", "false"),
+            delete_mode: if flag("DRY_RUN", "false") {
+                DeleteMode::DryRun
+            } else {
+                DeleteMode::Unlink
+            },
             log_level: LogLevel::parse(&get("LOG_LEVEL", "INFO")),
             workers: WorkerCount::new(int("NUM_CRAWLER_PROCESSES", "8")?)?,
             usage_poll_interval: Duration::from_secs_f64(poll),
+            #[cfg(feature = "events")]
             event_batch_size: usize::try_from(batch.max(1)).unwrap_or(1),
             max_files_per_second: non_negative(
                 "DELETION_MAX_FILES_PER_SECOND",
@@ -299,11 +316,13 @@ impl Config {
                 )? * 60.0,
             ),
             hex_bucket_len: usize::try_from(hex_len).unwrap_or(3),
-            enable_dir_cleanup: flag("ENABLE_DIR_CLEANUP", "true"),
-            dir_cleanup_ttl: Duration::from_secs_f64(non_negative(
-                "DIR_CLEANUP_TTL_SECONDS",
-                num("DIR_CLEANUP_TTL_SECONDS", "120.0")?,
-            )?),
+            dir_cleanup: {
+                let ttl = Duration::from_secs_f64(non_negative(
+                    "DIR_CLEANUP_TTL_SECONDS",
+                    num("DIR_CLEANUP_TTL_SECONDS", "120.0")?,
+                )?);
+                flag("ENABLE_DIR_CLEANUP", "true").then_some(ttl)
+            },
             log_file_path: optional("LOG_FILE_PATH").map(PathBuf::from),
             storage_events_endpoint: optional("STORAGE_EVENTS_ENDPOINT"),
             capacity_bytes: optional("CAPACITY_BYTES")
@@ -337,7 +356,9 @@ impl Config {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::config::{ChainPolicy, Config, ConfigError, LogLevel};
+    use std::time::Duration;
+
+    use crate::config::{ChainPolicy, Config, ConfigError, DeleteMode, LogLevel};
 
     fn cfg(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
         let env: HashMap<String, String> = pairs
@@ -357,16 +378,16 @@ mod tests {
         );
         assert_eq!(c.cleanup_threshold.get(), 85.0);
         assert_eq!(c.target_threshold.get(), 70.0);
-        assert!(!c.dry_run);
+        assert_eq!(c.delete_mode, DeleteMode::Unlink);
         assert_eq!(c.log_level, LogLevel::Info);
         assert_eq!(c.workers.get(), 8);
         assert_eq!(c.usage_poll_interval.as_secs_f64(), 0.5);
+        #[cfg(feature = "events")]
         assert_eq!(c.event_batch_size, 100);
         assert_eq!(c.max_files_per_second, 0.0);
         assert_eq!(c.hot_threshold.as_secs(), 3600);
         assert_eq!(c.hex_bucket_len, 3);
-        assert!(c.enable_dir_cleanup);
-        assert_eq!(c.dir_cleanup_ttl.as_secs(), 120);
+        assert_eq!(c.dir_cleanup, Some(Duration::from_secs(120)));
         assert_eq!(c.log_file_path, None);
         assert_eq!(c.storage_events_endpoint, None);
         assert_eq!(c.capacity_bytes, None);
@@ -512,14 +533,15 @@ mod tests {
         ])
         .expect("parse");
         assert_eq!(c.workers.get(), 4);
+        #[cfg(feature = "events")]
         assert_eq!(c.event_batch_size, 250);
     }
 
     #[test]
     fn booleans_only_true_is_true() {
         let c = cfg(&[("DRY_RUN", "TRUE"), ("ENABLE_DIR_CLEANUP", "yes")]).expect("parse");
-        assert!(c.dry_run);
-        assert!(!c.enable_dir_cleanup);
+        assert_eq!(c.delete_mode, DeleteMode::DryRun);
+        assert_eq!(c.dir_cleanup, None);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! The llmd_fs_backend on-disk layout:
+//! The `llmd_fs_backend` on-disk layout:
 //!
 //! ```text
 //! <cache>/<model>_<digest>/config.json            {"model_name": ...}
@@ -71,10 +71,8 @@ impl Shard {
             return false;
         }
         match u32::from_str_radix(name, 16) {
-            Ok(v) => {
-                let m = (v % u32::from(HEX_MODULO_BASE)) as u8;
-                (self.min..=self.max).contains(&m)
-            }
+            Ok(v) => u8::try_from(v % u32::from(HEX_MODULO_BASE))
+                .is_ok_and(|m| (self.min..=self.max).contains(&m)),
             Err(_) => false,
         }
     }

@@ -13,8 +13,8 @@ use std::time::{Duration, SystemTime};
 use crate::fsops;
 
 const PROBE_LEN: usize = 4096;
-const BACKDATE: Duration = Duration::from_secs(2 * 24 * 3600);
-const BACKDATE_TOLERANCE: Duration = Duration::from_secs(3600);
+const BACKDATE: Duration = Duration::from_hours(48);
+const BACKDATE_TOLERANCE: Duration = Duration::from_hours(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtimeBehavior {

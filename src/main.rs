@@ -26,10 +26,10 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 use crate::atime::AtimeBehavior;
 use crate::budget::Budget;
 use crate::capacity::{Sampler, Samples, statvfs_overreports};
-use crate::config::Config;
+use crate::config::{CapacityBytes, Config};
 use crate::controller::{
-    GRANT_MARGIN_PERCENT, Hysteresis, Mode, RecentFrees, SharedState, USAGE_LAG, UsageSource,
-    disk_usage, next_budget,
+    GRANT_MARGIN_PERCENT, GrantInputs, Hysteresis, Mode, RecentFrees, SharedState, USAGE_LAG,
+    UsageSource, disk_usage,
 };
 use crate::layout::Shard;
 use crate::shutdown::Shutdown;
@@ -77,17 +77,16 @@ fn wait_for_mount(path: &Path, shutdown: &Shutdown) -> bool {
 fn unix_now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+        .map_or(0.0, |d| d.as_secs_f64())
 }
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 fn controller_loop(
-    config: Arc<Config>,
-    source: UsageSource,
-    shared: Arc<SharedState>,
-    shutdown: Arc<Shutdown>,
+    config: &Config,
+    source: &UsageSource,
+    shared: &SharedState,
+    shutdown: &Shutdown,
 ) {
     let hysteresis = Hysteresis::new(config.cleanup_threshold, config.target_threshold);
     let mut mode = Mode::Idle;
@@ -111,13 +110,16 @@ fn controller_loop(
                 shared.set_usage(pct);
                 let recent = recent_frees.observe(Instant::now(), shared.freed_total(), USAGE_LAG);
                 let next = hysteresis.next(mode, pct);
-                shared.set_to_free(next_budget(
-                    next.is_evicting(),
-                    shared.to_free(),
-                    usage.above(config.target_threshold),
-                    recent,
-                    usage.total_bytes / 100 * GRANT_MARGIN_PERCENT,
-                ));
+                shared.set_to_free(
+                    GrantInputs {
+                        mode: next,
+                        outstanding: shared.to_free(),
+                        above_target: usage.above(config.target_threshold),
+                        recently_freed: recent,
+                        margin: usage.total_bytes / 100 * GRANT_MARGIN_PERCENT,
+                    }
+                    .next_grant(),
+                );
                 if next != mode {
                     let previous = mode;
                     mode = next;
@@ -275,7 +277,9 @@ fn start_chains(config: &Config, shutdown: &Arc<Shutdown>) -> anyhow::Result<Cha
             Arc::clone(shutdown),
         );
         spawn("kv-events".into(), move || {
-            if let Err(e) = chains::subscribe(&endpoints, replay_port, &chains, &shutdown) {
+            if let Err(e) =
+                chains::subscriber::subscribe(&endpoints, replay_port, &chains, &shutdown)
+            {
                 tracing::warn!(error = %e, "KV events subscriber failed, chain index stays empty");
             }
         })?
@@ -358,7 +362,7 @@ fn run(config: Config) -> anyhow::Result<()> {
             Arc::clone(&shutdown),
         );
         spawn("controller".into(), move || {
-            controller_loop(config, source, shared, shutdown)
+            controller_loop(&config, &source, &shared, &shutdown);
         })?
     };
 
@@ -430,8 +434,8 @@ fn main() -> ExitCode {
         workers = config.workers.get(),
         max_files_per_second = config.max_files_per_second,
         hot_threshold_secs = config.hot_threshold.as_secs(),
-        dry_run = config.dry_run,
-        capacity_bytes = config.capacity_bytes.map(|c| c.get()),
+        delete_mode = ?config.delete_mode,
+        capacity_bytes = config.capacity_bytes.map(CapacityBytes::get),
         version = env!("CARGO_PKG_VERSION"),
         "kvreap starting"
     );

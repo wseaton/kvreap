@@ -16,7 +16,7 @@ impl Shutdown {
     }
 
     pub fn is_set(&self) -> bool {
-        self.set.lock().map(|g| *g).unwrap_or(true)
+        self.set.lock().map_or(true, |g| *g)
     }
 
     /// Sleeps for `timeout` or until triggered. Returns true if triggered.
