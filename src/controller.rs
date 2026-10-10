@@ -10,7 +10,7 @@ use crate::config::{CapacityBytes, Percent};
 
 pub const EMERGENCY_FLOOR: f64 = 97.0;
 /// How long a deletion may take to show up in a usage reading.
-pub const USAGE_LAG: Duration = Duration::from_secs(2);
+pub const USAGE_LAG: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -280,6 +280,29 @@ mod tests {
         assert_eq!(r.observe(at(2500), 300, lag), 200, "the t=0 mark aged out");
         assert_eq!(r.observe(at(5000), 300, lag), 0, "nothing freed for 2 s");
         assert_eq!(r.observe(at(5100), 350, lag), 50);
+    }
+
+    #[test]
+    fn frees_hidden_by_a_lagging_reading_are_not_granted_twice() {
+        // VAST statvfs shows deletions ~2-4 s late: 400 bytes over target, 300
+        // freed 3 s ago and not visible yet, so only 100 may still be granted.
+        let t0 = Instant::now();
+        let mut r = RecentFrees::default();
+        r.observe(t0, 0, crate::controller::USAGE_LAG);
+        let recent = r.observe(
+            t0 + Duration::from_secs(3),
+            300,
+            crate::controller::USAGE_LAG,
+        );
+        let u = DiskUsage {
+            total_bytes: 1000,
+            used_bytes: 1100 - 400,
+        };
+        assert_eq!(
+            u.above(Percent::new("t", 30.0).expect("pct"))
+                .saturating_sub(recent),
+            100
+        );
     }
 
     #[test]
