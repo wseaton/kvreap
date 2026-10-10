@@ -58,6 +58,12 @@ def main() -> int:
     r.add_argument(
         "--vllm-memory-gib", type=int, default=96, help="vLLM pod memory limit; the CPU tier is pinned host memory"
     )
+    r.add_argument(
+        "--fs-stripe-blocks",
+        type=int,
+        default=0,
+        help="load the striped fs tier (bench/vllm_plugins) with this many blocks per task minimum; 0 = stock tier",
+    )
     r.add_argument("--fs-read-threads", type=int, default=16, help="fs tier n_read_threads")
     r.add_argument("--churn-input-len", type=int, default=4096, help="tokens per churn prompt")
     r.add_argument("--hot-prefix-len", type=int, default=2048, help="tokens per repeated hot prefix")
@@ -132,6 +138,7 @@ def main() -> int:
         kv_cache_dtype=args.kv_cache_dtype,
         fs_read_threads=args.fs_read_threads,
         vllm_memory_gib=args.vllm_memory_gib,
+        fs_stripe_blocks=args.fs_stripe_blocks,
         churn_input_len=args.churn_input_len,
         hot_prefix_len=args.hot_prefix_len,
         max_model_len=args.max_model_len,

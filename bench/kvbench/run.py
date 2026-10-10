@@ -112,6 +112,7 @@ class RunConfig:
     kv_cache_dtype: str | None = None
     fs_read_threads: int = 16
     vllm_memory_gib: int = 96
+    fs_stripe_blocks: int = 0
     evictor_env: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -227,8 +228,18 @@ def nyann_config(cfg: RunConfig) -> dict[str, Any]:
     }
 
 
+PLUGINS = Path(__file__).parent.parent / "vllm_plugins"
+
+
+def shm_gib(cfg: RunConfig) -> int:
+    """/dev/shm for vLLM: the CPU tier lives there as one shared region, plus headroom."""
+    return max(16, -(-cfg.cpu_tier_bytes // 1024**3) + 8)
+
+
 def sampler_configmap(cfg: RunConfig) -> Manifest:
     data = {"sampler.py": (Path(__file__).parent / "sampler.py").read_text()}
+    if cfg.fs_stripe_blocks:
+        data["striped_fs.py"] = (PLUGINS / "striped_fs.py").read_text()
     if cfg.workload == "agent":
         data["nyann.json"] = json.dumps(nyann_config(cfg))
         data["agent.txt"] = agent_preamble(cfg.agent_system_prompt_tokens)
@@ -275,7 +286,15 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
             "block_size": cfg.offload_block_tokens,
             "secondary_tiers": [
                 {
-                    "type": "fs",
+                    **(
+                        {
+                            "type": "StripedFileSystemTierManager",
+                            "module_path": "striped_fs",
+                            "stripe_blocks": cfg.fs_stripe_blocks,
+                        }
+                        if cfg.fs_stripe_blocks
+                        else {"type": "fs"}
+                    ),
                     "root_dir": f"{KV_MOUNT}/{CACHE_DIRECTORY}",
                     "n_read_threads": cfg.fs_read_threads,
                     "n_write_threads": 16,
@@ -303,6 +322,8 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
         {"name": "HOME", "value": "/tmp"},
         {"name": "VLLM_LOGGING_LEVEL", "value": "INFO"},
     ]
+    if cfg.fs_stripe_blocks:
+        env.append({"name": "PYTHONPATH", "value": "/bench"})
     ports = [{"containerPort": 8000}]
     svc_ports = [{"name": "http", "port": 8000, "targetPort": 8000}]
     if cfg.kv_events:
@@ -342,6 +363,7 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
                     },
                     "volumeMounts": [
                         {"name": "kv", "mountPath": KV_MOUNT},
+                        {"name": "bench", "mountPath": "/bench"},
                         {"name": "hf", "mountPath": "/models"},
                         {"name": "shm", "mountPath": "/dev/shm"},
                     ],
@@ -351,7 +373,7 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
             "volumes": [
                 {"name": "kv", "persistentVolumeClaim": {"claimName": cfg.kv_pvc}},
                 {"name": "hf", "persistentVolumeClaim": {"claimName": cfg.hf_pvc}},
-                {"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": "16Gi"}},
+                {"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": f"{shm_gib(cfg)}Gi"}},
                 bench_volume(cfg),
                 SAMPLES_VOLUME,
             ],

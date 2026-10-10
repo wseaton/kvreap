@@ -151,3 +151,28 @@ def test_vllm_memory_limit_follows_the_flag() -> None:
     container, _ = vllm_parts(cfg(vllm_memory_gib=160))
     assert container["resources"]["limits"]["memory"] == "160Gi"
     assert vllm_parts(cfg())[0]["resources"]["limits"]["memory"] == "96Gi"
+
+
+def test_striped_tier_ships_the_plugin_and_sizes_shm() -> None:
+    from kvbench.run import sampler_configmap
+
+    c = cfg(fs_stripe_blocks=4, cpu_tier_bytes=32 * 1024**3, vllm_memory_gib=160)
+    container, _ = vllm_parts(c)
+    [kv] = [a for a in container["args"] if a.startswith("--kv-transfer-config=")]
+    [tier] = json.loads(kv.split("=", 1)[1])["kv_connector_extra_config"]["secondary_tiers"]
+    assert tier["type"] == "StripedFileSystemTierManager"
+    assert tier["module_path"] == "striped_fs"
+    assert tier["stripe_blocks"] == 4
+    assert {"name": "PYTHONPATH", "value": "/bench"} in container["env"]
+    assert {"name": "bench", "mountPath": "/bench"} in container["volumeMounts"]
+    assert "class StripedFileSystemTierManager" in sampler_configmap(c)["data"]["striped_fs.py"]
+    pod, _ = vllm_manifests(c)
+    [shm] = [v for v in pod["spec"]["volumes"] if v["name"] == "shm"]
+    assert shm["emptyDir"]["sizeLimit"] == "40Gi"
+
+    stock, _ = vllm_parts(cfg())
+    [kv] = [a for a in stock["args"] if a.startswith("--kv-transfer-config=")]
+    assert json.loads(kv.split("=", 1)[1])["kv_connector_extra_config"]["secondary_tiers"][0]["type"] == "fs"
+    assert "striped_fs.py" not in sampler_configmap(cfg())["data"]
+    [shm] = [v for v in vllm_manifests(cfg())[0]["spec"]["volumes"] if v["name"] == "shm"]
+    assert shm["emptyDir"]["sizeLimit"] == "16Gi"
