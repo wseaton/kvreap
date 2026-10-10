@@ -17,7 +17,8 @@
 //! (vLLM >= 0.12), or arrays with the tag first (older releases).
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -32,6 +33,7 @@ const SUBTREE_BUDGET: usize = 4096;
 const RECV_TIMEOUT: Duration = Duration::from_millis(500);
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+const RESOLVE_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_DEPTH: usize = 16;
 const MEDIUM_STORAGE: &str = "STORAGE";
 
@@ -772,11 +774,13 @@ pub fn decode_batch(payload: &[u8]) -> Result<Vec<KvEvent>, DecodeError> {
         .collect()
 }
 
-/// Subscribes to every endpoint and feeds decoded batches into `chains` until shutdown.
+/// Subscribes to every address the endpoints resolve to and feeds decoded
+/// batches into `chains` until shutdown.
 ///
-/// Each endpoint gets its own SUB socket, so one vLLM that is down or slow does
-/// not hold up the others. Connections retry with backoff; hostnames are
-/// resolved again on every reconnect.
+/// An endpoint may name a headless Service: it is resolved every
+/// `RESOLVE_INTERVAL`, each address gets its own SUB socket (so one vLLM that
+/// is down or slow does not hold up the others), and sockets for addresses
+/// that disappear are dropped. A failed lookup keeps the last addresses.
 pub fn subscribe(
     endpoints: &[String],
     chains: &Chains,
@@ -787,19 +791,67 @@ pub fn subscribe(
         .build()?;
     runtime.block_on(async {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
-        for endpoint in endpoints {
-            tokio::spawn(follow(endpoint.clone(), tx.clone()));
-        }
-        drop(tx);
+        let mut resolved: HashMap<&str, HashSet<SocketAddr>> = HashMap::new();
+        let mut followers: HashMap<SocketAddr, tokio::task::JoinHandle<()>> = HashMap::new();
+        let mut next_resolve = Instant::now();
         while !shutdown.is_set() {
-            match tokio::time::timeout(RECV_TIMEOUT, rx.recv()).await {
-                Ok(Some(payload)) => apply_payload(chains, &payload),
-                Ok(None) => break,
-                Err(_) => {}
+            if Instant::now() >= next_resolve {
+                for endpoint in endpoints {
+                    match resolve(endpoint).await {
+                        Ok(addrs) => {
+                            resolved.insert(endpoint.as_str(), addrs);
+                        }
+                        Err(e) => {
+                            tracing::warn!(endpoint, error = %e, "KV events endpoint lookup failed");
+                        }
+                    }
+                }
+                let desired: HashSet<SocketAddr> = resolved.values().flatten().copied().collect();
+                let current: HashSet<SocketAddr> = followers.keys().copied().collect();
+                let (add, remove) = plan_peers(&current, &desired);
+                for addr in remove {
+                    if let Some(handle) = followers.remove(&addr) {
+                        handle.abort();
+                        tracing::info!(%addr, "KV events peer gone");
+                    }
+                }
+                for addr in add {
+                    followers.insert(addr, tokio::spawn(follow(format!("tcp://{addr}"), tx.clone())));
+                }
+                next_resolve = Instant::now() + RESOLVE_INTERVAL;
             }
+            if let Ok(Some(payload)) = tokio::time::timeout(RECV_TIMEOUT, rx.recv()).await {
+                apply_payload(chains, &payload);
+            }
+        }
+        for handle in followers.into_values() {
+            handle.abort();
         }
     });
     Ok(())
+}
+
+/// Addresses of a `tcp://host:port` endpoint.
+async fn resolve(endpoint: &str) -> std::io::Result<HashSet<SocketAddr>> {
+    let host_port = endpoint.strip_prefix("tcp://").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{endpoint} is not a tcp:// endpoint"),
+        )
+    })?;
+    Ok(tokio::net::lookup_host(host_port).await?.collect())
+}
+
+/// Addresses to start following and to drop.
+fn plan_peers(
+    current: &HashSet<SocketAddr>,
+    desired: &HashSet<SocketAddr>,
+) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+    let mut add: Vec<SocketAddr> = desired.difference(current).copied().collect();
+    let mut remove: Vec<SocketAddr> = current.difference(desired).copied().collect();
+    add.sort();
+    remove.sort();
+    (add, remove)
 }
 
 fn apply_payload(chains: &Chains, payload: &[u8]) {
@@ -1352,6 +1404,47 @@ mod tests {
             "0x13 removed from STORAGE"
         );
         assert_eq!(chains.deleted(h(0x11)), Position::Root);
+    }
+
+    #[test]
+    fn peer_plan_adds_new_addresses_and_drops_gone_ones() {
+        use std::collections::HashSet;
+        use std::net::SocketAddr;
+
+        use crate::chains::plan_peers;
+
+        let a: SocketAddr = "10.0.0.1:5557".parse().expect("addr");
+        let b: SocketAddr = "10.0.0.2:5557".parse().expect("addr");
+        let c: SocketAddr = "10.0.0.3:5557".parse().expect("addr");
+        let current: HashSet<_> = [a, b].into();
+        let desired: HashSet<_> = [b, c].into();
+        assert_eq!(plan_peers(&current, &desired), (vec![c], vec![a]));
+        assert_eq!(plan_peers(&desired, &desired), (vec![], vec![]));
+    }
+
+    #[test]
+    fn subscriber_resolves_a_hostname_to_its_addresses() {
+        let chains = Arc::new(Chains::new(100, ChainPolicy::TailFirst, 2, None));
+        let shutdown = Arc::new(Shutdown::default());
+        let endpoint = {
+            let chains = Arc::clone(&chains);
+            publish_until(vec![unhex(GOLDEN_LEGACY)], move || {
+                Stats::get(&chains.stats.batches) > 0
+            })
+        };
+        let port = endpoint.rsplit(':').next().expect("port").to_string();
+        let handle = {
+            let (chains, shutdown) = (Arc::clone(&chains), Arc::clone(&shutdown));
+            let named = format!("tcp://localhost:{port}");
+            std::thread::spawn(move || subscribe(&[named], &chains, &shutdown))
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Stats::get(&chains.stats.batches) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        shutdown.trigger();
+        handle.join().expect("join").expect("subscribe");
+        assert!(Stats::get(&chains.stats.batches) >= 1);
     }
 
     #[test]
