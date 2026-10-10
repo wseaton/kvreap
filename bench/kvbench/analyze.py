@@ -30,6 +30,7 @@ CHAIN_COUNTERS = (
     ("cascaded", "chain deletions: cascaded below a deleted root"),
     ("undigested", "blocks announced without a digest"),
     ("young_edges", "leaf edges skipped as too young"),
+    ("young_fallbacks", "young leaf edges deleted under pressure"),
     ("event_batches", "KV event batches received"),
     ("decode_errors", "KV event decode errors"),
 )

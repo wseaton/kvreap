@@ -27,7 +27,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::budget::{Budget, OpKind};
 use crate::capacity::{BucketSample, Samples};
 #[cfg(feature = "events")]
-use crate::chains::{Chains, Rank};
+use crate::chains::{Chains, LeafEdge, Rank};
 #[cfg(feature = "events")]
 use crate::config::ChainPolicy;
 use crate::config::Config;
@@ -519,17 +519,18 @@ impl Worker {
 
     /// Dead candidates take their whole subtree with them. Any other
     /// candidate maps to the radix leaf edge it belongs to (or, inside a
-    /// shared prefix, the oldest edge below it), which is deleted leaf first
-    /// unless one of its blocks is younger than the hot threshold.
+    /// shared prefix, the oldest edge below it), deleted leaf first. Edges
+    /// with a block younger than the hot threshold wait; if the round still
+    /// falls short, the least recently written of them go anyway.
     #[cfg(feature = "events")]
     fn evict_radix(&mut self, quota: usize, chains: &Chains) -> usize {
         let mut window: Vec<Candidate> = std::iter::from_fn(|| self.pool.pop_oldest())
             .take(quota.saturating_mul(CHAIN_WINDOW))
             .collect();
         let mut held = Vec::new();
+        let mut young: Vec<(Option<Instant>, Candidate)> = Vec::new();
         let mut evicted = 0;
-        while evicted < quota && self.ctx.shared.mode().is_evicting() && !self.ctx.shutdown.is_set()
-        {
+        while evicted < quota && self.evicting() {
             if window.is_empty() {
                 break;
             }
@@ -552,52 +553,84 @@ impl Worker {
                 .is_some_and(|t| t.elapsed() < self.ctx.config.hot_threshold)
             {
                 Stats::add(&chains.stats.young_edges, 1);
-                held.push(c);
+                young.push((edge.newest_store, c));
                 continue;
             }
-            let Some(group) = leaf_group(&c.path) else {
-                held.push(c);
-                continue;
-            };
-            let ranks = [
-                std::slice::from_ref(&c.rank),
-                self.sibling_ranks(&c.rank).as_slice(),
-            ]
-            .concat();
-            let own_name = c
-                .path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(str::to_owned);
-            let mut candidate_gone = false;
-            for b in edge.blocks.iter().rev() {
-                let is_candidate = b.hash == c.hash;
-                let Some(name) = b
-                    .file_name
-                    .clone()
-                    .or_else(|| own_name.clone().filter(|_| is_candidate))
-                else {
-                    continue;
-                };
-                let files = self.remove_named(&ranks, &name, &group, b.hash, c.size);
-                if files > 0 {
-                    evicted += files;
-                    chains.deleted(b.hash);
-                    if is_candidate {
-                        candidate_gone = true;
-                    } else {
-                        Stats::add(&chains.stats.cascaded, 1);
-                    }
-                }
-            }
+            let (files, candidate_gone) = self.delete_edge(&c, &edge, chains);
+            evicted += files;
             if !candidate_gone {
                 held.push(c);
             }
         }
-        for c in window.into_iter().chain(held) {
+        young.sort_by_key(|(newest, _)| *newest);
+        let mut young = young.into_iter().map(|(_, c)| c);
+        while evicted < quota && self.evicting() {
+            let Some(c) = young.next() else {
+                break;
+            };
+            let Some(edge) = chains.leaf_edge(c.hash) else {
+                held.push(c);
+                continue;
+            };
+            let (files, candidate_gone) = self.delete_edge(&c, &edge, chains);
+            if files > 0 {
+                Stats::add(&chains.stats.young_fallbacks, 1);
+            }
+            evicted += files;
+            if !candidate_gone {
+                held.push(c);
+            }
+        }
+        for c in window.into_iter().chain(held).chain(young) {
             self.pool.insert(c);
         }
         evicted
+    }
+
+    #[cfg(feature = "events")]
+    fn evicting(&self) -> bool {
+        self.ctx.shared.mode().is_evicting() && !self.ctx.shutdown.is_set()
+    }
+
+    /// Deletes `edge` leaf first in every rank dir of `c`'s model. Returns
+    /// files removed and whether `c` itself was one of them.
+    #[cfg(feature = "events")]
+    fn delete_edge(&mut self, c: &Candidate, edge: &LeafEdge, chains: &Chains) -> (usize, bool) {
+        let Some(group) = leaf_group(&c.path) else {
+            return (0, false);
+        };
+        let ranks = [
+            std::slice::from_ref(&c.rank),
+            self.sibling_ranks(&c.rank).as_slice(),
+        ]
+        .concat();
+        let own_name = c
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned);
+        let (mut files, mut candidate_gone) = (0, false);
+        for b in edge.blocks.iter().rev() {
+            let is_candidate = b.hash == c.hash;
+            let Some(name) = b
+                .file_name
+                .clone()
+                .or_else(|| own_name.clone().filter(|_| is_candidate))
+            else {
+                continue;
+            };
+            let removed = self.remove_named(&ranks, &name, &group, b.hash, c.size);
+            if removed > 0 {
+                files += removed;
+                chains.deleted(b.hash);
+                if is_candidate {
+                    candidate_gone = true;
+                } else {
+                    Stats::add(&chains.stats.cascaded, 1);
+                }
+            }
+        }
+        (files, candidate_gone)
     }
 
     /// Ranks are recomputed after every deletion: removing a leaf can turn
@@ -1552,8 +1585,8 @@ mod tests {
 
     #[cfg(feature = "events")]
     #[test]
-    fn radix_leaves_young_edges_alone() {
-        use crate::worker::tests::chain_fixtures::{bucket, chains};
+    fn radix_falls_back_to_the_least_recently_written_young_edges() {
+        use crate::worker::tests::chain_fixtures::{bucket, chains, names};
 
         let (_tmp, cache) = bucket(&[
             (1, Some(9000)),
@@ -1563,13 +1596,15 @@ mod tests {
             (5, Some(8300)),
         ]);
         let mut h = radix_harness(&cache, "60");
-        h.worker.ctx.config = Arc::new(config(
-            &cache,
-            &[("FILE_ACCESS_TIME_THRESHOLD_MINUTES", "60")],
-        ));
-        run_rounds(&mut h, 5);
-        assert_eq!(bins(&cache).len(), 5, "every edge was stored moments ago");
-        assert!(Stats::get(&chains(&h).stats.young_edges) > 0);
+        h.worker.round().expect("round");
+        assert_eq!(
+            bins(&cache),
+            names(&[1, 2, 5]),
+            "all edges are young, so the least recently written go first"
+        );
+        let s = &chains(&h).stats;
+        assert!(Stats::get(&s.young_edges) > 0);
+        assert_eq!(Stats::get(&s.young_fallbacks), 2);
     }
 
     #[cfg(feature = "events")]

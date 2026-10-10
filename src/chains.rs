@@ -385,6 +385,8 @@ pub struct ChainStats {
     pub undigested: AtomicU64,
     /// Leaf edges left alone because a block in them is younger than the hot threshold.
     pub young_edges: AtomicU64,
+    /// Young edges deleted because nothing older was left to free.
+    pub young_fallbacks: AtomicU64,
 }
 
 /// The index shared by the subscriber and every worker.
@@ -521,6 +523,7 @@ impl Chains {
             cascaded = Stats::get(&s.cascaded),
             undigested = Stats::get(&s.undigested),
             young_edges = Stats::get(&s.young_edges),
+            young_fallbacks = Stats::get(&s.young_fallbacks),
             "chains"
         );
     }
