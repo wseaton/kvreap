@@ -131,11 +131,15 @@ impl Hysteresis {
     }
 }
 
+/// Share of the volume added to every grant, so the writes that land while a
+/// reading settles do not leave usage just above the target.
+pub const GRANT_MARGIN_PERCENT: u64 = 2;
+
 /// The delete budget to publish after a usage reading.
 ///
-/// A prune is granted what is above the target and spends it. Once spent, a
-/// new grant comes only from a reading taken after no deletions for
-/// `USAGE_LAG`, so a reading that lags the deletions is never mistaken for
+/// A prune is granted what is above the target plus `margin` and spends it.
+/// Once spent, a new grant comes only from a reading taken after no deletions
+/// for `USAGE_LAG`, so a reading that lags the deletions is never mistaken for
 /// space still to free: a fast statvfs ends the prune as soon as the budget is
 /// spent, a lagging one pauses it until the reading settles.
 pub fn next_budget(
@@ -143,13 +147,14 @@ pub fn next_budget(
     outstanding: u64,
     above_target: u64,
     recently_freed: u64,
+    margin: u64,
 ) -> u64 {
     if !evicting {
         0
     } else if outstanding > 0 && outstanding != u64::MAX {
         outstanding
-    } else if recently_freed == 0 {
-        above_target
+    } else if recently_freed == 0 && above_target > 0 {
+        above_target.saturating_add(margin)
     } else {
         0
     }
@@ -310,27 +315,36 @@ mod tests {
     fn budget_is_spent_before_a_settled_reading_refills_it() {
         use crate::controller::next_budget;
 
-        assert_eq!(next_budget(false, 500, 900, 0), 0, "idle");
-        assert_eq!(next_budget(true, u64::MAX, 900, 0), 900, "prune start");
+        assert_eq!(next_budget(false, 500, 900, 0, 20), 0, "idle");
         assert_eq!(
-            next_budget(true, 400, 900, 500),
+            next_budget(true, u64::MAX, 900, 0, 20),
+            920,
+            "prune start: above target plus margin"
+        );
+        assert_eq!(
+            next_budget(true, 400, 900, 500, 20),
             400,
             "spending: readings ignored"
         );
         assert_eq!(
-            next_budget(true, 400, 0, 0),
+            next_budget(true, 400, 0, 0, 20),
             400,
             "an outstanding grant is not withdrawn"
         );
         assert_eq!(
-            next_budget(true, 0, 700, 300),
+            next_budget(true, 0, 700, 300, 20),
             0,
             "spent while the reading may still lag: wait"
         );
         assert_eq!(
-            next_budget(true, 0, 120, 0),
-            120,
-            "settled reading still above target: top up"
+            next_budget(true, 0, 120, 0, 20),
+            140,
+            "settled reading still above target: top up with margin"
+        );
+        assert_eq!(
+            next_budget(true, 0, 0, 0, 20),
+            0,
+            "at or below target: nothing to grant, margin or not"
         );
     }
 

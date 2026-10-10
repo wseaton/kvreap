@@ -28,7 +28,8 @@ use crate::budget::Budget;
 use crate::capacity::{Sampler, Samples, statvfs_overreports};
 use crate::config::Config;
 use crate::controller::{
-    Hysteresis, Mode, RecentFrees, SharedState, USAGE_LAG, UsageSource, disk_usage, next_budget,
+    GRANT_MARGIN_PERCENT, Hysteresis, Mode, RecentFrees, SharedState, USAGE_LAG, UsageSource,
+    disk_usage, next_budget,
 };
 use crate::layout::Shard;
 use crate::shutdown::Shutdown;
@@ -115,6 +116,7 @@ fn controller_loop(
                     shared.to_free(),
                     usage.above(config.target_threshold),
                     recent,
+                    usage.total_bytes / 100 * GRANT_MARGIN_PERCENT,
                 ));
                 if next != mode {
                     let previous = mode;
