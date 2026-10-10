@@ -99,7 +99,11 @@ class FakeVllm:
     def serve_replays(self, timeout_ms: int) -> None:
         """Answers replay requests like vLLM's `_service_replay`, waiting up to `timeout_ms` for the first."""
         while self.replay.poll(timeout_ms):
-            client, _, start = self.replay.recv_multipart()
+            frames = self.replay.recv_multipart()
+            if len(frames) != 3:
+                print(f"invalid replay request: {frames!r}", file=sys.stderr, flush=True)
+                continue
+            client, _, start = frames
             start_seq = int.from_bytes(start, "big")
             for seq, batch in self.buffer:
                 if seq >= start_seq:
