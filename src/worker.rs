@@ -186,6 +186,10 @@ impl Worker {
                 self.ctx.shutdown.wait(IDLE_POLL);
                 continue;
             }
+            if !self.ctx.shared.should_delete() {
+                self.ctx.shutdown.wait(IDLE_POLL);
+                continue;
+            }
             match self.round() {
                 Ok(Some(r)) => {
                     if let Some(wait) = self.after_round(&r) {
@@ -402,8 +406,7 @@ impl Worker {
             };
         }
         let mut evicted = 0;
-        while evicted < quota && self.ctx.shared.mode().is_evicting() && !self.ctx.shutdown.is_set()
-        {
+        while evicted < quota && self.ctx.shared.should_delete() && !self.ctx.shutdown.is_set() {
             let Some(c) = self.pool.pop_oldest() else {
                 break;
             };
@@ -433,8 +436,7 @@ impl Worker {
             .take(quota.saturating_mul(CHAIN_WINDOW))
             .collect();
         let mut evicted = 0;
-        while evicted < quota && self.ctx.shared.mode().is_evicting() && !self.ctx.shutdown.is_set()
-        {
+        while evicted < quota && self.ctx.shared.should_delete() && !self.ctx.shutdown.is_set() {
             let best = window
                 .iter()
                 .enumerate()
@@ -472,7 +474,7 @@ impl Worker {
         };
         removed += self.remove_named(&siblings, &name, &group, hash, size);
         for d in chains.descendants(hash) {
-            if !self.ctx.shared.mode().is_evicting() || self.ctx.shutdown.is_set() {
+            if !self.ctx.shared.should_delete() || self.ctx.shutdown.is_set() {
                 break;
             }
             let Some(name) = d.file_name else {
@@ -589,7 +591,7 @@ impl Worker {
 
     #[cfg(feature = "events")]
     fn evicting(&self) -> bool {
-        self.ctx.shared.mode().is_evicting() && !self.ctx.shutdown.is_set()
+        self.ctx.shared.should_delete() && !self.ctx.shutdown.is_set()
     }
 
     /// Deletes `edge` leaf first in every rank dir of `c`'s model. Returns
@@ -642,8 +644,7 @@ impl Worker {
             .take(quota.saturating_mul(CHAIN_WINDOW))
             .collect();
         let mut evicted = 0;
-        while evicted < quota && self.ctx.shared.mode().is_evicting() && !self.ctx.shutdown.is_set()
-        {
+        while evicted < quota && self.ctx.shared.should_delete() && !self.ctx.shutdown.is_set() {
             let best = window
                 .iter()
                 .enumerate()
@@ -714,9 +715,10 @@ impl Worker {
         if self.ctx.config.dry_run {
             tracing::debug!(path = %path.display(), "[DRY RUN] would delete");
             Stats::add(&self.ctx.stats.files_deleted, 1);
+            self.ctx.shared.freed(size);
             return true;
         }
-        if !self.acquire() || !self.ctx.shared.mode().is_evicting() {
+        if !self.acquire() || !self.ctx.shared.should_delete() {
             return false;
         }
         match self.timed(OpKind::Unlink, || fsops::unlink_path(path)) {
@@ -730,6 +732,7 @@ impl Worker {
         }
         Stats::add(&self.ctx.stats.files_deleted, 1);
         Stats::add(&self.ctx.stats.bytes_freed, size);
+        self.ctx.shared.freed(size);
         #[cfg(feature = "events")]
         if let Some(chains) = self.ctx.chains.as_ref().filter(|_| record_chain) {
             chains.deleted(hash);
@@ -994,6 +997,25 @@ mod tests {
             bins(&cache),
             vec!["abcde00000000002.bin", "abcde00000000004.bin"]
         );
+    }
+
+    #[test]
+    fn eviction_stops_once_the_byte_budget_is_spent() {
+        let fx = fixture(6, 0);
+        let mut h = harness(config(&fx.cache, &[]));
+        h.shared.set_mode(Mode::Evicting);
+        h.shared.set_to_free(250);
+        run_rounds(&mut h, 50);
+        assert_eq!(
+            Stats::get(&h.stats.files_deleted),
+            3,
+            "100-byte files: the third deletion crosses the 250-byte budget"
+        );
+        assert_eq!(bins(&fx.cache).len(), 3);
+        assert!(!h.shared.should_delete());
+        h.shared.set_to_free(100);
+        run_rounds(&mut h, 50);
+        assert_eq!(bins(&fx.cache).len(), 2, "a new budget resumes eviction");
     }
 
     #[test]
@@ -1623,6 +1645,32 @@ mod tests {
         h.worker.round().expect("round");
         assert_eq!(bins(&cache), names(&[9, 10]), "2 and 3 were dead");
         assert_eq!(Stats::get(&chains(&h).stats.cascaded), 1);
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn subtree_cascade_stops_at_the_byte_budget() {
+        use crate::config::ChainPolicy;
+        use crate::worker::tests::chain_fixtures::{bucket, chain_harness, names};
+
+        // Fixture files are 1 byte: a budget of 3 bytes allows the root and two below it.
+        let (_tmp, cache) = bucket(&[
+            (1, Some(9000)),
+            (2, Some(8999)),
+            (3, Some(8998)),
+            (4, Some(8997)),
+            (5, Some(8996)),
+        ]);
+        let mut h = chain_harness(&cache, ChainPolicy::Subtree, &[1, 2, 3, 4, 5]);
+        h.shared.set_mode(Mode::Evicting);
+        h.shared.set_to_free(3);
+        h.worker.round().expect("round");
+        assert_eq!(bins(&cache).len(), 2, "left: {:?}", bins(&cache));
+        assert!(
+            !bins(&cache).contains(&names(&[1])[0]),
+            "the root goes first"
+        );
+        assert!(!h.shared.should_delete());
     }
 
     #[cfg(feature = "events")]

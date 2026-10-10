@@ -28,7 +28,9 @@ use crate::atime::AtimeBehavior;
 use crate::budget::Budget;
 use crate::capacity::{Sampler, Samples, statvfs_overreports};
 use crate::config::Config;
-use crate::controller::{Hysteresis, Mode, SharedState, UsageSource, disk_usage};
+use crate::controller::{
+    Hysteresis, Mode, RecentFrees, SharedState, USAGE_LAG, UsageSource, disk_usage,
+};
 use crate::layout::Shard;
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
@@ -90,6 +92,7 @@ fn controller_loop(
     let hysteresis = Hysteresis::new(config.cleanup_threshold, config.target_threshold);
     let mut mode = Mode::Idle;
     let mut have_usage = false;
+    let mut recent_frees = RecentFrees::default();
     loop {
         match source.read() {
             Ok(Some(usage)) => {
@@ -106,6 +109,8 @@ fn controller_loop(
                     }
                 }
                 shared.set_usage(pct);
+                let recent = recent_frees.observe(Instant::now(), shared.freed_total(), USAGE_LAG);
+                shared.set_to_free(usage.above(config.target_threshold).saturating_sub(recent));
                 let next = hysteresis.next(mode, pct);
                 if next != mode {
                     let previous = mode;
