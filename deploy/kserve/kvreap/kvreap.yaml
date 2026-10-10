@@ -1,0 +1,121 @@
+# One kvreap per shared KV cache PVC. Replace LLMISVC_NAME with the
+# LLMInferenceService name and KV_CACHE_PVC with its kvCacheOffloading
+# secondary[0].fileSystem.pvc.ref.name (kustomization.yaml does both).
+apiVersion: v1
+kind: Service
+metadata:
+  name: LLMISVC_NAME-kv-events
+  labels:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/part-of: llminferenceservice
+    app.kubernetes.io/name: LLMISVC_NAME
+    kserve.io/component: workload
+  ports:
+    - name: tcp-kv-events
+      port: 5557
+      targetPort: 5557
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: LLMISVC_NAME-kvreap
+  labels:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: LLMISVC_NAME
+      app.kubernetes.io/component: kvreap
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: LLMISVC_NAME
+        app.kubernetes.io/component: kvreap
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kvreap
+          image: quay.io/wseaton/kvreap:latest
+          env:
+            - name: PVC_MOUNT_PATH
+              value: /kv-cache
+            - name: CACHE_DIRECTORY
+              value: "."
+            - name: CLEANUP_THRESHOLD
+              value: "85"
+            - name: TARGET_THRESHOLD
+              value: "70"
+            - name: FILE_ACCESS_TIME_THRESHOLD_MINUTES
+              value: "2"
+            - name: KV_EVENTS_ENDPOINTS
+              value: tcp://LLMISVC_NAME-kv-events:5557
+            - name: KV_EVENTS_DISK_MEDIUM
+              value: STORAGE
+            - name: CHAIN_EVICTION
+              value: radix
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: kv-cache
+              mountPath: /kv-cache
+      volumes:
+        - name: kv-cache
+          persistentVolumeClaim:
+            claimName: KV_CACHE_PVC
+---
+# Selecting the workload pods for Ingress denies every port not listed, so
+# vLLM's 8000 stays open to all and only 5557 is limited to kvreap and the
+# EPP: BlockStored carries prompt token ids. Add any other port the workload
+# serves before applying.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: LLMISVC_NAME-kv-events
+  labels:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: llminferenceservice
+      app.kubernetes.io/name: LLMISVC_NAME
+      kserve.io/component: workload
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - port: 8000
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: LLMISVC_NAME
+              app.kubernetes.io/component: kvreap
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: llminferenceservice
+              app.kubernetes.io/name: LLMISVC_NAME
+              app.kubernetes.io/component: llminferenceservice-router-scheduler
+      ports:
+        - port: 5557
+          protocol: TCP

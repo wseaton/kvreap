@@ -1,0 +1,11 @@
+# Inputs for the kvreap component; not applied to the cluster.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kvreap-target
+  annotations:
+    config.kubernetes.io/local-config: "true"
+data:
+  llmisvc: qwen3-32b
+  pvc: qwen3-32b-kv-cache
+  kvEventsEndpoint: tcp://qwen3-32b-kv-events:5557

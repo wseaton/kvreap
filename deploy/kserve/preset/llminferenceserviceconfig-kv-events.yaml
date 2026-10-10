@@ -1,0 +1,36 @@
+# Opt-in preset (spec.baseRefs) for an LLMInferenceService whose
+# kvCacheOffloading uses a shared RWX pvc.ref filesystem tier cleaned up by
+# kvreap. vLLM binds its KV events PUB socket so both the EPP (discovery mode)
+# and kvreap can subscribe, sends full block hashes so kvreap can name the
+# files below a deleted block, and the fs tier publishes its own STORAGE
+# stores so kvreap knows what is on disk.
+#
+# --kv-transfer-config here replaces the one KServe renders from
+# spec.kvCacheOffloading (the launch script skips its own when
+# VLLM_ADDITIONAL_ARGS has one). Keep cpu_bytes_to_use in line with
+# spec.kvCacheOffloading.cpu; root_dir is where KServe mounts secondary tier 0.
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceServiceConfig
+metadata:
+  name: kv-offloading-kvreap
+spec:
+  template:
+    containers:
+      - name: main
+        ports:
+          - name: tcp-kv-events
+            containerPort: 5557
+            protocol: TCP
+        env:
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: PYTHONHASHSEED
+            value: "42"
+          - name: VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES
+            value: "0"
+          - name: VLLM_ADDITIONAL_ARGS
+            value: >-
+              --kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv@$(POD_IP)@{{ .Spec.Model.Name }}"}'
+              --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":34359738368,"secondary_tiers":[{"type":"fs","root_dir":"/mnt/kv-cache-0","n_read_threads":64,"enable_kv_events":true}]}}'
