@@ -1,0 +1,40 @@
+# The llm-d Python pvc_evictor's own usage check, run against a CoreWeave
+# node-local NVMe hostPath after writing 20 GiB into a cache meant to hold 16 GiB.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pvc-evictor-hostpath-proof
+  annotations: {sidecar.istio.io/inject: "false"}
+spec:
+  restartPolicy: Never
+  nodeSelector: {gpu.nvidia.com/class: H200}
+  imagePullSecrets: [{name: quay-wseaton-pull}]
+  containers:
+    - name: proof
+      image: quay.io/wseaton/pvc-evictor:a-f62b9a7
+      securityContext: {runAsUser: 0}
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+          SRC=$(dirname "$(find / -path /proc -prune -o -name activator.py -path '*processes*' -print 2>/dev/null | head -1)")/..
+          check() {
+            python3 - "$SRC" <<'PY'
+          import sys; sys.path.insert(0, sys.argv[1])
+          from utils.system import get_disk_usage_from_statvfs
+          u = get_disk_usage_from_statvfs("/kv-cache")
+          print(f"  pvc_evictor sees: usage={u.usage_percent:.2f}% of {u.total_bytes/2**40:.1f} TiB "
+                f"-> cleanup at 85% {'TRIGGERS' if u.usage_percent >= 85 else 'never triggers'}; "
+                f"{(0.85*u.total_bytes - u.used_bytes)/2**40:.1f} TiB more writes before it would")
+          PY
+          }
+          echo "== df on the hostPath";  df -h /kv-cache | tail -1
+          echo "== before"; check
+          mkdir -p /kv-cache/kv && dd if=/dev/zero of=/kv-cache/kv/blocks bs=64M count=320 status=none && sync
+          echo "== after writing $(du -sh /kv-cache/kv | cut -f1) into a cache budgeted at 16 GiB (125%)"; check
+          rm -rf /kv-cache/kv
+      volumeMounts: [{name: kv, mountPath: /kv-cache}]
+  volumes:
+    - name: kv
+      hostPath: {path: /mnt/local/kvreap-bench/proof, type: DirectoryOrCreate}

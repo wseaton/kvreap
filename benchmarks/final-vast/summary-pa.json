@@ -1,0 +1,310 @@
+{
+  "variant": "pa",
+  "duration_s": 2407.4657847881317,
+  "evictor_ops": {
+    "ACCESS": {
+      "count": 604609,
+      "per_sec": 251.29218744623287,
+      "p95_10s_per_sec": 669.2997606397531,
+      "mean_rtt_ms": 0.3045174650063099,
+      "mean_queue_ms": 0.00365690884522063
+    },
+    "FSINFO": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "FSSTAT": {
+      "count": 7238,
+      "per_sec": 3.008312566858637,
+      "p95_10s_per_sec": 3.09999970436099,
+      "mean_rtt_ms": 0.6388505111909367,
+      "mean_queue_ms": 0.010085659021829235
+    },
+    "GETATTR": {
+      "count": 33456625,
+      "per_sec": 13905.496743876325,
+      "p95_10s_per_sec": 20643.7896640877,
+      "mean_rtt_ms": 0.26603953626523896,
+      "mean_queue_ms": 0.003461706014877472
+    },
+    "LOOKUP": {
+      "count": 328764,
+      "per_sec": 136.64339219821952,
+      "p95_10s_per_sec": 744.8996625639537,
+      "mean_rtt_ms": 0.8295737976177441,
+      "mean_queue_ms": 0.004641627428793907
+    },
+    "NULL": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "PATHCONF": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "READDIRPLUS": {
+      "count": 526724,
+      "per_sec": 218.92103184112307,
+      "p95_10s_per_sec": 785.4004681351591,
+      "mean_rtt_ms": 1.3924237361502418,
+      "mean_queue_ms": 0.0036755492440063487
+    },
+    "REMOVE": {
+      "count": 208234,
+      "per_sec": 86.54779760254786,
+      "p95_10s_per_sec": 370.599796776883,
+      "mean_rtt_ms": 2.304047369785914,
+      "mean_queue_ms": 0.0034384394479287724
+    },
+    "RMDIR": {
+      "count": 393149,
+      "per_sec": 163.4035752069503,
+      "p95_10s_per_sec": 438.8999581432382,
+      "mean_rtt_ms": 1.972526955429112,
+      "mean_queue_ms": 0.003431269060839529
+    }
+  },
+  "evictor_total": [
+    35525343,
+    14765.313040738258
+  ],
+  "vllm_ops": {
+    "ACCESS": {
+      "count": 919354,
+      "per_sec": 381.9501468468768,
+      "p95_10s_per_sec": 1085.7001811957662,
+      "mean_rtt_ms": 0.7617163791096792,
+      "mean_queue_ms": 0.004217091566469499
+    },
+    "CREATE": {
+      "count": 263754,
+      "per_sec": 109.57789821053821,
+      "p95_10s_per_sec": 212.20024790315978,
+      "mean_rtt_ms": 1.6187242657931253,
+      "mean_queue_ms": 0.0030672520606322556
+    },
+    "FSINFO": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "FSSTAT": {
+      "count": 2434,
+      "per_sec": 1.011217286731007,
+      "p95_10s_per_sec": 1.1000000262260443,
+      "mean_rtt_ms": 0.9322103533278554,
+      "mean_queue_ms": 0.006984387838948234
+    },
+    "GETATTR": {
+      "count": 3391384,
+      "per_sec": 1408.9671843643998,
+      "p95_10s_per_sec": 3364.299598944235,
+      "mean_rtt_ms": 1.4043856431474584,
+      "mean_queue_ms": 0.0053606433243773045
+    },
+    "LOOKUP": {
+      "count": 1561120,
+      "per_sec": 648.5749920548519,
+      "p95_10s_per_sec": 1626.4004265404867,
+      "mean_rtt_ms": 0.6686577585323358,
+      "mean_queue_ms": 0.0031541457415189093
+    },
+    "MKDIR": {
+      "count": 247135,
+      "per_sec": 102.67345281687238,
+      "p95_10s_per_sec": 196.99999060630844,
+      "mean_rtt_ms": 2.2048637384425516,
+      "mean_queue_ms": 0.002909341048414834
+    },
+    "NULL": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "PATHCONF": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "READ": {
+      "count": 6806105,
+      "per_sec": 2827.6298403066307,
+      "p95_10s_per_sec": 7982.498477459244,
+      "mean_rtt_ms": 4.205882365905316,
+      "mean_queue_ms": 0.016389403337150985
+    },
+    "REMOVE": {
+      "count": 0,
+      "per_sec": 0.0,
+      "p95_10s_per_sec": 0.0,
+      "mean_rtt_ms": null,
+      "mean_queue_ms": null
+    },
+    "RENAME": {
+      "count": 263754,
+      "per_sec": 109.57789821053821,
+      "p95_10s_per_sec": 211.80002019882394,
+      "mean_rtt_ms": 2.571487067494711,
+      "mean_queue_ms": 0.012079437657817512
+    },
+    "SETATTR": {
+      "count": 263754,
+      "per_sec": 109.57789821053821,
+      "p95_10s_per_sec": 212.20024790315978,
+      "mean_rtt_ms": 0.938491928084503,
+      "mean_queue_ms": 0.007503203742881624
+    },
+    "WRITE": {
+      "count": 791262,
+      "per_sec": 328.73369463161464,
+      "p95_10s_per_sec": 635.4000605964718,
+      "mean_rtt_ms": 5.529833354818,
+      "mean_queue_ms": 0.18565784784306588
+    }
+  },
+  "vllm_rtt_deleting": {
+    "LOOKUP": 0.7349393644410884,
+    "GETATTR": 1.1227913839624324,
+    "CREATE": 1.5655938697318008,
+    "RENAME": 2.522458737529309,
+    "WRITE": 5.2800314682278175,
+    "READ": 4.105039596384381
+  },
+  "vllm_rtt_idle": {
+    "LOOKUP": 0.6326447690368503,
+    "GETATTR": 1.4510987533870867,
+    "CREATE": 1.63618869141176,
+    "RENAME": 2.5876040926745962,
+    "WRITE": 5.611947090640108,
+    "READ": 4.219385509390458
+  },
+  "prune_cycles": [
+    {
+      "start": 1791659842.013162,
+      "seconds": 40.06894612312317,
+      "usage_start": 85.242919921875,
+      "usage_end": 68.8958740234375
+    },
+    {
+      "start": 1791659922.143044,
+      "seconds": 80.62939095497131,
+      "usage_start": 79.5166015625,
+      "usage_end": 67.9302978515625
+    },
+    {
+      "start": 1791660143.504703,
+      "seconds": 40.07090401649475,
+      "usage_start": 85.9661865234375,
+      "usage_end": 67.982177734375
+    },
+    {
+      "start": 1791660374.387059,
+      "seconds": 40.570964097976685,
+      "usage_start": 84.9639892578125,
+      "usage_end": 69.8211669921875
+    },
+    {
+      "start": 1791660515.126769,
+      "seconds": 40.56508994102478,
+      "usage_start": 84.986572265625,
+      "usage_end": 68.9312744140625
+    },
+    {
+      "start": 1791660645.838914,
+      "seconds": 40.5669641494751,
+      "usage_start": 85.4522705078125,
+      "usage_end": 71.09375
+    },
+    {
+      "start": 1791660766.535667,
+      "seconds": 40.57347798347473,
+      "usage_start": 85.6915283203125,
+      "usage_end": 69.9951171875
+    },
+    {
+      "start": 1791660877.216746,
+      "seconds": 50.09980392456055,
+      "usage_start": 82.618408203125,
+      "usage_end": 70.224609375
+    },
+    {
+      "start": 1791660997.929189,
+      "seconds": 100.66523313522339,
+      "usage_start": 85.072021484375,
+      "usage_end": 69.8095703125
+    },
+    {
+      "start": 1791661218.79199,
+      "seconds": 40.57086706161499,
+      "usage_start": 85.4327392578125,
+      "usage_end": 72.6605224609375
+    },
+    {
+      "start": 1791661440.142045,
+      "seconds": 40.06474494934082,
+      "usage_start": 85.30029296875,
+      "usage_end": 71.05224609375
+    },
+    {
+      "start": 1791661610.916442,
+      "seconds": 40.064680099487305,
+      "usage_start": 85.880126953125,
+      "usage_end": 72.17529296875
+    }
+  ],
+  "max_usage_pct": 91.622314453125,
+  "pct_time_above_cleanup": 6.644518272425249,
+  "errors": {
+    "quota_exceeded": 0,
+    "store_failed": 0,
+    "load_failed": 266
+  },
+  "bench": {
+    "agent_requests": 2748,
+    "agent_failed": 0,
+    "agent_first_ttft_p50_ms": 1847.261711,
+    "agent_first_ttft_p90_ms": 6101.885757999999,
+    "agent_later_ttft_p50_ms": 645.2426439999999,
+    "agent_later_ttft_p90_ms": 6295.135459,
+    "agent_later_ttft_p99_ms": 18103.742530000003,
+    "agent_prompt_tok_per_s": null
+  },
+  "metrics": {
+    "vllm:external_prefix_cache_hits_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\"}": 35547984.0,
+    "vllm:external_prefix_cache_queries_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\"}": 48755956.0,
+    "vllm:kv_offload_load_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\"}": 5824181698560.0,
+    "vllm:kv_offload_load_time_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\"}": 217.81318384140337,
+    "vllm:kv_offload_store_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\"}": 2184225751040.0,
+    "vllm:kv_offload_store_time_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\"}": 81.54998289255418,
+    "vllm:kv_offload_tiering_chunk_hits_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\",tier=\"1:StripedFileSystemTierManager\"}": 2244351.0,
+    "vllm:kv_offload_tiering_chunk_queries_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\",tier=\"0:primary\"}": 3045919.0,
+    "vllm:kv_offload_tiering_chunk_queries_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\",tier=\"1:StripedFileSystemTierManager\"}": 2247115.0,
+    "vllm:kv_offload_tiering_promotion_job_failures_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\",tier=\"1:StripedFileSystemTierManager\"}": 68.0,
+    "vllm:kv_offload_tiering_read_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\",tier=\"1:StripedFileSystemTierManager\"}": 5824181698560.0,
+    "vllm:kv_offload_tiering_read_time_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\",tier=\"1:StripedFileSystemTierManager\"}": 16923.038473903143,
+    "vllm:kv_offload_tiering_write_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\",tier=\"1:StripedFileSystemTierManager\"}": 2185567928320.0,
+    "vllm:kv_offload_tiering_write_time_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\",tier=\"1:StripedFileSystemTierManager\"}": 4510.2011822151835,
+    "vllm:kv_offload_total_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\",transfer_type=\"CPU_to_GPU\"}": 5824181698560.0,
+    "vllm:kv_offload_total_bytes_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\",transfer_type=\"GPU_to_CPU\"}": 2184225751040.0,
+    "vllm:kv_offload_total_time_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\",transfer_type=\"CPU_to_GPU\"}": 217.81318384140337,
+    "vllm:kv_offload_total_time_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\",transfer_type=\"GPU_to_CPU\"}": 81.54998289255418,
+    "vllm:prefix_cache_hits_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\"}": 4435680.0,
+    "vllm:prefix_cache_queries_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-72B-Instruct\"}": 53191636.0
+  },
+  "chains": {}
+}

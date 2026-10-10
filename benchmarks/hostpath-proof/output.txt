@@ -1,0 +1,6 @@
+== df on the hostPath
+/dev/md127       28T  8.0T   20T  29% /kv-cache
+== before
+  pvc_evictor sees: usage=28.49% of 27.9 TiB -> cleanup at 85% never triggers; 15.8 TiB more writes before it would
+== after writing 20G into a cache budgeted at 16 GiB (125%)
+  pvc_evictor sees: usage=28.56% of 27.9 TiB -> cleanup at 85% never triggers; 15.8 TiB more writes before it would

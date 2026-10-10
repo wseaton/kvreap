@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 120" width="640" height="120" font-family="system-ui, -apple-system, Segoe UI, sans-serif" role="img" aria-label="Evictor NFS ops by type (mean ops/s)">
+<rect width="640" height="120" rx="8" fill="#fcfcfb"/>
+<text x="48" y="18" font-size="13" font-weight="600" fill="#0b0b0b">Evictor NFS ops by type (mean ops/s)</text>
+<line x1="585" x2="599" y1="14" y2="14" stroke="#eb6834" stroke-width="2"/>
+<text x="603" y="18" font-size="11" fill="#52514e">nr2</text>
+<line x1="542" x2="556" y1="14" y2="14" stroke="#2a78d6" stroke-width="2"/>
+<text x="560" y="18" font-size="11" fill="#52514e">nw2</text>
+<text x="320.0" y="60.0" text-anchor="middle" font-size="12" fill="#898781">no evictor ops</text></svg>
