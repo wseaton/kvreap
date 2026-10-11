@@ -261,6 +261,23 @@ def test_tiered_runs_one_evictor_per_tier() -> None:
 
 
 @needs_chart
+def test_shared_tier_values_reach_only_the_shared_evictor() -> None:
+    from dataclasses import replace
+
+    c = replace(tiered(), shared_tier_values={"config": {"cleanupThreshold": 80, "targetThreshold": 65}})
+    deps = [o for o in evictor_manifests(c) if o["kind"] == "Deployment"]
+
+    def env(dep: dict) -> dict[str, str]:
+        [ev] = [x for x in dep["spec"]["template"]["spec"]["containers"] if x["name"] == "evictor"]
+        return {e["name"]: e.get("value") for e in ev.get("env", [])}
+
+    by_role = {d["spec"]["template"]["metadata"]["labels"]["kvreap-bench/role"]: env(d) for d in deps}
+    assert float(by_role["evictor-shared"]["CLEANUP_THRESHOLD"]) == 80
+    assert float(by_role["evictor-shared"]["TARGET_THRESHOLD"]) == 65
+    assert float(by_role["evictor"]["CLEANUP_THRESHOLD"]) == 85
+
+
+@needs_chart
 def test_host_path_evictor_runs_on_vllms_node_with_capacity_bytes() -> None:
     c = cfg(kv_host_path="/mnt/local/kvreap-bench", pvc_size="160Gi")
     [dep] = [o for o in evictor_manifests(c) if o["kind"] == "Deployment"]

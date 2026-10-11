@@ -33,6 +33,12 @@ def main() -> int:
         "host path (LOCAL), each with its own evictor release; collects evictor-shared.log and "
         "evictor-shared-sampler.jsonl for the PVC tier",
     )
+    r.add_argument(
+        "--shared-tier-values",
+        default="{}",
+        help="JSON merged into the shared tier's chart values after --evictor-values, "
+        'e.g. \'{"config": {"cleanupThreshold": 80, "targetThreshold": 65}}\'',
+    )
     r.add_argument("--duration", type=int, default=1200, help="load duration in seconds")
     r.add_argument("--offload-block-tokens", type=int, default=16)
     r.add_argument(
@@ -137,6 +143,7 @@ def main() -> int:
         duration_s=args.duration,
         offload_block_tokens=args.offload_block_tokens,
         evictor_values=json.loads(args.evictor_values),
+        shared_tier_values=json.loads(args.shared_tier_values),
         placement=args.placement,
         share_nfs_client=args.share_nfs_client,
         kv_events=args.kv_events,

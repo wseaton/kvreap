@@ -107,6 +107,7 @@ class RunConfig:
     hot_prefix_len: int = 2048
     hot_request_rate: float = 2.0
     evictor_values: dict[str, Any] = field(default_factory=dict)
+    shared_tier_values: dict[str, Any] = field(default_factory=dict)
     placement: Placement = "any"
     share_nfs_client: bool = False
     kv_events: bool = False
@@ -644,6 +645,8 @@ def tier_evictor_manifests(cfg: RunConfig, tier: EvictorTier) -> list[Manifest]:
         },
         cfg.evictor_values,
     )
+    if not tier.host_path and cfg.tiered:
+        values = deep_merge(values, cfg.shared_tier_values)
     rendered = subprocess.run(
         ["helm", "template", tier.release(cfg), str(cfg.chart), "-f", "-"],
         input=yaml.safe_dump(values),
