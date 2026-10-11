@@ -6,7 +6,7 @@
 | d | `quay.io/wseaton/kvreap:d-a2a0bbe` |
 | e | `quay.io/wseaton/kvreap:e-3d5cd6d` |
 
-One 20-minute run per variant on coreweave-waldorf (1× H200, VAST), Qwen/Qwen3-0.6B, same settings as `benchmarks/README.md`, run back to back on 2026-10-09. All three run vLLM with `--kv-events` (vLLM publishes KV events over ZMQ and the fs tier publishes `STORAGE` stores). c and e use the same image and vLLM config, with block hashes sent as bytes; only `CHAIN_EVICTION` differs. d ran earlier on an image with the same tail-first code and vLLM's default int hashes, which tail-first does not need.
+One 20-minute run per variant on coreweave-waldorf (1× H200, VAST), Qwen/Qwen3-0.6B, same settings as `benchmarks/sampling-vast.md`, run back to back on 2026-10-09. All three run vLLM with `--kv-events` (vLLM publishes KV events over ZMQ and the fs tier publishes `STORAGE` stores). c and e use the same image and vLLM config, with block hashes sent as bytes; only `CHAIN_EVICTION` differs. d ran earlier on an image with the same tail-first code and vLLM's default int hashes, which tail-first does not need.
 
 - **c**: `observe`. Plain sampled LRU (oldest-written first); the chain index only classifies deletions.
 - **d**: `tail-first`. Among the oldest candidates, delete dead blocks, then childless ones, deferring chain interiors up to 8 rounds.

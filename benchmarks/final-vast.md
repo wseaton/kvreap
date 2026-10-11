@@ -6,7 +6,7 @@
 | gw | `quay.io/wseaton/kvreap:r-962281f` |
 | vr | `quay.io/wseaton/kvreap:r-0668381` |
 
-Final comparison on a shared VAST PVC: the llm-d Python `pvc_evictor` (upstream main, `quay.io/wseaton/pvc-evictor:a-f62b9a7`), kvreap's plain sampled LRU (`observe`), and kvreap's radix eviction. Qwen/Qwen2.5-72B-Instruct, TP=4, `--kv-cache-dtype fp8`, 4× H200 per run, fs tier on VAST through the striped tier plugin. nyann-bench `conversation_pool`: 32 sessions in rotation, 8 in flight, 2,048-token shared preamble, 8,000-token first turn, up to 30 turns of 500 tokens with 200-token replies. 40 minutes per run, 160Gi PVC, CPU tier 32 GiB, cleanup 85%, target 70%.
+Final comparison on a shared VAST PVC: the llm-d Python `pvc_evictor` (upstream main, `quay.io/wseaton/pvc-evictor:a-f62b9a7`), kvreap's plain sampled LRU (the `observe` policy at the time: chain index built, eviction by age), and kvreap's radix eviction. Qwen/Qwen2.5-72B-Instruct, TP=4, `--kv-cache-dtype fp8`, 4× H200 per run, fs tier on VAST through the striped tier plugin. nyann-bench `conversation_pool`: 32 sessions in rotation, 8 in flight, 2,048-token shared preamble, 8,000-token first turn, up to 30 turns of 500 tokens with 200-token replies. 40 minutes per run, 160Gi PVC, CPU tier 32 GiB, cleanup 85%, target 70%.
 
 **pa** (Python) and **vr** (kvreap radix, `r-0668381`) ran at the same time. **gw** (kvreap plain LRU, `r-962281f`) ran earlier the same day with identical settings; the limiter and missing-file fixes in `r-0668381` only change radix behavior.
 

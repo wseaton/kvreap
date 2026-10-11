@@ -1,4 +1,4 @@
-# PVC evictor A/B/C: vLLM 0.31 on VAST
+# Sampled LRU vs the Python pvc_evictor: Qwen3-0.6B on VAST
 
 | run | evictor image |
 |---|---|
