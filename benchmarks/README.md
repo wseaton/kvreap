@@ -8,6 +8,7 @@ images, settings and load.
 
 | report | what it shows |
 |---|---|
+| [../docs/report.md](../docs/report.md) | the full write-up: problem, policies, read path, hardening, shipping, references |
 | [final-vast.md](final-vast.md) | Python `pvc_evictor` vs kvreap plain LRU vs kvreap chain-aware, Qwen2.5-72B TP=4 on a shared VAST PVC |
 | [final-nvme.md](final-nvme.md) | kvreap plain LRU vs chain-aware on node-local NVMe through a hostPath |
 | [hostpath-proof/](hostpath-proof/) | the Python evictor's own usage function on a hostPath: it never reaches the threshold |
