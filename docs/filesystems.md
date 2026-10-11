@@ -128,7 +128,7 @@ In rough priority order.
    filesystem can't report it. Used bytes then come from a sampled estimate:
    mean block bytes over the last 64 sampled buckets x bucket count. Workers
    record every bucket they sample while evicting; a sampler thread lists the
-   buckets every 60 s and samples one bucket per second (back to back until
+   buckets every 5 s and samples one bucket every 100 ms (back to back until
    16 are in), so the estimate keeps up with vLLM while idle. Eviction waits
    for the first estimate. At startup kvreap warns when `statvfs` total is
    more than 10x `CAPACITY_BYTES` (VAST before the first write, hostPath,

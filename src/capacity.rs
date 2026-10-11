@@ -22,8 +22,8 @@ use crate::stats::Stats;
 
 const WINDOW: usize = 64;
 const MIN_SAMPLES: usize = 16;
-const IDLE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-const BUCKET_LIST_REFRESH: Duration = Duration::from_secs(60);
+const IDLE_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+const BUCKET_LIST_REFRESH: Duration = Duration::from_secs(5);
 const STATVFS_MISMATCH_FACTOR: u64 = 10;
 
 /// Block files found in one bucket and their total size.

@@ -766,8 +766,7 @@ fn radix_eviction_keeps_its_order_in_the_emergency_band() {
     fs::rename(staging.rank(), cache.rank()).expect("move chains into the cache");
 
     assert!(
-        wait_until(Duration::from_secs(150), || existing(&stale_blocks)
-            .is_empty()),
+        ev.wait_for_log("DELETION_END", Duration::from_secs(150)),
         "{}",
         ev.log()
     );
@@ -775,10 +774,19 @@ fn radix_eviction_keeps_its_order_in_the_emergency_band() {
     assert!(ev.sigterm().success());
     let log = ev.log();
     assert!(log.contains("usage in emergency band"), "{log}");
-    let kept: Vec<bool> = active_blocks.iter().map(|b| b.path.exists()).collect();
+    let kept = |blocks: &[Block]| -> Vec<bool> { blocks.iter().map(|b| b.path.exists()).collect() };
+    let (stale_kept, active_kept) = (kept(&stale_blocks), kept(&active_blocks));
+    for (name, kept) in [("stale", &stale_kept), ("active", &active_kept)] {
+        assert!(
+            kept.windows(2).all(|w| w[0] || !w[1]),
+            "the {name} chain lost blocks above its leaf end: {kept:?}\n{log}"
+        );
+    }
+    assert!(!stale_kept.iter().all(|&k| k), "nothing evicted\n{log}");
     assert!(
-        kept.windows(2).all(|w| w[0] || !w[1]),
-        "the active chain lost blocks above its leaf end: {kept:?}\n{log}"
+        active_kept.iter().all(|&k| k) || stale_kept.iter().all(|&k| !k),
+        "the active chain lost blocks while the stale one had some left: \
+         stale {stale_kept:?} active {active_kept:?}\n{log}"
     );
     let line = log
         .lines()
