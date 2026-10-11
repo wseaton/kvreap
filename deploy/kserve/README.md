@@ -13,6 +13,9 @@ conversation tails instead of cutting prefix chains in the middle; see
 | `kvreap-monitoring/` | optional kustomize Component: a PodMonitor for kvreap's metrics and a NetworkPolicy for its port |
 | `kvreap-metrics-rbac/` | optional kustomize Component, instead of `kvreap-monitoring`: the same over TLS with token auth through kube-rbac-proxy |
 | `example/` | an overlay that includes the preset and the kvreap Component for a service named `qwen3-32b` |
+| `preset-tiered/` | `LLMInferenceServiceConfig` `kv-offloading-kvreap-tiered`: node-local tier + shared PVC tier, with a kvreap sidecar for the node-local tier ([Tiered](#tiered-node-local--shared-storage)) |
+| `kvreap-shared-tier/` | kustomize Component, with `preset-tiered`: limits the `kvreap` Deployment to the shared tier's events |
+| `example-tiered/` | an overlay with `preset-tiered`, `kvreap` and `kvreap-shared-tier` |
 
 ```bash
 kubectl kustomize deploy/kserve/example
@@ -108,6 +111,70 @@ own KV event subscription, so the events are plaintext on the pod network.
   8000 as open to all; add any other port your workload serves. In a mesh,
   keep the ports named `tcp-*` so the sidecars carry them as opaque TCP with
   mTLS.
+
+## Tiered: node-local + shared storage
+
+```bash
+kubectl kustomize deploy/kserve/example-tiered
+```
+
+vLLM's `TieringOffloadingSpec` writes every block to every secondary tier
+and loads from the first tier in list order that has it. A block loaded from
+a later tier is not written back to an earlier one. With node-local disk
+listed first, hits come from local NVMe, and the shared tier serves what the
+node evicted and what other replicas wrote.
+
+```yaml
+spec:
+  baseRefs: [{name: kv-offloading-kvreap-tiered}]
+  kvCacheOffloading:
+    cpu: 32Gi
+    secondary:
+      - fileSystem:                       # /mnt/kv-cache-0, LOCAL
+          emptyDir: {size: 400Gi}
+      - fileSystem:                       # /mnt/kv-cache-1, REMOTE
+          pvc: {ref: {name: qwen3-32b-kv-cache}}
+```
+
+Each tier's fs config sets `locality` and `enable_kv_events`, so its
+`STORAGE` events say which tier wrote the block. Both tiers publish under
+the pod's one topic. There is one kvreap per tier, and each sets
+`KV_EVENTS_LOCALITY` to its tier. Every event still teaches parent links.
+
+- **Node-local tier: a sidecar in the workload pod.** KServe gives each pod
+  its own node-local volume (`emptyDir`, or `pvc.spec` for an ephemeral PVC
+  from a local-disk storage class), mounted only in that pod. The preset adds
+  a `kvreap` container that mounts `kv-cache-secondary-0` and subscribes on
+  loopback (`tcp://127.0.0.1:5557`) to its own pod's events. A DaemonSet does
+  not fit: it cannot mount another pod's `emptyDir`, and it would need to
+  pick the pods on its node out of the headless Service, because another
+  node's `LOCAL` stores are not on this disk.
+  `statvfs` on an `emptyDir` reports the node's disk, so the sidecar sets
+  `CAPACITY_BYTES`. The kubelet evicts the pod once the `emptyDir` passes
+  its `sizeLimit`, so keep `CAPACITY_BYTES` below the tier's `size` (the
+  preset uses 90% of 400Gi; kvreap's estimate trails the disk by a few
+  seconds).
+- **Shared tier: the `kvreap` Deployment** with `kvreap-shared-tier`, which
+  sets `KV_EVENTS_LOCALITY=REMOTE`. `data.pvc` names `secondary[1]`'s
+  `pvc.ref`.
+
+The preset renders the same as the single-tier one on upstream KServe and on
+the OpenDataHub/RHOAI fork: both mount tier *i* as volume
+`kv-cache-secondary-<i>` at `/mnt/kv-cache-<i>`, and both launch scripts
+skip their own `--kv-transfer-config` when `VLLM_ADDITIONAL_ARGS` has one.
+The preset covers single-node workloads (`spec.template`); a multi-node
+`spec.worker` needs the same container there. The sidecar runs as the pod's
+uid, so the same uid rule as above applies: on OpenShift leave it unset,
+elsewhere set the pod's `runAsUser` or `fsGroup` to vLLM's. To scrape the
+sidecar, point a PodMonitor at the workload pods' `kvreap-metrics` port.
+
+A `LOCAL` kvreap counts the shared tier's stores as a backing copy: when it
+deletes a block whose children are still on local disk, those children stay
+reachable, because a lookup that misses the parent locally loads it from the
+shared tier. It does not rank them as dead. The `REMOTE` kvreap does not
+count `LOCAL` stores as a copy, since node-local copies are per pod and
+evicted sooner. Neither tier prefers blocks the other tier also holds:
+with every block written to both, that would be every block.
 
 ## Optional: faster fs tier reads
 

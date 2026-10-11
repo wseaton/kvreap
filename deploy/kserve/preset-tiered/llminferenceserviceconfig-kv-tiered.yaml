@@ -1,0 +1,86 @@
+# Opt-in preset (spec.baseRefs) for an LLMInferenceService with two
+# filesystem tiers: a node-local tier first (kvCacheOffloading.secondary[0],
+# an emptyDir or a per-pod PVC on local NVMe) and a shared RWX pvc.ref tier
+# second (secondary[1], e.g. VAST). vLLM writes every block to both and loads
+# from the first that has it.
+#
+# Each tier publishes STORAGE events with its locality, LOCAL and REMOTE. The
+# kvreap sidecar evicts the node-local tier of its own pod from the events on
+# loopback; the shared tier's kvreap is the Deployment from ../kvreap with
+# ../kvreap-shared-tier, subscribed to every pod.
+#
+# --kv-transfer-config here replaces the one KServe renders from
+# spec.kvCacheOffloading, which has no locality or enable_kv_events. Keep
+# cpu_bytes_to_use in line with spec.kvCacheOffloading.cpu, and the sidecar's
+# CAPACITY_BYTES below secondary[0]'s size: the kubelet evicts a pod whose
+# emptyDir passes its sizeLimit.
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceServiceConfig
+metadata:
+  name: kv-offloading-kvreap-tiered
+spec:
+  template:
+    containers:
+      - name: main
+        ports:
+          - name: tcp-kv-events
+            containerPort: 5557
+            protocol: TCP
+          - name: tcp-kv-replay
+            containerPort: 5558
+            protocol: TCP
+        env:
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: PYTHONHASHSEED
+            value: "42"
+          - name: VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES
+            value: "0"
+          - name: VLLM_ADDITIONAL_ARGS
+            value: >-
+              --kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","topic":"kv@$(POD_IP)@{{ .Spec.Model.Name }}"}'
+              --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":34359738368,"secondary_tiers":[{"type":"fs","root_dir":"/mnt/kv-cache-0","n_read_threads":64,"enable_kv_events":true,"locality":"LOCAL"},{"type":"fs","root_dir":"/mnt/kv-cache-1","n_read_threads":64,"enable_kv_events":true,"locality":"REMOTE"}]}}'
+      - name: kvreap
+        image: quay.io/wseaton/kvreap:latest
+        env:
+          - name: PVC_MOUNT_PATH
+            value: /kv-cache
+          - name: CACHE_DIRECTORY
+            value: "."
+          - name: CAPACITY_BYTES
+            value: "386547056640"
+          - name: CLEANUP_THRESHOLD
+            value: "85"
+          - name: TARGET_THRESHOLD
+            value: "70"
+          - name: FILE_ACCESS_TIME_THRESHOLD_MINUTES
+            value: "2"
+          - name: KV_EVENTS_ENDPOINTS
+            value: tcp://127.0.0.1:5557
+          - name: KV_EVENTS_REPLAY_PORT
+            value: "5558"
+          - name: KV_EVENTS_DISK_MEDIUM
+            value: STORAGE
+          - name: KV_EVENTS_LOCALITY
+            value: LOCAL
+          - name: METRICS_ADDR
+            value: 0.0.0.0:9090
+        ports:
+          - name: kvreap-metrics
+            containerPort: 9090
+            protocol: TCP
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            memory: 2Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+        volumeMounts:
+          - name: kv-cache-secondary-0
+            mountPath: /kv-cache

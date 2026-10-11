@@ -1,0 +1,22 @@
+# With ../preset-tiered: points the ../kvreap Deployment at the shared tier's
+# events only (locality REMOTE), so the node-local tier's stores of the same
+# blocks do not count as files on the shared PVC.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+patches:
+  - target:
+      kind: Deployment
+      labelSelector: app.kubernetes.io/component=kvreap
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: kvreap
+      spec:
+        template:
+          spec:
+            containers:
+              - name: kvreap
+                env:
+                  - name: KV_EVENTS_LOCALITY
+                    value: REMOTE
