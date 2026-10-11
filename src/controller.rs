@@ -531,6 +531,7 @@ mod tests {
             samples.record(BucketSample {
                 files: 3,
                 bytes: 300,
+                untracked_bytes: 300,
             });
         }
         let usage = source.read().expect("read").expect("estimate");

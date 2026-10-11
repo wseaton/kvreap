@@ -2,7 +2,11 @@
 //! does not describe the volume (VAST before its first write, hostPath, emptyDir).
 //!
 //! ```text
-//!   used ~= mean(block bytes per sampled bucket, last WINDOW buckets) x bucket count
+//!   without KV events:
+//!     used ~= mean(block bytes per sampled bucket, last WINDOW buckets) x bucket count
+//!   with KV events:
+//!     used ~= blocks the index has on disk x rank dirs x mean block file bytes
+//!           + mean(bytes of files the index does not know, per bucket) x bucket count
 //!
 //!   workers ──(every bucket they sample while evicting)──┐
 //!   sampler ──(one bucket per IDLE_SAMPLE_INTERVAL)──────┴─► Samples ──► controller
@@ -14,9 +18,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::chains::Chains;
 use crate::config::CapacityBytes;
 use crate::fsops::{self, EntryKind};
-use crate::layout::{block_files, discover_rank_dirs, is_bucket_name};
+use crate::layout::{BlockHash, block_files, discover_rank_dirs, is_bucket_name};
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
 
@@ -31,21 +36,58 @@ const STATVFS_MISMATCH_FACTOR: u64 = 10;
 pub struct BucketSample {
     pub files: u64,
     pub bytes: u64,
+    /// Bytes of the files the chain index does not have on disk (all of them
+    /// without an index).
+    pub untracked_bytes: u64,
+}
+
+impl BucketSample {
+    pub fn add(&mut self, bytes: u64, tracking: Tracking) {
+        self.files += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+        if tracking == Tracking::Untracked {
+            self.untracked_bytes = self.untracked_bytes.saturating_add(bytes);
+        }
+    }
+}
+
+/// Whether the chain index has a sampled file's block on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tracking {
+    Tracked,
+    Untracked,
 }
 
 #[derive(Debug, Default)]
 struct Window {
     samples: VecDeque<BucketSample>,
     bucket_count: Option<u64>,
+    rank_dirs: Option<u64>,
 }
 
 /// Recent bucket samples shared by the workers, the sampler and the controller.
 #[derive(Debug, Default)]
 pub struct Samples {
     inner: Mutex<Window>,
+    chains: Option<Arc<Chains>>,
 }
 
 impl Samples {
+    /// With `chains`, blocks the index has on disk are counted, not sampled.
+    pub fn new(chains: Option<Arc<Chains>>) -> Self {
+        Self {
+            inner: Mutex::default(),
+            chains,
+        }
+    }
+
+    pub fn tracking(&self, hash: BlockHash) -> Tracking {
+        match &self.chains {
+            Some(c) if c.on_disk(hash) => Tracking::Tracked,
+            _ => Tracking::Untracked,
+        }
+    }
+
     pub fn record(&self, sample: BucketSample) {
         if let Ok(mut w) = self.inner.lock() {
             w.samples.push_back(sample);
@@ -58,6 +100,13 @@ impl Samples {
     pub fn set_bucket_count(&self, count: u64) {
         if let Ok(mut w) = self.inner.lock() {
             w.bucket_count = Some(count);
+        }
+    }
+
+    /// Rank dirs hold one file per block each.
+    pub fn set_rank_dirs(&self, count: u64) {
+        if let Ok(mut w) = self.inner.lock() {
+            w.rank_dirs = Some(count);
         }
     }
 
@@ -76,8 +125,23 @@ impl Samples {
         if w.samples.len() < MIN_SAMPLES {
             return None;
         }
-        let total: u128 = w.samples.iter().map(|s| u128::from(s.bytes)).sum();
-        let estimate = total.saturating_mul(u128::from(count)) / w.samples.len() as u128;
+        let n = w.samples.len() as u128;
+        let sum = |f: fn(&BucketSample) -> u64| -> u128 {
+            w.samples.iter().map(|s| u128::from(f(s))).sum()
+        };
+        let estimate = match &self.chains {
+            None => sum(|s| s.bytes).saturating_mul(u128::from(count)) / n,
+            Some(chains) => {
+                let blocks = u128::try_from(chains.on_disk_blocks()).unwrap_or(u128::MAX);
+                let tracked = blocks
+                    .saturating_mul(u128::from(w.rank_dirs.unwrap_or(1).max(1)))
+                    .saturating_mul(sum(|s| s.bytes))
+                    .checked_div(sum(|s| s.files))
+                    .unwrap_or(0);
+                let untracked = sum(|s| s.untracked_bytes).saturating_mul(u128::from(count)) / n;
+                tracked.saturating_add(untracked)
+            }
+        };
         Some(u64::try_from(estimate).unwrap_or(u64::MAX))
     }
 }
@@ -89,7 +153,7 @@ pub fn statvfs_overreports(statvfs_total: u64, capacity: CapacityBytes) -> bool 
 }
 
 /// Lists and stats one bucket without going through the op budget.
-fn bucket_sample(bucket: &Path, stats: &Stats) -> io::Result<BucketSample> {
+fn bucket_sample(bucket: &Path, samples: &Samples, stats: &Stats) -> io::Result<BucketSample> {
     let bucket_fd = fsops::open_dir(bucket)?;
     Stats::add(&stats.readdir_ops, 1);
     let leaves = fsops::list(&bucket_fd)?;
@@ -102,11 +166,10 @@ fn bucket_sample(bucket: &Path, stats: &Stats) -> io::Result<BucketSample> {
         let Ok(files) = fsops::list(&leaf_fd) else {
             continue;
         };
-        for (name, _) in block_files(&files) {
+        for (name, hash) in block_files(&files) {
             Stats::add(&stats.stat_ops, 1);
             if let Ok(meta) = fsops::stat_at(&leaf_fd, name) {
-                sample.files += 1;
-                sample.bytes = sample.bytes.saturating_add(meta.size);
+                sample.add(meta.size, samples.tracking(hash));
             }
         }
     }
@@ -127,7 +190,10 @@ pub struct Sampler {
 impl Sampler {
     fn list_buckets(&self) -> Vec<PathBuf> {
         let mut buckets = Vec::new();
-        for rank in discover_rank_dirs(&self.cache) {
+        let ranks = discover_rank_dirs(&self.cache);
+        self.samples
+            .set_rank_dirs(u64::try_from(ranks.len()).unwrap_or(u64::MAX));
+        for rank in ranks {
             Stats::add(&self.stats.readdir_ops, 1);
             let Ok(entries) = fsops::open_dir(&rank).and_then(|fd| fsops::list(&fd)) else {
                 continue;
@@ -155,7 +221,7 @@ impl Sampler {
                     .set_bucket_count(u64::try_from(buckets.len()).unwrap_or(u64::MAX));
             }
             let recorded = match fastrand::choice(&buckets) {
-                Some(bucket) => match bucket_sample(bucket, &self.stats) {
+                Some(bucket) => match bucket_sample(bucket, &self.samples, &self.stats) {
                     Ok(sample) => {
                         self.samples.record(sample);
                         true
@@ -201,7 +267,11 @@ mod tests {
     }
 
     fn sample(files: u64, bytes: u64) -> BucketSample {
-        BucketSample { files, bytes }
+        BucketSample {
+            files,
+            bytes,
+            untracked_bytes: bytes,
+        }
     }
 
     #[test]
@@ -254,6 +324,61 @@ mod tests {
     }
 
     #[test]
+    fn with_an_index_tracked_blocks_are_counted_and_only_the_rest_sampled() {
+        use crate::chains::testing::stored;
+        use crate::chains::{Chains, Tier};
+
+        let chains = Arc::new(Chains::new(100, Tier::default()));
+        chains.apply(&[stored(None, &[1, 2, 3, 4, 5], "STORAGE")]);
+        let s = Samples::new(Some(Arc::clone(&chains)));
+        s.set_bucket_count(100);
+        s.set_rank_dirs(2);
+        for i in 0..MIN_SAMPLES as u64 {
+            s.record(BucketSample {
+                files: 4,
+                bytes: 4000,
+                untracked_bytes: if i % 2 == 0 { 0 } else { 2000 },
+            });
+        }
+        // 5 blocks x 2 ranks x 1000 bytes per file, plus 1000 untracked bytes per bucket x 100.
+        assert_eq!(s.estimated_used_bytes(), Some(10_000 + 100_000));
+        chains.deleted(crate::layout::BlockHash(5));
+        assert_eq!(
+            s.estimated_used_bytes(),
+            Some(8_000 + 100_000),
+            "a deletion shows at once, before any bucket is sampled again"
+        );
+    }
+
+    #[test]
+    fn bucket_samples_split_tracked_from_untracked_bytes() {
+        use crate::chains::testing::stored;
+        use crate::chains::{Chains, Tier};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path();
+        write_block(cache, "abcde00000000001", 100);
+        write_block(cache, "abcde00000000002", 250);
+        let chains = Arc::new(Chains::new(100, Tier::default()));
+        chains.apply(&[stored(None, &[0xabcd_e000_0000_0001], "STORAGE")]);
+        let samples = Samples::new(Some(chains));
+        let got = bucket_sample(
+            &cache.join("m_abcdef012345_r0/abc"),
+            &samples,
+            &Stats::default(),
+        )
+        .expect("sample");
+        assert_eq!(
+            got,
+            BucketSample {
+                files: 2,
+                bytes: 350,
+                untracked_bytes: 250,
+            }
+        );
+    }
+
+    #[test]
     fn huge_estimates_saturate() {
         let s = Samples::default();
         s.set_bucket_count(u64::MAX);
@@ -294,7 +419,12 @@ mod tests {
         fs::create_dir_all(cache.join("m_abcdef012345_r0/abc/00_g0")).expect("mkdir");
 
         let stats = Stats::default();
-        let got = bucket_sample(&cache.join("m_abcdef012345_r0/abc"), &stats).expect("sample");
+        let got = bucket_sample(
+            &cache.join("m_abcdef012345_r0/abc"),
+            &Samples::default(),
+            &stats,
+        )
+        .expect("sample");
         assert_eq!(got, sample(3, 400));
         assert_eq!(Stats::get(&stats.stat_ops), 3);
         assert_eq!(Stats::get(&stats.readdir_ops), 4);

@@ -210,7 +210,7 @@ fn start_usage_source(
     }
     tracing::info!(
         capacity_bytes = capacity.get(),
-        "CAPACITY_BYTES set: usage is estimated from bucket samples, not statvfs"
+        "CAPACITY_BYTES set: usage comes from the chain index and bucket samples, not statvfs"
     );
     let sampler = Sampler {
         cache: config.cache_path(),
@@ -325,10 +325,10 @@ fn run(config: Config) -> anyhow::Result<()> {
 
     let shared = Arc::new(SharedState::default());
     let stats = Arc::new(Stats::default());
-    let samples = Arc::new(Samples::default());
     let budget = Arc::new(Budget::new(config.max_files_per_second));
 
     let (chains, chains_thread) = start_chains(&config, &shutdown)?;
+    let samples = Arc::new(Samples::new(chains.clone()));
     let (source, sampler) = start_usage_source(&config, &samples, &stats, &shutdown)?;
 
     let metrics_thread = match config.metrics_addr {

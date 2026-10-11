@@ -141,8 +141,7 @@ impl Worker {
                         continue;
                     }
                 };
-                sample.files += 1;
-                sample.bytes = sample.bytes.saturating_add(meta.size);
+                sample.add(meta.size, self.ctx.samples.tracking(hash));
                 Stats::add(&self.ctx.stats.files_sampled, 1);
                 if self.is_hot(meta.atime) {
                     Stats::add(&self.ctx.stats.files_skipped_hot, 1);

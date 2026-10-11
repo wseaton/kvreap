@@ -173,6 +173,15 @@ impl Chains {
         self.index().len()
     }
 
+    /// Blocks this tier's events marked on disk.
+    pub fn on_disk_blocks(&self) -> usize {
+        self.index().on_disk_count()
+    }
+
+    pub fn on_disk(&self, hash: BlockHash) -> bool {
+        self.index().on_disk(hash)
+    }
+
     pub fn descendants(&self, hash: BlockHash) -> Vec<Descendant> {
         self.index().descendants(hash, WALK_BUDGET)
     }

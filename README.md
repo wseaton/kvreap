@@ -122,7 +122,7 @@ digests; `kvreap_blocks_undigested` counts blocks it could not name.
 | `FILE_ACCESS_TIME_THRESHOLD_MINUTES` | `60` | files accessed (on `noatime` mounts, written) more recently are never sampled for eviction |
 | `ENABLE_DIR_CLEANUP` / `DIR_CLEANUP_TTL_SECONDS` | `true` / `120` | remove leaf and bucket dirs that sampling finds empty and unchanged for the TTL |
 | `HEX_BUCKET_LEN` | `3` | |
-| `CAPACITY_BYTES` | unset | volume size in bytes. When set, used bytes are estimated from bucket samples instead of `statvfs`, for volumes whose `statvfs` reports another filesystem (hostPath on a shared node disk). Warns at startup if `statvfs` reports more than 10× this |
+| `CAPACITY_BYTES` | unset | volume size in bytes. When set, used bytes come from the chain index (blocks on disk × rank dirs × block file size) plus sampled bytes of files the index does not know, or from bucket samples alone without KV events, instead of `statvfs`, for volumes whose `statvfs` reports another filesystem (hostPath on a shared node disk). Warns at startup if `statvfs` reports more than 10× this |
 | `KV_EVENTS_ENDPOINTS` | unset | comma-separated vLLM `--kv-events-config` PUB endpoints; a hostname resolving to several addresses (a headless Service) subscribes to each pod. Enables chain-aware eviction |
 | `KV_EVENTS_REPLAY_PORT` | unset | port of each publisher's `replay_endpoint`; without it gaps are counted but not repaired |
 | `KV_EVENTS_DISK_MEDIUM` | unset | only `BlockStored` events of this medium mark a block on disk; `STORAGE` for vLLM's fs tier |
@@ -155,9 +155,11 @@ live chain). The same counters go to the log every status interval.
 
 ## Known limitations
 
-- `CAPACITY_BYTES` estimates usage from bucket samples, so it trails the disk
-  by a few seconds; the NVMe run peaked at 91.4% of the budget. Leave
-  headroom between the budget and the disk.
+- With `CAPACITY_BYTES` and no KV events, usage is estimated from bucket
+  samples and trails the disk by a few seconds; on small volumes with few
+  files per bucket it swings by tens of points. With KV events, blocks the
+  index knows are counted instead. Leave headroom between the budget and the
+  disk either way.
 - Chain-aware eviction runs usage higher than the Python evictor on VAST
   (96.6% peak, 12.9% of the run above the cleanup threshold against 6.6%):
   below the pressure line it holds back recently written sessions while the

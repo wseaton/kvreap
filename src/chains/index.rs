@@ -108,6 +108,7 @@ pub struct ChainIndex {
     nodes: HashMap<BlockHash, Node>,
     order: VecDeque<(BlockHash, u64)>,
     next_generation: u64,
+    on_disk: usize,
 }
 
 impl ChainIndex {
@@ -117,7 +118,13 @@ impl ChainIndex {
             nodes: HashMap::new(),
             order: VecDeque::new(),
             next_generation: 0,
+            on_disk: 0,
         }
+    }
+
+    /// Blocks marked on disk.
+    pub fn on_disk_count(&self) -> usize {
+        self.on_disk
     }
 
     pub fn len(&self) -> usize {
@@ -175,15 +182,20 @@ impl ChainIndex {
         let n = self.node_mut(hash);
         let parent = n.parent.or(parent);
         n.parent = parent;
+        let newly_on_disk = store == Store::OnDisk && n.residence != Residence::OnDisk;
         match store {
-            Store::OnDisk if n.residence != Residence::OnDisk => {
+            Store::OnDisk if newly_on_disk => {
                 n.residence = Residence::OnDisk;
                 n.stored_at = Some(SystemTime::now());
             }
             Store::Backing => n.backup = Backup::Held,
             Store::OnDisk | Store::LinksOnly => {}
         }
-        if let (Residence::OnDisk, Some(p)) = (n.residence, parent) {
+        let residence = n.residence;
+        if newly_on_disk {
+            self.on_disk += 1;
+        }
+        if let (Residence::OnDisk, Some(p)) = (residence, parent) {
             self.child_stored(p, hash);
         }
     }
@@ -307,6 +319,7 @@ impl ChainIndex {
             return position;
         }
         node.residence = Residence::Gone;
+        self.on_disk = self.on_disk.saturating_sub(1);
         let parent = node.parent;
         if node.children.is_empty() {
             self.nodes.remove(&hash);
@@ -368,6 +381,7 @@ impl ChainIndex {
             if let Some(node) = current.then(|| self.nodes.remove(&hash)).flatten()
                 && node.residence == Residence::OnDisk
             {
+                self.on_disk = self.on_disk.saturating_sub(1);
                 self.child_removed(node.parent, hash);
             }
         }

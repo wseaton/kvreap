@@ -125,8 +125,12 @@ In rough priority order.
 
 1. **Pluggable capacity source** (implemented). `statvfs` stays the default;
    `CAPACITY_BYTES` sets the volume size (e.g. the PVC request) when the
-   filesystem can't report it. Used bytes then come from a sampled estimate:
-   mean block bytes over the last 64 sampled buckets x bucket count. Workers
+   filesystem can't report it. With KV events, used bytes are the blocks the
+   chain index has on disk x rank dirs x mean block file size, plus a sampled
+   estimate of files the index does not know (written before kvreap started,
+   or in lost batches); deletions and stores show up at once. Without KV
+   events they come from the sampled estimate alone: mean block bytes over the
+   last 64 sampled buckets x bucket count. Workers
    record every bucket they sample while evicting; a sampler thread lists the
    buckets every 5 s and samples one bucket every 100 ms (back to back until
    16 are in), so the estimate keeps up with vLLM while idle. Eviction waits
