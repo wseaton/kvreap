@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from kvbench import analyze, chart
-from kvbench.run import KV_EVENTS_PORT, Cluster, RunConfig, run
+from kvbench.run import AIPERF_IMAGE, KV_EVENTS_PORT, WEKA_DATASET, Cluster, RunConfig, run
 
 
 def main() -> int:
@@ -61,9 +61,27 @@ def main() -> int:
 
     r.add_argument(
         "--workload",
-        choices=["churn-hot", "agent"],
+        choices=["churn-hot", "agent", "weka"],
         default="churn-hot",
-        help="churn-hot: vllm bench churn + repeated hot prefixes; agent: nyann-bench conversation pool",
+        help="churn-hot: vllm bench churn + repeated hot prefixes; agent: nyann-bench conversation pool; "
+        "weka: AIPerf replaying the SemiAnalysis Weka Claude Code traces",
+    )
+    r.add_argument("--weka-image", default=AIPERF_IMAGE, help="weka: AIPerf image with the corpus and tokenizer")
+    r.add_argument("--weka-dataset", default=WEKA_DATASET, help="weka: AIPerf --public-dataset")
+    r.add_argument("--weka-traces", type=int, default=96, help="weka: traces loaded, replayed in dataset order")
+    r.add_argument("--weka-concurrency", type=int, default=8, help="weka: sessions (traces) replayed at once")
+    r.add_argument(
+        "--weka-max-isl", type=int, default=126000, help="weka: drop requests with more input tokens than this"
+    )
+    r.add_argument("--weka-max-osl", type=int, default=1024, help="weka: cap on root-session output tokens")
+    r.add_argument("--weka-think-cap", type=float, default=60.0, help="weka: cap on recorded think time (s)")
+    r.add_argument("--weka-seed", type=int, default=42, help="weka: AIPerf --random-seed")
+    r.add_argument(
+        "--hf-overrides",
+        default="{}",
+        help="JSON for vLLM --hf-overrides, e.g. YaRN: "
+        '\'{"max_position_embeddings": 131072, "rope_parameters": {"rope_type": "yarn", "factor": 4.0, '
+        '"original_max_position_embeddings": 32768, "rope_theta": 1000000.0}}\'',
     )
     r.add_argument("--agent-concurrency", type=int, default=8, help="agent: requests in flight")
     r.add_argument("--agent-pool", type=int, default=64, help="agent: conversations in rotation")
@@ -156,6 +174,15 @@ def main() -> int:
         agent_osl=args.agent_osl,
         agent_turns=args.agent_turns,
         agent_system_prompt_tokens=args.agent_system_prompt_tokens,
+        weka_image=args.weka_image,
+        weka_dataset=args.weka_dataset,
+        weka_traces=args.weka_traces,
+        weka_concurrency=args.weka_concurrency,
+        weka_max_isl=args.weka_max_isl,
+        weka_max_osl=args.weka_max_osl,
+        weka_think_cap_s=args.weka_think_cap,
+        weka_seed=args.weka_seed,
+        hf_overrides=json.loads(args.hf_overrides),
         kv_cache_dtype=args.kv_cache_dtype,
         fs_read_threads=args.fs_read_threads,
         vllm_memory_gib=args.vllm_memory_gib,

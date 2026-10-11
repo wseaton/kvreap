@@ -138,6 +138,68 @@ def test_agent_workload_runs_nyann_conversation_pool() -> None:
     assert "nyann.json" not in sampler_configmap(cfg())["data"]
 
 
+def test_weka_workload_runs_aiperf_against_vllm() -> None:
+    from kvbench.run import AIPERF_IMAGE, WEKA_DATASET, WEKA_SCRIPT, loadgen_manifest, sampler_configmap
+
+    c = cfg(
+        workload="weka",
+        model="Qwen/Qwen2.5-72B-Instruct",
+        duration_s=2400,
+        weka_concurrency=12,
+        weka_traces=64,
+        weka_max_isl=120000,
+        weka_max_osl=512,
+        weka_think_cap_s=30.0,
+        weka_seed=7,
+    )
+    pod = loadgen_manifest(c)
+    [lg] = pod["spec"]["containers"]
+    assert lg["image"] == AIPERF_IMAGE
+    assert pod["spec"]["imagePullSecrets"] == [{"name": "quay-wseaton-pull"}]
+    sh, dash_c, script, argv0, *args = lg["command"]
+    assert (sh, dash_c, script, argv0) == ("sh", "-c", WEKA_SCRIPT, "sh")
+    assert 'aiperf profile "$@"' in script
+    assert "touch /results/STARTED" in script and "touch /results/DONE" in script
+    assert script.index("touch /results/STARTED") < script.index("wait $pid")
+    for flag in (
+        "--url=http://kvreap-bench-d-vllm:8000",
+        "--model=Qwen/Qwen2.5-72B-Instruct",
+        "--tokenizer=Qwen/Qwen2.5-72B-Instruct",
+        "--endpoint-type=chat",
+        "--streaming",
+        f"--public-dataset={WEKA_DATASET}",
+        "--num-dataset-entries=64",
+        "--no-fixed-schedule",
+        "--concurrency=12",
+        "--use-think-time-only",
+        "--inter-turn-delay-cap-seconds=30",
+        "--synthesis-max-isl=120000",
+        "--synthesis-max-osl=512",
+        "--benchmark-duration=2400",
+        "--random-seed=7",
+        "--extra-inputs=ignore_eos:true",
+        "--extra-inputs=temperature:0",
+        "--artifact-dir=/results/weka",
+    ):
+        assert flag in args, flag
+    assert len(args) == len(set(args)), "no flag repeated with a different value"
+    assert lg["volumeMounts"] == [{"name": "results", "mountPath": "/results"}]
+    assert "nyann.json" not in sampler_configmap(c)["data"]
+
+
+def test_hf_overrides_reach_vllm_only_when_set() -> None:
+    yarn = {
+        "max_position_embeddings": 131072,
+        "rope_parameters": {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768},
+    }
+    container, _ = vllm_parts(cfg(hf_overrides=yarn, max_model_len=131072))
+    [arg] = [a for a in container["args"] if a.startswith("--hf-overrides=")]
+    assert json.loads(arg.split("=", 1)[1]) == yarn
+    assert "--max-model-len=131072" in container["args"]
+    plain, _ = vllm_parts(cfg())
+    assert not any(a.startswith("--hf-overrides") for a in plain["args"])
+
+
 def test_fp8_kv_and_read_threads_reach_vllm() -> None:
     container, _ = vllm_parts(cfg(kv_cache_dtype="fp8", fs_read_threads=64))
     assert "--kv-cache-dtype=fp8" in container["args"]

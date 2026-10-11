@@ -19,6 +19,18 @@ uv run kvbench run --variant c --image quay.io/wseaton/kvreap:c-<sha> --chart $C
 uv run kvbench report results/a results/b results/c --out reports/<name>
 ```
 
+`--workload agent` replaces churn and hot reads with nyann-bench agent
+sessions. `--workload weka` replays the SemiAnalysis Weka Claude Code traces
+with NVIDIA AIPerf from the image built by [aiperf-image/](aiperf-image/)
+(AIPerf, the trace corpus and the Qwen2.5 tokenizer pinned and baked in, so the
+load generator runs offline): `--weka-concurrency` sessions at a time, each
+replaying one trace and its subagents with recorded think times capped at
+`--weka-think-cap` seconds; requests over `--weka-max-isl` input tokens are
+dropped. The load window starts when AIPerf starts sending, after it has built
+its prompts. AIPerf's per-request `profile_export.jsonl` lands in
+`loadgen/weka/`. For contexts past the model's native length pass YaRN through
+`--hf-overrides` (see `kvbench run --help`).
+
 `kvbench report` writes `README.md` with light/dark SVG charts and the full
 metrics table; `kvbench analyze` prints the table only. Pass chart overrides
 with `--evictor-values '{"config": {"deletionMaxFilesPerSecond": 200}}'`.

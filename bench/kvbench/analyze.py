@@ -9,7 +9,7 @@ import statistics
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 GIB = 1024**3
 DATA_OPS = {"READ", "WRITE", "COMMIT"}
@@ -45,6 +45,26 @@ AGENT_KEYS = (
     "agent_later_ttft_p99_ms",
     "agent_prompt_tok_per_s",
 )
+WEKA_KEYS = (
+    "weka_requests",
+    "weka_failed",
+    "weka_cancelled",
+    "weka_sessions",
+    "weka_ttft_p50_ms",
+    "weka_ttft_p90_ms",
+    "weka_ttft_p99_ms",
+    "weka_first_ttft_p50_ms",
+    "weka_first_ttft_p90_ms",
+    "weka_later_ttft_p50_ms",
+    "weka_later_ttft_p90_ms",
+    "weka_later_ttft_p99_ms",
+    "weka_subagent_ttft_p50_ms",
+    "weka_subagent_ttft_p90_ms",
+    "weka_subagent_ttft_p99_ms",
+    "weka_prompt_tok_per_s",
+    "weka_output_tok_per_s",
+)
+WekaKind = Literal["first", "later", "subagent"]
 KV_PAIR = re.compile(r"(\w+)=(\d+)\b")
 TS_PREFIX = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s")
 
@@ -172,25 +192,38 @@ def chain_counters(evictor_log: Path) -> dict[str, int]:
     return {k: int(v) for k, v in KV_PAIR.findall(last)}
 
 
-def load_agent(dir_: Path) -> dict[str, Any]:
+@dataclass
+class AgentRequests:
     """nyann-bench `requests_*.jsonl`: TTFT for first turns (cold) and later turns (returning)."""
-    first: list[float] = []
-    later: list[float] = []
-    failed = 0
-    prompt_tokens = 0
-    t0, t1 = float("inf"), 0.0
+
+    first: list[float] = field(default_factory=list)
+    later: list[float] = field(default_factory=list)
+    failed: int = 0
+    prompt_tokens: int = 0
+    t0: float = float("inf")
+    t1: float = 0.0
+
+
+def load_agent_requests(dir_: Path) -> AgentRequests:
+    a = AgentRequests()
     for f in sorted(dir_.glob("requests_*.jsonl")):
         for line in f.read_text().splitlines():
             if not line.strip():
                 continue
             r = json.loads(line)
             if r.get("status") != "ok":
-                failed += 1
+                a.failed += 1
                 continue
-            (first if r.get("turn", 0) == 0 else later).append(float(r["ttft_ms"]))
-            prompt_tokens += int(r.get("prompt_tokens", 0))
-            t0, t1 = min(t0, float(r["t0"])), max(t1, float(r["tend"]))
-    span = t1 - t0 if t1 > t0 else 0.0
+            (a.first if r.get("turn", 0) == 0 else a.later).append(float(r["ttft_ms"]))
+            a.prompt_tokens += int(r.get("prompt_tokens", 0))
+            a.t0, a.t1 = min(a.t0, float(r["t0"])), max(a.t1, float(r["tend"]))
+    return a
+
+
+def load_agent(dir_: Path) -> dict[str, Any]:
+    a = load_agent_requests(dir_)
+    first, later, failed, prompt_tokens = a.first, a.later, a.failed, a.prompt_tokens
+    span = a.t1 - a.t0 if a.t1 > a.t0 else 0.0
     return {
         "agent_requests": len(first) + len(later),
         "agent_failed": failed,
@@ -203,9 +236,98 @@ def load_agent(dir_: Path) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class WekaRecord:
+    """One profiling-phase request from AIPerf's `profile_export.jsonl`."""
+
+    kind: WekaKind
+    trace: str
+    ok: bool
+    cancelled: bool
+    ttft_ms: float | None
+    input_tokens: int
+    output_tokens: int
+    start_ns: int
+    end_ns: int
+
+
+def metric_value(metrics: dict[str, Any], name: str) -> float | None:
+    m = metrics.get(name)
+    return float(m["value"]) if isinstance(m, dict) and isinstance(m.get("value"), (int, float)) else None
+
+
+def weka_kind(meta: dict[str, Any]) -> WekaKind:
+    """A root session's first request, its later requests, or a subagent's request (any depth)."""
+    if int(meta.get("agent_depth") or 0) > 0:
+        return "subagent"
+    return "first" if int(meta.get("turn_index") or 0) == 0 else "later"
+
+
+def load_weka_records(dir_: Path) -> list[WekaRecord]:
+    out: list[WekaRecord] = []
+    path = dir_ / "profile_export.jsonl"
+    if not path.exists():
+        return out
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        meta: dict[str, Any] = r.get("metadata", {})
+        if meta.get("benchmark_phase", "profiling") != "profiling":
+            continue
+        metrics: dict[str, Any] = r.get("metrics", {})
+        cancelled = bool(meta.get("was_cancelled"))
+        out.append(
+            WekaRecord(
+                kind=weka_kind(meta),
+                trace=str(meta.get("source_trace_id") or meta.get("conversation_id")),
+                ok=not r.get("error") and not cancelled,
+                cancelled=cancelled,
+                ttft_ms=metric_value(metrics, "time_to_first_token"),
+                input_tokens=int(metric_value(metrics, "input_sequence_length") or 0),
+                output_tokens=int(metric_value(metrics, "output_sequence_length") or 0),
+                start_ns=int(meta.get("request_start_ns") or 0),
+                end_ns=int(meta.get("request_end_ns") or 0),
+            )
+        )
+    return out
+
+
+def weka_ttfts(records: list[WekaRecord], *kinds: WekaKind) -> list[float]:
+    return [r.ttft_ms for r in records if r.ok and r.ttft_ms is not None and (not kinds or r.kind in kinds)]
+
+
+def load_weka(dir_: Path) -> dict[str, Any]:
+    """AIPerf Weka replay: TTFT for root-session first requests, later root requests and subagent requests."""
+    records = load_weka_records(dir_)
+    ok = [r for r in records if r.ok]
+    span = (max(r.end_ns for r in ok) - min(r.start_ns for r in ok)) / 1e9 if ok else 0.0
+    out: dict[str, Any] = {
+        "weka_requests": len(ok),
+        "weka_failed": sum(not r.ok and not r.cancelled for r in records),
+        "weka_cancelled": sum(r.cancelled for r in records),
+        "weka_sessions": len({r.trace for r in records}),
+        "weka_prompt_tok_per_s": sum(r.input_tokens for r in ok) / span if span else None,
+        "weka_output_tok_per_s": sum(r.output_tokens for r in ok) / span if span else None,
+    }
+    splits: tuple[tuple[str, tuple[WekaKind, ...], tuple[int, ...]], ...] = (
+        ("", (), (50, 90, 99)),
+        ("first_", ("first",), (50, 90)),
+        ("later_", ("later",), (50, 90, 99)),
+        ("subagent_", ("subagent",), (50, 90, 99)),
+    )
+    for label, kinds, quantiles in splits:
+        ttfts = weka_ttfts(records, *kinds)
+        for q in quantiles:
+            out[f"weka_{label}ttft_p{q}_ms"] = percentile(ttfts, q / 100)
+    return out
+
+
 def load_bench(dir_: Path) -> dict[str, Any]:
     if (dir_ / "agent").is_dir():
         return load_agent(dir_ / "agent")
+    if (dir_ / "weka").is_dir():
+        return load_weka(dir_ / "weka")
     hot_ttfts: list[float] = []
     hot_failed = 0
     churn_input_tokens = 0
@@ -387,7 +509,7 @@ def report(summaries: list[RunSummary]) -> str:
         row("shared tier % time >= cleanup threshold", [fmt(s.shared_pct_time_above_cleanup) for s in summaries])
     for k in ("hot_ttft_p50_ms", "hot_ttft_p90_ms", "hot_ttft_p99_ms"):
         row(k.replace("_", " "), [fmt(s.bench.get(k)) for s in summaries])
-    for k in AGENT_KEYS:
+    for k in (*AGENT_KEYS, *WEKA_KEYS):
         if any(k in s.bench for s in summaries):
             row(k.replace("_", " "), [fmt(s.bench.get(k)) for s in summaries])
     row(

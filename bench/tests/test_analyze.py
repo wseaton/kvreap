@@ -157,3 +157,97 @@ def test_agent_records_split_first_and_returning_turns(tmp_path: Path) -> None:
     assert b["agent_first_ttft_p50_ms"] == pytest.approx(3000.0)
     assert b["agent_later_ttft_p50_ms"] == pytest.approx(600.0), "nearest rank"
     assert b["agent_prompt_tok_per_s"] == pytest.approx((18000 + 18700 + 19400) / 10.0)
+
+
+def aiperf_record(
+    turn: int,
+    depth: int,
+    ttft_ms: float,
+    start_s: float,
+    end_s: float,
+    *,
+    trace: str = "t1",
+    isl: int = 1000,
+    osl: int = 100,
+    error: bool = False,
+    cancelled: bool = False,
+    phase: str = "profiling",
+) -> str:
+    rec: dict[str, object] = {
+        "metadata": {
+            "conversation_id": f"{trace}-{depth}",
+            "turn_index": turn,
+            "source_trace_id": trace,
+            "source_kind": "weka_subagent" if depth else "weka_main",
+            "agent_depth": depth,
+            "request_start_ns": int(start_s * 1e9),
+            "request_end_ns": int(end_s * 1e9),
+            "benchmark_phase": phase,
+            "was_cancelled": cancelled,
+        },
+        "metrics": {
+            "time_to_first_token": {"value": ttft_ms, "unit": "ms"},
+            "input_sequence_length": {"value": isl, "unit": "tokens"},
+            "output_sequence_length": {"value": osl, "unit": "tokens"},
+        },
+    }
+    if error:
+        rec["error"] = {"code": 400, "type": "Bad Request", "message": "context length"}
+        rec["metrics"] = {}
+    return json.dumps(rec)
+
+
+def test_weka_records_split_first_later_and_subagent_requests(tmp_path: Path) -> None:
+    from kvbench.analyze import load_bench
+
+    weka = tmp_path / "weka"
+    weka.mkdir()
+    rows = [
+        aiperf_record(0, 0, 5000.0, 0.0, 10.0, isl=60000, osl=200),
+        aiperf_record(1, 0, 300.0, 12.0, 15.0, isl=61000, osl=300),
+        aiperf_record(2, 0, 700.0, 16.0, 20.0, isl=62000, osl=100),
+        aiperf_record(0, 1, 2000.0, 13.0, 18.0, isl=30000, osl=400),
+        aiperf_record(1, 1, 100.0, 18.0, 19.0, isl=31000, osl=0),
+        aiperf_record(0, 0, 9000.0, 1.0, 20.0, trace="t2", isl=1000, osl=0),
+        aiperf_record(3, 0, 0.0, 19.0, 19.5, error=True),
+        aiperf_record(4, 0, 50.0, 19.0, 99.0, cancelled=True),
+        aiperf_record(0, 0, 1.0, -5.0, -4.0, trace="warm", phase="warmup"),
+    ]
+    (weka / "profile_export.jsonl").write_text("\n".join(rows) + "\n\n")
+    b = load_bench(tmp_path)
+    assert b["weka_requests"] == 6
+    assert b["weka_failed"] == 1
+    assert b["weka_cancelled"] == 1
+    assert b["weka_sessions"] == 2, "warmup records are not counted"
+    assert b["weka_first_ttft_p50_ms"] == pytest.approx(9000.0), "nearest rank of [5000, 9000]"
+    assert b["weka_first_ttft_p90_ms"] == pytest.approx(9000.0)
+    assert b["weka_later_ttft_p50_ms"] == pytest.approx(700.0)
+    assert b["weka_subagent_ttft_p50_ms"] == pytest.approx(2000.0)
+    assert b["weka_ttft_p50_ms"] == pytest.approx(2000.0), "nearest rank of six"
+    assert b["weka_ttft_p99_ms"] == pytest.approx(9000.0)
+    assert b["weka_prompt_tok_per_s"] == pytest.approx((60000 + 61000 + 62000 + 30000 + 31000 + 1000) / 20.0)
+    assert b["weka_output_tok_per_s"] == pytest.approx((200 + 300 + 100 + 400) / 20.0)
+    assert "weka_first_ttft_p99_ms" not in b
+
+
+def test_weka_rows_reach_the_report(tmp_path: Path, run_dir: Path) -> None:
+    import shutil
+
+    lg = run_dir / "loadgen"
+    shutil.rmtree(lg)
+    (lg / "weka").mkdir(parents=True)
+    (lg / "weka" / "profile_export.jsonl").write_text(aiperf_record(1, 0, 450.0, 0.0, 1.0) + "\n")
+    out = report([summarize(run_dir)])
+    assert "| weka requests | 1 |" in out
+    assert "| weka later ttft p50 ms | 450.0 |" in out
+    assert "agent requests" not in out
+
+
+def test_missing_weka_export_reports_no_requests(tmp_path: Path) -> None:
+    from kvbench.analyze import load_bench
+
+    (tmp_path / "weka").mkdir()
+    b = load_bench(tmp_path)
+    assert b["weka_requests"] == 0
+    assert b["weka_ttft_p50_ms"] is None
+    assert b["weka_prompt_tok_per_s"] is None

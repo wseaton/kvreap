@@ -19,10 +19,13 @@ from kvbench.analyze import (
     RunSummary,
     Sample,
     deletion_windows,
+    load_agent_requests,
     load_samples,
+    load_weka_records,
     op_field,
     report,
     summarize,
+    weka_ttfts,
     window,
 )
 
@@ -304,11 +307,20 @@ def rtt_series(samples: list[Sample], op: str, t0: float) -> list[Point]:
     return pts
 
 
-def ttft_ecdf(run_dir: Path) -> list[Point]:
+def returning_ttfts(loadgen: Path) -> tuple[str, list[float]]:
+    """TTFTs (ms) of the requests that can reuse an earlier prefix, and what they are."""
+    if (loadgen / "weka").is_dir():
+        return "Weka root-session later-request TTFT", weka_ttfts(load_weka_records(loadgen / "weka"), "later")
+    if (loadgen / "agent").is_dir():
+        return "Agent returning-turn TTFT", load_agent_requests(loadgen / "agent").later
     ttfts: list[float] = []
-    for f in sorted((run_dir / "loadgen" / "hot").glob("hot-*.json")):
+    for f in sorted((loadgen / "hot").glob("hot-*.json")):
         ttfts += [t * 1000 for t in json.loads(f.read_text()).get("ttfts", []) if t]
-    ttfts.sort()
+    return "Hot-prefix TTFT", ttfts
+
+
+def ttft_ecdf(ttfts: list[float]) -> list[Point]:
+    ttfts = sorted(ttfts)
     n = len(ttfts)
     if n == 0:
         return []
@@ -325,6 +337,7 @@ class RunSeries:
     evictor_ops: list[Point]
     rtt: dict[str, list[Point]]
     ttft: list[Point]
+    ttft_label: str
     deleting: list[tuple[float, float]]
     op_types: dict[str, float]
     cleanup: float
@@ -337,13 +350,15 @@ def run_series(run_dir: Path, summary: RunSummary) -> RunSeries:
     vllm = window(load_samples(run_dir / "vllm-sampler.jsonl"), t0, t1)
     evictor = window(load_samples(run_dir / "evictor-sampler.jsonl"), t0, t1)
     cfg = meta.get("evictor_values", {}).get("config", {})
+    ttft_label, ttfts = returning_ttfts(run_dir / "loadgen")
     return RunSeries(
         name=summary.variant,
         image=meta.get("evictor_image") or "no evictor",
         usage=usage_series(vllm, t0),
         evictor_ops=metadata_rate_series(evictor, t0),
         rtt={op: rtt_series(vllm, op, t0) for op in RTT_OPS},
-        ttft=ttft_ecdf(run_dir),
+        ttft=ttft_ecdf(ttfts),
+        ttft_label=ttft_label,
         deleting=[(a - t0, (b or t1) - t0) for a, b in deletion_windows(run_dir / "evictor.log")],
         op_types={op: st.per_sec for op, st in summary.evictor_ops.items()},
         cleanup=float(cfg.get("cleanupThreshold", 85)),
@@ -372,7 +387,7 @@ def charts(runs: list[RunSeries], theme: Theme) -> dict[str, str]:
         "evictor-ops": line_chart(theme, "Evictor NFS metadata ops/s (5 s windows)", ser(lambda r: r.evictor_ops)),
         "ttft": line_chart(
             theme,
-            "Hot-prefix TTFT, cumulative % of requests",
+            f"{first.ttft_label}, cumulative % of requests",
             ser(lambda r: r.ttft),
             y_unit="%",
             x_unit=" ms",
@@ -399,7 +414,7 @@ CHART_ORDER = (
     ("rtt-create", "vLLM CREATE latency"),
     ("rtt-write", "vLLM WRITE latency"),
     ("rtt-read", "vLLM READ latency"),
-    ("ttft", "Hot-prefix TTFT"),
+    ("ttft", "TTFT of requests that can reuse a prefix"),
 )
 
 
@@ -415,26 +430,56 @@ def picture(name: str, alt: str) -> str:
 SETUP_KEYS = (
     ("model", "model"),
     ("vllm_image", "vLLM image"),
+    ("max_model_len", "max model length"),
+    ("hf_overrides", "HF config overrides"),
     ("pvc_size", "PVC size"),
+    ("shared_tier_size", "shared tier PVC size"),
     ("storage_class", "storage class"),
     ("duration_s", "load duration (s)"),
     ("offload_block_tokens", "offload block (tokens)"),
     ("cpu_tier_bytes", "CPU tier (bytes)"),
     ("gpu_blocks", "GPU KV blocks"),
-    ("churn_input_len", "churn prompt length"),
-    ("churn_concurrency", "churn concurrency"),
-    ("hot_prefixes", "hot prefixes"),
-    ("hot_prefix_len", "hot prefix length"),
-    ("hot_request_rate", "hot request rate (req/s)"),
 )
+WORKLOAD_SETUP_KEYS = {
+    "churn-hot": (
+        ("churn_input_len", "churn prompt length"),
+        ("churn_concurrency", "churn concurrency"),
+        ("hot_prefixes", "hot prefixes"),
+        ("hot_prefix_len", "hot prefix length"),
+        ("hot_request_rate", "hot request rate (req/s)"),
+    ),
+    "agent": (
+        ("agent_concurrency", "agent requests in flight"),
+        ("agent_pool", "agent conversations in rotation"),
+        ("agent_first_isl", "agent first-turn tokens"),
+        ("agent_turn_isl", "agent later-turn tokens"),
+        ("agent_osl", "agent output tokens"),
+        ("agent_turns", "agent turns"),
+    ),
+    "weka": (
+        ("weka_image", "AIPerf image"),
+        ("weka_dataset", "Weka dataset"),
+        ("weka_traces", "traces loaded"),
+        ("weka_concurrency", "concurrent sessions"),
+        ("weka_max_isl", "max input tokens (longer requests dropped)"),
+        ("weka_max_osl", "max output tokens (root sessions)"),
+        ("weka_think_cap_s", "think-time cap (s)"),
+        ("weka_seed", "random seed"),
+    ),
+}
 
 
 def setup_table(dirs: list[Path]) -> list[str]:
     metas = [json.loads((d / "meta.json").read_text()) for d in dirs]
+    workloads = sorted({str(m.get("workload", "churn-hot")) for m in metas})
+    keys = [*SETUP_KEYS, ("workload", "workload")]
+    for w in workloads:
+        keys += WORKLOAD_SETUP_KEYS.get(w, ())
     lines = ["| setting | value |", "|---|---|"]
-    for key, label in SETUP_KEYS:
-        values = {str(m.get(key)) for m in metas}
-        lines.append(f"| {label} | {' / '.join(sorted(values))} |")
+    for key, label in keys:
+        values = {str(m.get(key)) for m in metas if key in m}
+        if values:
+            lines.append(f"| {label} | {' / '.join(sorted(values))} |")
     return lines
 
 

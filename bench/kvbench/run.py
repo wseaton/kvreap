@@ -9,7 +9,8 @@
    sampler sidecar: mountstats,            sampler sidecar:
      usage, /metrics                         mountstats, usage
    ▲
- loadgen pod: churn + hot prompts, or nyann-bench agent sessions
+ loadgen pod: churn + hot prompts, nyann-bench agent sessions, or AIPerf
+   replaying the SemiAnalysis Weka Claude Code traces
 
  nosharecache gives each pod its own NFS superblock, so each sampler sees
  only its own pod's NFS operations. On a host path, usage is the bytes under
@@ -44,9 +45,11 @@ KV_EVENTS_PORT = 5557
 
 Manifest = dict[str, Any]
 Placement = Literal["any", "colocated", "separate"]
-Workload = Literal["churn-hot", "agent"]
+Workload = Literal["churn-hot", "agent", "weka"]
 Locality = Literal["LOCAL", "REMOTE"]
 NYANN_IMAGE = "quay.io/wseaton/nyann-bench:kvbench-edd5f54"
+AIPERF_IMAGE = "quay.io/wseaton/kvbench-aiperf:0.13.0-w062126"
+WEKA_DATASET = "semianalysis_cc_traces_weka_062126_256k"
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,15 @@ class RunConfig:
     agent_osl: int = 200
     agent_turns: int = 10
     agent_system_prompt_tokens: int = 2048
+    weka_image: str = AIPERF_IMAGE
+    weka_dataset: str = WEKA_DATASET
+    weka_traces: int = 96
+    weka_concurrency: int = 8
+    weka_max_isl: int = 126000
+    weka_max_osl: int = 1024
+    weka_think_cap_s: float = 60.0
+    weka_seed: int = 42
+    hf_overrides: dict[str, Any] = field(default_factory=dict)
     kv_cache_dtype: str | None = None
     fs_read_threads: int = 16
     vllm_memory_gib: int = 96
@@ -381,6 +393,8 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
     ]
     if cfg.kv_cache_dtype:
         args.append(f"--kv-cache-dtype={cfg.kv_cache_dtype}")
+    if cfg.hf_overrides:
+        args.append(f"--hf-overrides={json.dumps(cfg.hf_overrides)}")
     if cfg.tensor_parallel_size > 1:
         args.append(f"--tensor-parallel-size={cfg.tensor_parallel_size}")
     gpus = str(cfg.tensor_parallel_size)
@@ -509,6 +523,73 @@ sleep infinity
 """
 
 
+WEKA_SCRIPT = r"""
+set -u
+mkdir -p /results/weka
+aiperf profile "$@" > /results/weka/console.txt 2>&1 &
+pid=$!
+until grep -q "Phase profiling (profiling) started" /results/weka/logs/aiperf.log 2>/dev/null; do
+  kill -0 $pid 2>/dev/null || break
+  sleep 2
+done
+touch /results/STARTED
+wait $pid || echo "aiperf failed" >&2
+touch /results/DONE
+sleep infinity
+"""
+
+
+def aiperf_args(cfg: RunConfig) -> list[str]:
+    """`aiperf profile` replaying the Weka corpus: `weka_concurrency` sessions at a time, each replaying one
+    trace with its recorded think times capped at `weka_think_cap_s`, requests above `weka_max_isl` dropped."""
+    return [
+        f"--url=http://{cfg.run_id}-vllm:8000",
+        f"--model={cfg.model}",
+        f"--tokenizer={cfg.model}",
+        "--endpoint-type=chat",
+        "--streaming",
+        f"--public-dataset={cfg.weka_dataset}",
+        f"--num-dataset-entries={cfg.weka_traces}",
+        "--no-fixed-schedule",
+        f"--concurrency={cfg.weka_concurrency}",
+        "--use-think-time-only",
+        f"--inter-turn-delay-cap-seconds={cfg.weka_think_cap_s:g}",
+        f"--synthesis-max-isl={cfg.weka_max_isl}",
+        f"--synthesis-max-osl={cfg.weka_max_osl}",
+        f"--benchmark-duration={cfg.duration_s}",
+        f"--random-seed={cfg.weka_seed}",
+        "--extra-inputs=ignore_eos:true",
+        "--extra-inputs=temperature:0",
+        "--no-server-metrics",
+        "--export-level=records",
+        "--ui=none",
+        "--artifact-dir=/results/weka",
+    ]
+
+
+def weka_loadgen_manifest(cfg: RunConfig) -> Manifest:
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": f"{cfg.run_id}-loadgen", "labels": labels(cfg, "loadgen"), "annotations": NO_ISTIO},
+        "spec": {
+            "restartPolicy": "Never",
+            "securityContext": {"runAsUser": 1000, "runAsGroup": 1000, "fsGroup": 1000},
+            "imagePullSecrets": [{"name": cfg.pull_secret}],
+            "containers": [
+                {
+                    "name": "loadgen",
+                    "image": cfg.weka_image,
+                    "command": ["sh", "-c", WEKA_SCRIPT, "sh", *aiperf_args(cfg)],
+                    "resources": {"requests": {"cpu": "8", "memory": "16Gi"}, "limits": {"memory": "32Gi"}},
+                    "volumeMounts": [{"name": "results", "mountPath": "/results"}],
+                }
+            ],
+            "volumes": [{"name": "results", "emptyDir": {}}],
+        },
+    }
+
+
 def agent_loadgen_manifest(cfg: RunConfig) -> Manifest:
     return {
         "apiVersion": "v1",
@@ -542,6 +623,8 @@ def agent_loadgen_manifest(cfg: RunConfig) -> Manifest:
 def loadgen_manifest(cfg: RunConfig) -> Manifest:
     if cfg.workload == "agent":
         return agent_loadgen_manifest(cfg)
+    if cfg.workload == "weka":
+        return weka_loadgen_manifest(cfg)
     env = {
         "DURATION": str(cfg.duration_s),
         "BASE_URL": f"http://{cfg.run_id}-vllm:8000",
@@ -702,7 +785,7 @@ def wait_pod_ready(cluster: Cluster, name: str, timeout_s: int) -> None:
     cluster.kubectl("wait", f"pod/{name}", "--for=condition=Ready", f"--timeout={timeout_s}s")
 
 
-def wait_loadgen_done(cfg: RunConfig, timeout_s: int) -> None:
+def wait_loadgen_file(cfg: RunConfig, marker: str, timeout_s: int) -> None:
     name = f"{cfg.run_id}-loadgen"
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -718,15 +801,15 @@ def wait_loadgen_done(cfg: RunConfig, timeout_s: int) -> None:
                 "--",
                 "test",
                 "-f",
-                "/results/DONE",
+                f"/results/{marker}",
             ],
             capture_output=True,
             check=False,
         )
         if res.returncode == 0:
             return
-        time.sleep(30)
-    raise TimeoutError(f"loadgen did not finish within {timeout_s}s")
+        time.sleep(10)
+    raise TimeoutError(f"loadgen wrote no {marker} within {timeout_s}s")
 
 
 def collect(cfg: RunConfig, evictor_pods: dict[str, str], events: dict[str, float]) -> None:
@@ -802,9 +885,11 @@ def run(cfg: RunConfig, keep: bool = False) -> None:
 
         c.apply([loadgen_manifest(cfg)])
         wait_pod_ready(c, f"{cfg.run_id}-loadgen", timeout_s=600)
+        if cfg.workload == "weka":
+            wait_loadgen_file(cfg, "STARTED", timeout_s=1800)
         events["load_start"] = time.time()
         print(f"[{cfg.variant}] load running for {cfg.duration_s}s", flush=True)
-        wait_loadgen_done(cfg, timeout_s=cfg.duration_s + 900)
+        wait_loadgen_file(cfg, "DONE", timeout_s=cfg.duration_s + 900)
         events["load_end"] = time.time()
         time.sleep(cfg.settle_s)
         events["collect"] = time.time()
