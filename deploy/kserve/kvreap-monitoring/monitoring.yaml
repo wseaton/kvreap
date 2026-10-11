@@ -1,0 +1,45 @@
+# Prometheus scraping for the kvreap Deployment from deploy/kserve/kvreap.
+# Needs the Prometheus Operator CRDs (OpenShift user workload monitoring,
+# kube-prometheus-stack).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: LLMISVC_NAME-kvreap
+  labels:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: LLMISVC_NAME
+      app.kubernetes.io/component: kvreap
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      scheme: http
+      interval: 30s
+---
+# kvreap takes no other inbound traffic; only the monitoring namespace may
+# reach its metrics port. Change the namespace for a Prometheus outside
+# OpenShift user workload monitoring.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: LLMISVC_NAME-kvreap-metrics
+  labels:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: LLMISVC_NAME
+      app.kubernetes.io/component: kvreap
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-user-workload-monitoring
+      ports:
+        - port: 9090
+          protocol: TCP

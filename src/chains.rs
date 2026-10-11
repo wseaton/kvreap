@@ -28,7 +28,7 @@ pub mod decode;
 pub mod index;
 pub mod subscriber;
 #[cfg(test)]
-mod testing;
+pub mod testing;
 
 pub const INDEX_CAP: usize = 4 << 20;
 const SUBTREE_BUDGET: usize = 4096;
@@ -218,6 +218,10 @@ impl Chains {
         self.index().rank(hash, deferrals, self.max_deferrals)
     }
 
+    pub fn index_blocks(&self) -> usize {
+        self.index().len()
+    }
+
     pub fn subtree_key(&self, hash: BlockHash) -> SubtreeKey {
         self.index().subtree_key(hash, SUBTREE_BUDGET)
     }
@@ -342,7 +346,7 @@ impl Chains {
         tracing::info!(
             policy = ?self.policy,
             disk_medium = self.disk_medium.as_deref().unwrap_or("any"),
-            index_blocks = self.index().len(),
+            index_blocks = self.index_blocks(),
             event_batches = Stats::get(&s.batches),
             decode_errors = Stats::get(&s.decode_errors),
             blocks_stored = Stats::get(&s.blocks_stored),

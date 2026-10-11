@@ -97,7 +97,9 @@ impl Context {
     ) -> io::Result<T> {
         let start = Instant::now();
         let out = f();
-        self.budget.observe(kind, start.elapsed());
+        let elapsed = start.elapsed();
+        self.budget.observe(kind, elapsed);
+        self.stats.timings.op(kind).observe(elapsed.as_secs_f64());
         let counter = match kind {
             OpKind::Readdir => &self.stats.readdir_ops,
             OpKind::Stat => &self.stats.stat_ops,

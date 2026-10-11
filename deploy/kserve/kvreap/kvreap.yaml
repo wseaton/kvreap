@@ -78,6 +78,12 @@ spec:
               value: STORAGE
             - name: CHAIN_EVICTION
               value: radix
+            - name: METRICS_ADDR
+              value: 0.0.0.0:9090
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
           resources:
             requests:
               cpu: 500m

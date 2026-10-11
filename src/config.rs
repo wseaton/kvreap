@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -21,6 +22,8 @@ pub enum ConfigError {
     InvalidWorkerCount(i64),
     #[error("CHAIN_EVICTION must be tail-first, subtree, radix or observe, got {0:?}")]
     InvalidChainPolicy(String),
+    #[error("{var}={value:?} is not a host:port socket address")]
+    NotAnAddress { var: &'static str, value: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
@@ -184,6 +187,8 @@ pub struct Config {
     pub capacity_bytes: Option<CapacityBytes>,
     /// vLLM `--kv-events-config` PUB endpoints to build the prefix-chain index from.
     pub kv_events_endpoints: Vec<String>,
+    /// Where to serve Prometheus metrics (`METRICS_ADDR`); `None` serves none.
+    pub metrics_addr: Option<SocketAddr>,
     /// Port of each publisher's `replay_endpoint`, for fetching missed batches.
     pub kv_events_replay_port: Option<u16>,
     pub chain_policy: ChainPolicy,
@@ -334,6 +339,16 @@ impl Config {
                 .filter(|e| !e.is_empty())
                 .map(str::to_owned)
                 .collect(),
+            metrics_addr: optional("METRICS_ADDR")
+                .map(|raw| {
+                    raw.trim()
+                        .parse::<SocketAddr>()
+                        .map_err(|_| ConfigError::NotAnAddress {
+                            var: "METRICS_ADDR",
+                            value: raw,
+                        })
+                })
+                .transpose()?,
             kv_events_replay_port: optional("KV_EVENTS_REPLAY_PORT")
                 .map(|raw| {
                     raw.trim()
@@ -415,6 +430,29 @@ mod tests {
                 .kv_events_endpoints
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn metrics_addr_is_off_by_default_and_must_be_a_socket_address() {
+        assert_eq!(cfg(&[]).expect("defaults").metrics_addr, None);
+        assert_eq!(
+            cfg(&[("METRICS_ADDR", " 0.0.0.0:9090 ")])
+                .expect("parse")
+                .metrics_addr,
+            Some("0.0.0.0:9090".parse().expect("addr"))
+        );
+        for bad in ["9090", "localhost", "0.0.0.0:http"] {
+            assert!(
+                matches!(
+                    cfg(&[("METRICS_ADDR", bad)]),
+                    Err(ConfigError::NotAnAddress {
+                        var: "METRICS_ADDR",
+                        ..
+                    })
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

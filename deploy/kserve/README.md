@@ -9,7 +9,8 @@ the middle; see `benchmarks/chain-spike-agent.md` for the measured effect.
 |---|---|
 | `preset/` | `LLMInferenceServiceConfig` `kv-offloading-kvreap`, added to the service's `spec.baseRefs` |
 | `kvreap/` | kustomize Component: headless Service over the workload pods, the kvreap Deployment on the PVC, a NetworkPolicy for the KV events port |
-| `example/` | an overlay that includes both for a service named `qwen3-32b` |
+| `kvreap-monitoring/` | optional kustomize Component: a PodMonitor for kvreap's metrics and a NetworkPolicy for its port |
+| `example/` | an overlay that includes the preset and the kvreap Component for a service named `qwen3-32b` |
 
 ```bash
 kubectl kustomize deploy/kserve/example
@@ -53,6 +54,17 @@ does. On connect, on a gap, on joining mid-stream and when vLLM restarts
 the last 10,000 batches. A failed replay backs off 30 s. The `chains` status
 line counts `gaps`, `resets`, `replays`, `replay_failures` and `events_lost`
 (batches gone from the buffer before kvreap could fetch them).
+
+## Metrics
+
+kvreap serves Prometheus metrics on port 9090 (`METRICS_ADDR`, plain HTTP,
+`GET /metrics`): deletions, metadata-op latency, prune duration, usage, the
+delete grant and op-rate limit, chain deletions by position, and KV event
+batches, gaps, replays and losses. Include `kvreap-monitoring` as a second
+component for a PodMonitor and a NetworkPolicy that admits only
+`openshift-user-workload-monitoring`; it needs the Prometheus Operator CRDs.
+For a TLS scrape, set `METRICS_ADDR=127.0.0.1:9090` and put kube-rbac-proxy
+in front of it.
 
 ## Security
 

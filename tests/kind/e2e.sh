@@ -82,6 +82,15 @@ deleted=$(( $(counter deleted_root) + $(counter deleted_orphan) + $(counter dele
   || { echo "FAIL: more than 5% of $deleted deletions cut a chain" >&2; fail=1; }
 printf '%s\n' "$logs" | grep DELETION_END | sed 's/.*DELETION_END/DELETION_END/'
 
+scraped=$(k exec deployment/e2e-model-kvreap -- python3 -c \
+  'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:9090/metrics").read().decode())')
+series() { printf '%s\n' "$scraped" | awk -v s="$1" '$1 == s {print $2}'; }
+for s in kvreap_files_deleted_total 'kvreap_chain_deletions_total{position="leaf"}' kvreap_kv_event_replays_total kvreap_prune_seconds_count; do
+  v=$(series "$s")
+  echo "metrics: $s = ${v:-missing}"
+  awk -v v="${v:-0}" 'BEGIN { exit !(v > 0) }' || { echo "FAIL: /metrics has no $s > 0" >&2; fail=1; }
+done
+
 k exec fake-vllm -- python3 /app/fake_vllm.py check || { echo "FAIL: a live session or the preamble lost blocks" >&2; fail=1; }
 
 if [ "${KEEP:-0}" != 1 ]; then

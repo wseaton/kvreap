@@ -14,7 +14,6 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::Read;
-#[cfg(feature = "events")]
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -867,6 +866,74 @@ fn below_cleanup_threshold_nothing_is_deleted() {
     assert!(status.success());
     assert_eq!(existing(&cold).len(), cold.len());
     assert!(!ev.log().contains("DELETION_START"));
+}
+
+/// GETs `/metrics` from `addr`, retrying while the listener comes up.
+fn scrape(addr: &str) -> String {
+    use std::io::Write;
+
+    for _ in 0..50 {
+        if let Ok(mut stream) = std::net::TcpStream::connect(addr) {
+            stream
+                .write_all(b"GET /metrics HTTP/1.1\r\nHost: kvreap\r\n\r\n")
+                .expect("request");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("response");
+            return response;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("nothing listening on {addr}");
+}
+
+fn metric(body: &str, series: &str) -> f64 {
+    body.lines()
+        .find_map(|l| l.strip_prefix(series)?.strip_prefix(' '))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("{series} missing from\n{body}"))
+}
+
+#[test]
+fn metrics_endpoint_reports_deletions_while_evicting() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache = Cache::new(tmp.path());
+    let cold = cache.cold_blocks(30, 64);
+    let port = TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("free port")
+        .port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut env = always_evicting();
+    env.push(("METRICS_ADDR", addr.clone()));
+    let mut ev = Evictor::start(tmp.path(), &env);
+    assert!(
+        wait_until(Duration::from_secs(30), || existing(&cold).is_empty()),
+        "{}",
+        ev.log()
+    );
+    let response = scrape(&addr);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let body = response.split_once("\r\n\r\n").expect("body").1;
+    assert!(metric(body, "kvreap_files_deleted_total") >= 30.0, "{body}");
+    assert!(
+        metric(body, "kvreap_metadata_ops_total{op=\"unlink\"}") >= 30.0,
+        "{body}"
+    );
+    assert!(
+        metric(body, "kvreap_metadata_op_seconds_count{op=\"unlink\"}") >= 30.0,
+        "{body}"
+    );
+    assert_eq!(
+        metric(body, "kvreap_mode{mode=\"evicting\"}"),
+        1.0,
+        "{body}"
+    );
+    assert!(ev.sigterm().success());
+    assert!(
+        ev.log().contains("serving Prometheus metrics"),
+        "{}",
+        ev.log()
+    );
 }
 
 #[test]

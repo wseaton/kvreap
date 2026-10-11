@@ -8,6 +8,7 @@ mod controller;
 mod events;
 mod fsops;
 mod layout;
+mod metrics;
 mod shutdown;
 mod stats;
 mod worker;
@@ -86,8 +87,10 @@ fn controller_loop(
     config: &Config,
     source: &UsageSource,
     shared: &SharedState,
+    stats: &Stats,
     shutdown: &Shutdown,
 ) {
+    let mut prune_started: Option<Instant> = None;
     let hysteresis = Hysteresis::new(config.cleanup_threshold, config.target_threshold);
     let mut mode = Mode::Idle;
     let mut have_usage = false;
@@ -129,14 +132,22 @@ fn controller_loop(
                         usage.total_bytes as f64 / GIB,
                     );
                     match (previous.is_evicting(), next.is_evicting()) {
-                        (false, true) => tracing::info!(
-                            "DELETION_START: timestamp={:.3}, usage={pct:.2}%, used={used:.2}GB, total={total:.2}GB",
-                            unix_now()
-                        ),
-                        (true, false) => tracing::info!(
-                            "DELETION_END: timestamp={:.3}, usage={pct:.2}%, used={used:.2}GB, total={total:.2}GB",
-                            unix_now()
-                        ),
+                        (false, true) => {
+                            prune_started = Some(Instant::now());
+                            tracing::info!(
+                                "DELETION_START: timestamp={:.3}, usage={pct:.2}%, used={used:.2}GB, total={total:.2}GB",
+                                unix_now()
+                            );
+                        }
+                        (true, false) => {
+                            if let Some(started) = prune_started.take() {
+                                stats.timings.prune.observe(started.elapsed().as_secs_f64());
+                            }
+                            tracing::info!(
+                                "DELETION_END: timestamp={:.3}, usage={pct:.2}%, used={used:.2}GB, total={total:.2}GB",
+                                unix_now()
+                            );
+                        }
                         _ => {}
                     }
                     if next == Mode::Emergency {
@@ -355,14 +366,31 @@ fn run(config: Config) -> anyhow::Result<()> {
     let (chains, chains_thread) = start_chains(&config, &shutdown)?;
     let (source, sampler) = start_usage_source(&config, &samples, &stats, &shutdown)?;
 
+    let metrics_thread = match config.metrics_addr {
+        Some(addr) => {
+            let sources = metrics::Sources {
+                stats: Arc::clone(&stats),
+                shared: Arc::clone(&shared),
+                budget: Arc::clone(&budget),
+                chains: chains.clone(),
+            };
+            let (bound, handle) = metrics::serve(addr, sources, Arc::clone(&shutdown))
+                .with_context(|| format!("serving metrics on {addr}"))?;
+            tracing::info!(addr = %bound, "serving Prometheus metrics on /metrics");
+            Some(handle)
+        }
+        None => None,
+    };
+
     let controller = {
-        let (config, shared, shutdown) = (
+        let (config, shared, stats, shutdown) = (
             Arc::clone(&config),
             Arc::clone(&shared),
+            Arc::clone(&stats),
             Arc::clone(&shutdown),
         );
         spawn("controller".into(), move || {
-            controller_loop(&config, &source, &shared, &shutdown);
+            controller_loop(&config, &source, &shared, &stats, &shutdown);
         })?
     };
 
@@ -402,6 +430,9 @@ fn run(config: Config) -> anyhow::Result<()> {
         let _ = t.join();
     }
     if let Some(t) = chains_thread {
+        let _ = t.join();
+    }
+    if let Some(t) = metrics_thread {
         let _ = t.join();
     }
     signal_handle.close();

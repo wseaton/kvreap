@@ -9,6 +9,7 @@ repository = "https://github.com/wseaton/kvreap"
 [dependencies]
 anyhow = "1.0.104"
 fastrand = "2.5.0"
+prometheus-client = { version = "0.24.1", default-features = false }
 rmp = { version = "0.8.15", optional = true }
 rustix = { version = "1.1.5", features = ["fs"] }
 serde_json = "1.0.151"
