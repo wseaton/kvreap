@@ -15,7 +15,7 @@ use crate::layout::BlockHash;
 use crate::stats::Stats;
 use crate::worker::buckets::RankDir;
 use crate::worker::pool::Candidate;
-use crate::worker::{Context, RECHECK_AFTER, Removed, Worker};
+use crate::worker::{Context, RECHECK_AFTER, Worker};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unlink {
@@ -64,9 +64,7 @@ impl Named {
 #[derive(Debug)]
 pub(crate) struct Target {
     pub(crate) path: PathBuf,
-    pub(crate) hash: BlockHash,
     pub(crate) size: u64,
-    pub(crate) rank: Arc<RankDir>,
 }
 
 /// `g0` from `.../<hh>_g0/<hash>.bin`.
@@ -139,12 +137,6 @@ impl Context {
         Stats::add(&self.stats.files_deleted, 1);
         Stats::add(&self.stats.bytes_freed, t.size);
         self.shared.freed(t.size);
-        if let (Some(tx), Some(base)) = (&self.events, &t.rank.model_base) {
-            let _ = tx.send(Removed {
-                model_base: base.clone(),
-                hash: t.hash,
-            });
-        }
         Unlink::Deleted
     }
 
@@ -190,40 +182,23 @@ impl Worker {
         size: u64,
         blocks: &[(BlockHash, String)],
     ) -> Vec<(BlockHash, Named)> {
+        let bucket_len = self.ctx.config.hex_bucket_len;
         let mut targets = Vec::new();
         let mut spans = Vec::new();
         for (hash, name) in blocks {
             let start = targets.len();
-            targets.extend(self.targets(ranks, name, group, *hash, size));
+            targets.extend(ranks.iter().filter_map(|r| {
+                Some(Target {
+                    path: block_path(&r.path, name, bucket_len, group)?,
+                    size,
+                })
+            }));
             spans.push((*hash, start..targets.len()));
         }
         let results = self.ctx.unlink_all(&targets);
         spans
             .into_iter()
             .map(|(hash, span)| (hash, Named::of(results.get(span).unwrap_or_default())))
-            .collect()
-    }
-
-    /// The paths of block file `name` in each of `ranks`.
-    pub(crate) fn targets(
-        &self,
-        ranks: &[Arc<RankDir>],
-        name: &str,
-        group: &str,
-        hash: BlockHash,
-        size: u64,
-    ) -> Vec<Target> {
-        let bucket_len = self.ctx.config.hex_bucket_len;
-        ranks
-            .iter()
-            .filter_map(|r| {
-                Some(Target {
-                    path: block_path(&r.path, name, bucket_len, group)?,
-                    hash,
-                    size,
-                    rank: Arc::clone(r),
-                })
-            })
             .collect()
     }
 
@@ -250,9 +225,7 @@ impl Worker {
     pub(crate) fn remove_block(&self, c: &Candidate) -> Unlink {
         let target = Target {
             path: c.path.clone(),
-            hash: c.hash,
             size: c.size,
-            rank: Arc::clone(&c.rank),
         };
         let r = self.ctx.unlink(&target);
         if let Some(chains) = &self.ctx.chains {
@@ -272,12 +245,9 @@ impl Worker {
 mod tests {
     use std::fs;
     use std::path::Path;
-    use std::sync::Arc;
 
     use crate::controller::Mode;
-    use crate::layout::BlockHash;
     use crate::stats::Stats;
-    use crate::worker::buckets::RankDir;
     use crate::worker::testing::{config, harness};
     use crate::worker::unlink::{Target, Unlink};
 
@@ -298,22 +268,13 @@ mod tests {
     }
 
     fn fanout_targets(dir: &Path, n: usize, missing: &[usize]) -> Vec<Target> {
-        let rank = Arc::new(RankDir {
-            path: dir.to_path_buf(),
-            model_base: None,
-        });
         (0..n)
             .map(|i| {
                 let path = dir.join(format!("{i:04}.bin"));
                 if !missing.contains(&i) {
                     fs::write(&path, b"x").expect("write");
                 }
-                Target {
-                    path,
-                    hash: BlockHash(i as u64),
-                    size: 100,
-                    rank: Arc::clone(&rank),
-                }
+                Target { path, size: 100 }
             })
             .collect()
     }

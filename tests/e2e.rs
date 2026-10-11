@@ -17,11 +17,7 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-#[cfg(feature = "events")]
-use std::sync::Arc;
 use std::sync::Mutex;
-#[cfg(feature = "events")]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 const CACHE_DIR: &str = "kv/model-cache/models";
@@ -361,139 +357,6 @@ fn respects_max_files_per_second() {
         "{deleted} deletions in {elapsed:.2}s exceeds 10 files/s"
     );
     assert!(ev.sigterm().success());
-}
-
-#[cfg(feature = "events")]
-struct Subscriber {
-    stop: Arc<AtomicBool>,
-    handle: std::thread::JoinHandle<()>,
-    frames: Arc<Mutex<Vec<Vec<Vec<u8>>>>>,
-}
-
-#[cfg(feature = "events")]
-impl Subscriber {
-    fn connect(endpoint: &str) -> Self {
-        let ctx = zmq::Context::new();
-        let sub = ctx.socket(zmq::SUB).expect("sub socket");
-        sub.set_rcvtimeo(100).expect("rcvtimeo");
-        sub.set_subscribe(b"kv@").expect("subscribe");
-        sub.connect(endpoint).expect("connect");
-        let stop = Arc::new(AtomicBool::new(false));
-        let frames = Arc::new(Mutex::new(Vec::new()));
-        let handle = {
-            let (stop, frames) = (Arc::clone(&stop), Arc::clone(&frames));
-            std::thread::spawn(move || {
-                let _ctx = ctx;
-                while !stop.load(Ordering::Relaxed) {
-                    if let Ok(msg) = sub.recv_multipart(0) {
-                        frames.lock().expect("lock").push(msg);
-                    }
-                }
-            })
-        };
-        Self {
-            stop,
-            handle,
-            frames,
-        }
-    }
-
-    fn finish(self) -> Vec<Vec<Vec<u8>>> {
-        self.stop.store(true, Ordering::Relaxed);
-        self.handle.join().expect("join subscriber");
-        Arc::try_unwrap(self.frames)
-            .expect("sole owner")
-            .into_inner()
-            .expect("lock")
-    }
-}
-
-#[cfg(feature = "events")]
-/// Decodes a payload `[ts, [bin(event)...]]` into the hashes of its BlockRemoved events.
-fn decode_removed(payload: &[u8]) -> Vec<u64> {
-    let mut rd = payload;
-    assert_eq!(
-        rmp::decode::read_array_len(&mut rd).expect("payload array"),
-        2
-    );
-    let ts = rmp::decode::read_f64(&mut rd).expect("timestamp");
-    assert!(ts > 1.7e9, "timestamp {ts} is not a unix time");
-    let n = rmp::decode::read_array_len(&mut rd).expect("events array");
-    let mut hashes = Vec::new();
-    for _ in 0..n {
-        let len = rmp::decode::read_bin_len(&mut rd).expect("bin event") as usize;
-        let (mut event, rest) = rd.split_at(len);
-        rd = rest;
-        assert_eq!(
-            rmp::decode::read_array_len(&mut event).expect("event array"),
-            3
-        );
-        let mut tag = [0u8; 32];
-        assert_eq!(
-            rmp::decode::read_str(&mut event, &mut tag).expect("tag"),
-            "BlockRemoved"
-        );
-        let count = rmp::decode::read_array_len(&mut event).expect("hashes array");
-        for _ in 0..count {
-            hashes.push(rmp::decode::read_int(&mut event).expect("hash"));
-        }
-        let mut medium = [0u8; 32];
-        assert_eq!(
-            rmp::decode::read_str(&mut event, &mut medium).expect("medium"),
-            "SHARED_STORAGE"
-        );
-    }
-    hashes
-}
-
-#[cfg(feature = "events")]
-#[test]
-fn publishes_block_removed_events_for_every_deletion() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    assert_not_in_emergency_band(tmp.path());
-    let cache = Cache::new(tmp.path());
-    let cold = cache.cold_blocks(40, 64);
-
-    let port = TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("free port")
-        .port();
-    let sub = Subscriber::connect(&format!("tcp://127.0.0.1:{port}"));
-    let mut env = always_evicting();
-    env.push(("STORAGE_EVENTS_ENDPOINT", format!("tcp://127.0.0.1:{port}")));
-    env.push(("DELETION_BATCH_SIZE", "1000".into()));
-    env.push(("DELETION_MAX_FILES_PER_SECOND", "40".into()));
-    let mut ev = Evictor::start(tmp.path(), &env);
-
-    assert!(
-        wait_until(Duration::from_secs(60), || existing(&cold).is_empty()),
-        "cold blocks left: {}\n{}",
-        existing(&cold).len(),
-        ev.log()
-    );
-    assert!(ev.sigterm().success());
-    std::thread::sleep(Duration::from_millis(300));
-    let frames = sub.finish();
-
-    assert!(!frames.is_empty(), "no events received\n{}", ev.log());
-    let mut seqs = Vec::new();
-    let mut hashes = Vec::new();
-    for msg in &frames {
-        assert_eq!(msg.len(), 3, "expected [topic, seq, payload]");
-        assert_eq!(msg[0], format!("kv@SHARED_STORAGE@{MODEL_NAME}").as_bytes());
-        seqs.push(u64::from_be_bytes(
-            msg[1].as_slice().try_into().expect("8-byte seq"),
-        ));
-        hashes.extend(decode_removed(&msg[2]));
-    }
-    assert!(
-        seqs.windows(2).all(|w| w[1] == w[0] + 1),
-        "sequence not contiguous: {seqs:?}"
-    );
-    let got: BTreeSet<u64> = hashes.iter().copied().collect();
-    let want: BTreeSet<u64> = cold.iter().map(|b| b.hash).collect();
-    assert_eq!(got.len(), hashes.len(), "duplicate hashes in events");
-    assert_eq!(got, want);
 }
 
 /// A vLLM-style KV events PUB socket (pure-Rust zeromq) on localhost.
@@ -943,6 +806,7 @@ fn logs_to_log_file_path_and_reports_compat_vars() {
         ("LOG_FILE_PATH", log_file.to_string_lossy().into_owned()),
         ("FILE_QUEUE_MAXSIZE", "10000".into()),
         ("FILE_QUEUE_MIN_SIZE", "1000".into()),
+        ("STORAGE_EVENTS_ENDPOINT", "tcp://*:5559".into()),
     ];
     let mut ev = Evictor::start(tmp.path(), &env);
     assert!(
@@ -953,7 +817,11 @@ fn logs_to_log_file_path_and_reports_compat_vars() {
     assert!(ev.sigterm().success());
     let file_log = fs::read_to_string(&log_file).expect("log file written");
     assert!(file_log.contains("kvreap starting"), "{file_log}");
-    for var in ["FILE_QUEUE_MAXSIZE", "FILE_QUEUE_MIN_SIZE"] {
+    for var in [
+        "FILE_QUEUE_MAXSIZE",
+        "FILE_QUEUE_MIN_SIZE",
+        "STORAGE_EVENTS_ENDPOINT",
+    ] {
         assert!(
             file_log.contains(var),
             "{var} should be reported as ignored\n{file_log}"
@@ -1286,33 +1154,10 @@ fn threshold_never_deletes_hot_files_even_if_target_is_unreachable() {
     assert!(!ev.log().contains("DELETION_END"));
 }
 
-#[cfg(not(feature = "events"))]
-#[test]
-fn storage_events_endpoint_without_events_feature_warns_and_still_evicts() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let cache = Cache::new(tmp.path());
-    let cold = cache.cold_blocks(10, 64);
-    let mut env = always_evicting();
-    env.push(("STORAGE_EVENTS_ENDPOINT", "tcp://127.0.0.1:5559".into()));
-    let mut ev = Evictor::start(tmp.path(), &env);
-    assert!(
-        ev.wait_for_log("this build has no events support", Duration::from_secs(10)),
-        "{}",
-        ev.log()
-    );
-    assert!(
-        wait_until(Duration::from_secs(30), || existing(&cold).is_empty()),
-        "{}",
-        ev.log()
-    );
-    assert!(ev.sigterm().success());
-}
-
 /// The default build must not link any cryptographic code (FIPS). zeromq's
 /// `rand` brings a ChaCha PRNG (`rand_chacha`), which is not a crypto
 /// primitive and is not on check-payload's deny list; the ChaCha20-Poly1305
 /// AEAD is.
-#[cfg(not(feature = "events"))]
 #[test]
 fn default_build_links_no_crypto() {
     let bin = fs::read(BIN).expect("read kvreap binary");

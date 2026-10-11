@@ -138,9 +138,6 @@ pub struct Config {
     pub log_level: LogLevel,
     pub workers: WorkerCount,
     pub usage_poll_interval: Duration,
-    /// Removed blocks per published event batch.
-    #[cfg(feature = "events")]
-    pub event_batch_size: usize,
     /// 0 means unlimited.
     pub max_files_per_second: f64,
     /// Unlinks one worker keeps in flight while deleting an edge or subtree.
@@ -151,7 +148,6 @@ pub struct Config {
     /// `None` keeps empty directories.
     pub dir_cleanup: Option<Duration>,
     pub log_file_path: Option<PathBuf>,
-    pub storage_events_endpoint: Option<String>,
     /// When set, usage is estimated from bucket samples against this size instead of `statvfs`.
     pub capacity_bytes: Option<CapacityBytes>,
     /// vLLM `--kv-events-config` PUB endpoints to build the prefix-chain index from.
@@ -164,7 +160,20 @@ pub struct Config {
     pub kv_events_disk_medium: Option<String>,
 }
 
-const IGNORED_VARS: [&str; 2] = ["FILE_QUEUE_MAXSIZE", "FILE_QUEUE_MIN_SIZE"];
+/// How the Python evictor reads a variable kvreap accepts and ignores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ignored {
+    /// Parsed as a number, so a bad value still fails like it does there.
+    Number,
+    Text,
+}
+
+const IGNORED_VARS: [(&str, Ignored); 4] = [
+    ("FILE_QUEUE_MAXSIZE", Ignored::Number),
+    ("FILE_QUEUE_MIN_SIZE", Ignored::Number),
+    ("DELETION_BATCH_SIZE", Ignored::Number),
+    ("STORAGE_EVENTS_ENDPOINT", Ignored::Text),
+];
 
 impl Config {
     pub fn cache_path(&self) -> PathBuf {
@@ -179,6 +188,7 @@ impl Config {
     pub fn ignored_vars_set(lookup: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
         IGNORED_VARS
             .into_iter()
+            .map(|(var, _)| var)
             .filter(|v| lookup(v).is_some_and(|s| !s.is_empty()))
             .collect()
     }
@@ -223,8 +233,10 @@ impl Config {
             });
         }
 
-        for var in IGNORED_VARS {
-            int(var, "0")?;
+        for (var, kind) in IGNORED_VARS {
+            if kind == Ignored::Number {
+                int(var, "0")?;
+            }
         }
 
         let poll = num("LOGGER_INTERVAL_SECONDS", "0.5")?;
@@ -237,8 +249,6 @@ impl Config {
             });
         }
 
-        #[cfg(feature = "events")]
-        let batch = int("DELETION_BATCH_SIZE", "100")?;
         let hex_len = int("HEX_BUCKET_LEN", "3")?;
         if !(1..=4).contains(&hex_len) {
             return Err(ConfigError::OutOfRange {
@@ -262,8 +272,6 @@ impl Config {
             log_level: LogLevel::parse(&get("LOG_LEVEL", "INFO")),
             workers: WorkerCount::new(int("NUM_CRAWLER_PROCESSES", "8")?)?,
             usage_poll_interval: Duration::from_secs_f64(poll),
-            #[cfg(feature = "events")]
-            event_batch_size: usize::try_from(batch.max(1)).unwrap_or(1),
             max_files_per_second: non_negative(
                 "DELETION_MAX_FILES_PER_SECOND",
                 num("DELETION_MAX_FILES_PER_SECOND", "0")?,
@@ -296,7 +304,6 @@ impl Config {
                 flag("ENABLE_DIR_CLEANUP", "true").then_some(ttl)
             },
             log_file_path: optional("LOG_FILE_PATH").map(PathBuf::from),
-            storage_events_endpoint: optional("STORAGE_EVENTS_ENDPOINT"),
             capacity_bytes: optional("CAPACITY_BYTES")
                 .map(|raw| CapacityBytes::parse("CAPACITY_BYTES", &raw))
                 .transpose()?,
@@ -360,14 +367,11 @@ mod tests {
         assert_eq!(c.log_level, LogLevel::Info);
         assert_eq!(c.workers.get(), 8);
         assert_eq!(c.usage_poll_interval.as_secs_f64(), 0.5);
-        #[cfg(feature = "events")]
-        assert_eq!(c.event_batch_size, 100);
         assert_eq!(c.max_files_per_second, 0.0);
         assert_eq!(c.hot_threshold.as_secs(), 3600);
         assert_eq!(c.hex_bucket_len, 3);
         assert_eq!(c.dir_cleanup, Some(Duration::from_secs(120)));
         assert_eq!(c.log_file_path, None);
-        assert_eq!(c.storage_events_endpoint, None);
         assert_eq!(c.capacity_bytes, None);
         assert!(c.kv_events_endpoints.is_empty());
         assert_eq!(c.kv_events_replay_port, None);
@@ -495,8 +499,6 @@ mod tests {
         ])
         .expect("parse");
         assert_eq!(c.workers.get(), 4);
-        #[cfg(feature = "events")]
-        assert_eq!(c.event_batch_size, 250);
     }
 
     #[test]
@@ -508,9 +510,8 @@ mod tests {
 
     #[test]
     fn empty_optional_strings_are_none() {
-        let c = cfg(&[("LOG_FILE_PATH", ""), ("STORAGE_EVENTS_ENDPOINT", "")]).expect("parse");
+        let c = cfg(&[("LOG_FILE_PATH", "")]).expect("parse");
         assert_eq!(c.log_file_path, None);
-        assert_eq!(c.storage_events_endpoint, None);
     }
 
     #[test]
@@ -608,10 +609,16 @@ mod tests {
 
     #[test]
     fn reports_ignored_compat_vars() {
-        let env: HashMap<&str, &str> = [("FILE_QUEUE_MAXSIZE", "10000")].into_iter().collect();
+        let env: HashMap<&str, &str> = [
+            ("FILE_QUEUE_MAXSIZE", "10000"),
+            ("STORAGE_EVENTS_ENDPOINT", "tcp://*:5557"),
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
             Config::ignored_vars_set(|k| env.get(k).map(|v| v.to_string())),
-            vec!["FILE_QUEUE_MAXSIZE"]
+            vec!["FILE_QUEUE_MAXSIZE", "STORAGE_EVENTS_ENDPOINT"]
         );
+        assert!(cfg(&[("STORAGE_EVENTS_ENDPOINT", "tcp://*:5557")]).is_ok());
     }
 }

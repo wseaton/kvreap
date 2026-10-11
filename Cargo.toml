@@ -11,7 +11,6 @@ repository = "https://github.com/wseaton/kvreap"
 anyhow = "1.0.104"
 fastrand = "2.5.0"
 prometheus-client = { version = "0.24.1", default-features = false }
-rmp = { version = "0.8.15", optional = true }
 rustix = { version = "1.1.5", features = ["fs"] }
 serde_json = "1.0.151"
 signal-hook = "0.4.5"
@@ -20,12 +19,6 @@ tokio = { version = "1.53.2", default-features = false, features = ["net", "rt",
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zeromq = { version = "0.6.0", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
-zmq = { version = "0.10.0", optional = true }
-
-[features]
-# Publishing BlockRemoved events over libzmq. Off by default: libzmq links its
-# own SHA-1. Subscribing to vLLM's KV events uses the pure-Rust zeromq crate.
-events = ["dep:rmp", "dep:zmq"]
 
 [dev-dependencies]
 bytes = "1.11.1"

@@ -4,8 +4,6 @@ mod capacity;
 mod chains;
 mod config;
 mod controller;
-#[cfg(feature = "events")]
-mod events;
 mod fsops;
 mod layout;
 mod metrics;
@@ -16,7 +14,6 @@ mod worker;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,7 +32,7 @@ use crate::controller::{
 use crate::layout::Shard;
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
-use crate::worker::{Context, Removed, Worker};
+use crate::worker::{Context, Worker};
 
 const MOUNT_WAIT: Duration = Duration::from_secs(60);
 const MOUNT_POLL: Duration = Duration::from_secs(2);
@@ -258,8 +255,6 @@ fn spawn<F: FnOnce() + Send + 'static>(name: String, f: F) -> anyhow::Result<Joi
         .with_context(|| format!("spawning {name}"))
 }
 
-type EventsHandle = (Option<mpsc::Sender<Removed>>, Option<JoinHandle<()>>);
-
 type ChainsHandle = (Option<Arc<chains::Chains>>, Option<JoinHandle<()>>);
 
 fn start_chains(config: &Config, shutdown: &Arc<Shutdown>) -> anyhow::Result<ChainsHandle> {
@@ -292,37 +287,6 @@ fn start_chains(config: &Config, shutdown: &Arc<Shutdown>) -> anyhow::Result<Cha
         })?
     };
     Ok((Some(chains), Some(handle)))
-}
-
-#[cfg(feature = "events")]
-fn start_events(config: &Config) -> anyhow::Result<EventsHandle> {
-    let Some(endpoint) = &config.storage_events_endpoint else {
-        return Ok((None, None));
-    };
-    match events::Publisher::bind(endpoint) {
-        Ok(publisher) => {
-            tracing::info!(endpoint, "storage event publisher bound");
-            let (tx, rx) = mpsc::channel();
-            let batch = config.event_batch_size;
-            let handle = spawn("events".into(), move || events::run(publisher, rx, batch))?;
-            Ok((Some(tx), Some(handle)))
-        }
-        Err(e) => {
-            tracing::warn!(endpoint, error = %e, "failed to create storage event publisher");
-            Ok((None, None))
-        }
-    }
-}
-
-#[cfg(not(feature = "events"))]
-fn start_events(config: &Config) -> anyhow::Result<EventsHandle> {
-    if let Some(endpoint) = &config.storage_events_endpoint {
-        tracing::warn!(
-            endpoint,
-            "STORAGE_EVENTS_ENDPOINT is set but this build has no events support; BlockRemoved events are not published"
-        );
-    }
-    Ok((None, None))
 }
 
 fn run(config: Config) -> anyhow::Result<()> {
@@ -358,7 +322,6 @@ fn run(config: Config) -> anyhow::Result<()> {
     let samples = Arc::new(Samples::default());
     let budget = Arc::new(Budget::new(config.max_files_per_second));
 
-    let (events_tx, events_thread) = start_events(&config)?;
     let (chains, chains_thread) = start_chains(&config, &shutdown)?;
     let (source, sampler) = start_usage_source(&config, &samples, &stats, &shutdown)?;
 
@@ -399,14 +362,12 @@ fn run(config: Config) -> anyhow::Result<()> {
             stats: Arc::clone(&stats),
             samples: Arc::clone(&samples),
             shutdown: Arc::clone(&shutdown),
-            events: events_tx.clone(),
             chains: chains.clone(),
         };
         workers.push(spawn(format!("worker-{id}"), move || {
             Worker::new(id, shard, ctx).run()
         })?);
     }
-    drop(events_tx);
 
     while !shutdown.wait(STATUS_INTERVAL) {
         log_status(&shared, &budget, &stats);
@@ -420,9 +381,6 @@ fn run(config: Config) -> anyhow::Result<()> {
     }
     let _ = controller.join();
     if let Some(t) = sampler {
-        let _ = t.join();
-    }
-    if let Some(t) = events_thread {
         let _ = t.join();
     }
     if let Some(t) = chains_thread {

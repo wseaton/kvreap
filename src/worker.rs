@@ -19,9 +19,7 @@
 //! | `subtree` | deleting a dead block with everything below it |
 
 use std::io;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
 use std::time::{Duration, SystemTime};
 
 use crate::budget::{Budget, OpKind};
@@ -30,7 +28,7 @@ use crate::chains::Chains;
 use crate::config::Config;
 use crate::controller::{Mode, SharedState};
 use crate::fsops;
-use crate::layout::{BlockHash, Shard};
+use crate::layout::Shard;
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
 use crate::worker::buckets::BucketIndex;
@@ -56,13 +54,6 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const CHAIN_WINDOW: usize = 8;
 
-/// A deleted block, reported to the events publisher when the `events` feature is on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Removed {
-    pub model_base: PathBuf,
-    pub hash: BlockHash,
-}
-
 pub struct Context {
     pub config: Arc<Config>,
     pub shared: Arc<SharedState>,
@@ -70,7 +61,6 @@ pub struct Context {
     pub stats: Arc<Stats>,
     pub samples: Arc<Samples>,
     pub shutdown: Arc<Shutdown>,
-    pub events: Option<Sender<Removed>>,
     pub chains: Option<Arc<Chains>>,
 }
 
@@ -239,9 +229,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::controller::Mode;
-    use crate::layout::BlockHash;
     use crate::stats::Stats;
-    use crate::worker::Removed;
     use crate::worker::testing::{age, bins, config, fixture, harness, run_rounds};
 
     #[test]
@@ -333,31 +321,6 @@ mod tests {
         run_rounds(&mut h, 50);
         assert_eq!(bins(&fx.cache).len(), 4);
         assert!(Stats::get(&h.stats.files_deleted) > 0);
-        assert!(h.rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn emits_removed_events_with_model_base_and_hash() {
-        let fx = fixture(2, 0);
-        let mut h = harness(config(&fx.cache, &[]));
-        h.shared.set_mode(Mode::Evicting);
-        run_rounds(&mut h, 50);
-        let mut got: Vec<_> = h.rx.try_iter().collect();
-        got.sort_by_key(|r| r.hash.0);
-        let base = fx.cache.join("org-model_abcdef012345");
-        assert_eq!(
-            got,
-            vec![
-                Removed {
-                    model_base: base.clone(),
-                    hash: BlockHash(0x1000_0000_0000_0000)
-                },
-                Removed {
-                    model_base: base,
-                    hash: BlockHash(0x1001_0000_0000_0000)
-                },
-            ]
-        );
     }
 
     #[test]

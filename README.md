@@ -122,10 +122,8 @@ digests; `kvreap_blocks_undigested` counts blocks it could not name.
 | `KV_EVENTS_REPLAY_PORT` | unset | port of each publisher's `replay_endpoint`; without it gaps are counted but not repaired |
 | `KV_EVENTS_DISK_MEDIUM` | unset | only `BlockStored` events of this medium mark a block on disk; `STORAGE` for vLLM's fs tier |
 | `METRICS_ADDR` | unset | `host:port` to serve Prometheus metrics on `/metrics` |
-| `STORAGE_EVENTS_ENDPOINT` | unset | ZMQ PUB bind address for `BlockRemoved` events; needs the `events` build |
-| `DELETION_BATCH_SIZE` | `100` | `BlockRemoved` events per message |
 | `DRY_RUN`, `LOG_LEVEL`, `LOG_FILE_PATH` | | as in the Python evictor |
-| `FILE_QUEUE_MAXSIZE`, `FILE_QUEUE_MIN_SIZE` | | accepted and ignored |
+| `FILE_QUEUE_MAXSIZE`, `FILE_QUEUE_MIN_SIZE`, `STORAGE_EVENTS_ENDPOINT`, `DELETION_BATCH_SIZE` | | accepted and ignored (logged at startup) |
 
 ## Metrics
 
@@ -143,10 +141,9 @@ live chain). The same counters go to the log every status interval.
   or encryption; keep the events port reachable only by kvreap and the
   router, through the namespace boundary or a NetworkPolicy
   ([deploy/kserve/](deploy/kserve/README.md) has both cases).
-- The default build links no cryptographic code, so it passes FIPS
-  `check-payload` scans; a test scans the binary for crypto and libzmq
-  symbols. The optional `events` feature (`BlockRemoved` publishing) links
-  libzmq, which compiles in its own SHA-1.
+- kvreap links no cryptographic code, so it passes FIPS `check-payload`
+  scans; a test scans the binary for crypto and libzmq symbols. ZMQ is the
+  pure-Rust `zeromq` crate.
 - kvreap needs write access to the cache directories vLLM creates: the same
   uid as vLLM or a shared group.
 
@@ -157,10 +154,10 @@ live chain). The same counters go to the log every status interval.
   a second, now every 5 s and ten a second) and the true footprint peaked at
   111% of the budget. Not yet re-measured; leave headroom between the budget
   and the disk.
-- Against vLLM 0.31's fs tier, `BlockRemoved` events from the `events` build
-  have no effect: vLLM publishes storage-tier stores under its own pod
-  identity, while evictor removals go to the `SHARED_STORAGE` topic, which
-  only the old `llmd_fs_backend` (<= 0.23) used.
+- kvreap does not publish `BlockRemoved` events for the files it deletes.
+  The Python evictor's events go to the `SHARED_STORAGE` topic, which only
+  the old `llmd_fs_backend` (<= 0.23) used; vLLM 0.31's fs tier publishes
+  under its own pod identity, so nothing consumes them.
 - One cache tier per kvreap. Tiered NVMe + shared storage needs one kvreap
   per tier.
 

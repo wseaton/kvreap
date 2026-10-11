@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
 use crate::budget::Budget;
@@ -16,7 +15,7 @@ use crate::controller::SharedState;
 use crate::layout::{BlockHash, Shard};
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
-use crate::worker::{Context, Removed, Worker};
+use crate::worker::{Context, Worker};
 
 pub(crate) struct Fixture {
     pub(crate) _tmp: tempfile::TempDir,
@@ -76,14 +75,12 @@ pub(crate) struct Harness {
     pub(crate) shared: Arc<SharedState>,
     pub(crate) stats: Arc<Stats>,
     pub(crate) samples: Arc<Samples>,
-    pub(crate) rx: mpsc::Receiver<Removed>,
 }
 
 pub(crate) fn harness(cfg: Config) -> Harness {
     let shared = Arc::new(SharedState::default());
     let stats = Arc::new(Stats::default());
     let samples = Arc::new(Samples::default());
-    let (tx, rx) = mpsc::channel();
     let ctx = Context {
         budget: Arc::new(Budget::new(cfg.max_files_per_second)),
         config: Arc::new(cfg),
@@ -91,7 +88,6 @@ pub(crate) fn harness(cfg: Config) -> Harness {
         stats: Arc::clone(&stats),
         samples: Arc::clone(&samples),
         shutdown: Arc::new(Shutdown::default()),
-        events: Some(tx),
         chains: None,
     };
     Harness {
@@ -99,7 +95,6 @@ pub(crate) fn harness(cfg: Config) -> Harness {
         shared,
         stats,
         samples,
-        rx,
     }
 }
 
