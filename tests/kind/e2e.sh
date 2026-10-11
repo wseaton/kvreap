@@ -17,7 +17,8 @@ TIMEOUT=${TIMEOUT:-600}
 k() { kubectl --context "kind-$CLUSTER" -n kvreap-e2e "$@"; }
 
 kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --wait 120s
-docker build -q --load -t kvreap:e2e .
+build_log=$(mktemp)
+docker build --progress=plain --load -t kvreap:e2e . >"$build_log" 2>&1 || { tail -80 "$build_log"; exit 1; }
 docker build -q --load -t fake-vllm:e2e tests/kind/fake-vllm
 docker pull -q ghcr.io/shopify/toxiproxy:2.12.0
 kind load docker-image --name "$CLUSTER" kvreap:e2e fake-vllm:e2e ghcr.io/shopify/toxiproxy:2.12.0
