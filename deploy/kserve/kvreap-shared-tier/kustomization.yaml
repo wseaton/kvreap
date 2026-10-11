@@ -1,6 +1,7 @@
 # With ../preset-tiered: points the ../kvreap Deployment at the shared tier's
 # events only (locality REMOTE), so the node-local tier's stores of the same
-# blocks do not count as files on the shared PVC.
+# blocks do not count as files on the shared PVC, and starts pruning at 80%:
+# VAST's usage report lags writes and catches up in bursts.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 patches:
@@ -20,3 +21,7 @@ patches:
                 env:
                   - name: KV_EVENTS_LOCALITY
                     value: REMOTE
+                  - name: CLEANUP_THRESHOLD
+                    value: "80"
+                  - name: TARGET_THRESHOLD
+                    value: "65"
