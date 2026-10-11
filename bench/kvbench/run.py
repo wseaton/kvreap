@@ -14,6 +14,11 @@
  nosharecache gives each pod its own NFS superblock, so each sampler sees
  only its own pod's NFS operations. On a host path, usage is the bytes under
  the dir against --pvc-size.
+
+ With --shared-tier-size as well, vLLM writes every block to two fs tiers:
+ the host path (locality LOCAL, read first) and a PVC of that size (REMOTE),
+ each kept within budget by its own evictor release reading its tier's
+ KV events.
 ```
 """
 
@@ -33,12 +38,14 @@ PART_OF = "kvreap-bench"
 NO_ISTIO = {"sidecar.istio.io/inject": "false"}
 SAMPLER_IMAGE = "docker.io/library/python:3.12-slim"
 KV_MOUNT = "/kv-cache"
+SHARED_KV_MOUNT = "/kv-shared"
 CACHE_DIRECTORY = "kv/model-cache/models"
 KV_EVENTS_PORT = 5557
 
 Manifest = dict[str, Any]
 Placement = Literal["any", "colocated", "separate"]
 Workload = Literal["churn-hot", "agent"]
+Locality = Literal["LOCAL", "REMOTE"]
 NYANN_IMAGE = "quay.io/wseaton/nyann-bench:kvbench-edd5f54"
 
 
@@ -118,10 +125,22 @@ class RunConfig:
     evictor_env: dict[str, str] = field(default_factory=dict)
     kv_host_path: str | None = None
     node: str | None = None
+    shared_tier_size: str | None = None
 
     @property
     def run_id(self) -> str:
         return f"{PART_OF}-{self.variant}"
+
+    @property
+    def tiered(self) -> bool:
+        return self.kv_host_path is not None and self.shared_tier_size is not None
+
+    @property
+    def kv_pvc_size(self) -> str | None:
+        """Size of the run's kv PVC, or None when the cache is only on the host path."""
+        if self.tiered:
+            return self.shared_tier_size
+        return None if self.kv_host_path else self.pvc_size
 
     @property
     def kv_pvc(self) -> str:
@@ -315,7 +334,31 @@ def bench_volume(cfg: RunConfig) -> Manifest:
     return {"name": "bench", "configMap": {"name": f"{cfg.run_id}-sampler"}}
 
 
+def fs_tier(cfg: RunConfig, mount: str, locality: Locality | None) -> dict[str, Any]:
+    return {
+        **(
+            {
+                "type": "StripedFileSystemTierManager",
+                "module_path": "striped_fs",
+                "stripe_blocks": cfg.fs_stripe_blocks,
+            }
+            if cfg.fs_stripe_blocks
+            else {"type": "fs"}
+        ),
+        "root_dir": f"{mount}/{CACHE_DIRECTORY}",
+        "n_read_threads": cfg.fs_read_threads,
+        "n_write_threads": 16,
+        **({"enable_kv_events": True} if cfg.kv_events else {}),
+        **({"locality": locality} if locality else {}),
+    }
+
+
 def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
+    tiers = (
+        [fs_tier(cfg, KV_MOUNT, "LOCAL"), fs_tier(cfg, SHARED_KV_MOUNT, "REMOTE")]
+        if cfg.tiered
+        else [fs_tier(cfg, KV_MOUNT, None)]
+    )
     kv_config = {
         "kv_connector": "OffloadingConnector",
         "kv_role": "kv_both",
@@ -323,23 +366,7 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
             "spec_name": "TieringOffloadingSpec",
             "cpu_bytes_to_use": cfg.cpu_tier_bytes,
             "block_size": cfg.offload_block_tokens,
-            "secondary_tiers": [
-                {
-                    **(
-                        {
-                            "type": "StripedFileSystemTierManager",
-                            "module_path": "striped_fs",
-                            "stripe_blocks": cfg.fs_stripe_blocks,
-                        }
-                        if cfg.fs_stripe_blocks
-                        else {"type": "fs"}
-                    ),
-                    "root_dir": f"{KV_MOUNT}/{CACHE_DIRECTORY}",
-                    "n_read_threads": cfg.fs_read_threads,
-                    "n_write_threads": 16,
-                    **({"enable_kv_events": True} if cfg.kv_events else {}),
-                }
-            ],
+            "secondary_tiers": tiers,
         },
     }
     lbl = labels(cfg, "vllm")
@@ -402,6 +429,7 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
                     },
                     "volumeMounts": [
                         {"name": "kv", "mountPath": KV_MOUNT},
+                        *([{"name": "kv-shared", "mountPath": SHARED_KV_MOUNT}] if cfg.tiered else []),
                         {"name": "bench", "mountPath": "/bench"},
                         {"name": "hf", "mountPath": "/models"},
                         {"name": "shm", "mountPath": "/dev/shm"},
@@ -415,6 +443,7 @@ def vllm_manifests(cfg: RunConfig) -> list[Manifest]:
             ],
             "volumes": [
                 kv_volume(cfg),
+                *([{"name": "kv-shared", "persistentVolumeClaim": {"claimName": cfg.kv_pvc}}] if cfg.tiered else []),
                 {"name": "hf", "persistentVolumeClaim": {"claimName": cfg.hf_pvc}},
                 {"name": "shm", "emptyDir": {"medium": "Memory", "sizeLimit": f"{shm_gib(cfg)}Gi"}},
                 bench_volume(cfg),
@@ -567,7 +596,34 @@ def deep_merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+@dataclass(frozen=True)
+class EvictorTier:
+    """One evictor release, for one cache tier."""
+
+    role: str
+    """Release suffix, pod role label and the prefix of its collected files."""
+    host_path: bool
+    """Evicts the host path on vLLM's node rather than the kv PVC."""
+    locality: Locality | None
+
+    def release(self, cfg: RunConfig) -> str:
+        return f"{cfg.run_id}-{self.role}"
+
+    def deployment(self, cfg: RunConfig) -> str:
+        return f"{self.release(cfg)}-pvc-evictor"
+
+
+def evictor_tiers(cfg: RunConfig) -> list[EvictorTier]:
+    if cfg.tiered:
+        return [EvictorTier("evictor", True, "LOCAL"), EvictorTier("evictor-shared", False, "REMOTE")]
+    return [EvictorTier("evictor", cfg.kv_dir is not None, None)]
+
+
 def evictor_manifests(cfg: RunConfig) -> list[Manifest]:
+    return [obj for tier in evictor_tiers(cfg) for obj in tier_evictor_manifests(cfg, tier)]
+
+
+def tier_evictor_manifests(cfg: RunConfig, tier: EvictorTier) -> list[Manifest]:
     if cfg.evictor_image is None or cfg.chart is None:
         return []
     repo, tag = split_image(cfg.evictor_image)
@@ -584,12 +640,12 @@ def evictor_manifests(cfg: RunConfig) -> list[Manifest]:
                 "fileAccessTimeThresholdMinutes": 2,
                 "logFilePath": "",
             },
-            "labels": labels(cfg, "evictor"),
+            "labels": labels(cfg, tier.role),
         },
         cfg.evictor_values,
     )
     rendered = subprocess.run(
-        ["helm", "template", f"{cfg.run_id}-evictor", str(cfg.chart), "-f", "-"],
+        ["helm", "template", tier.release(cfg), str(cfg.chart), "-f", "-"],
         input=yaml.safe_dump(values),
         capture_output=True,
         text=True,
@@ -604,7 +660,7 @@ def evictor_manifests(cfg: RunConfig) -> list[Manifest]:
         tmpl.setdefault("metadata", {}).setdefault("annotations", {}).update(NO_ISTIO)
         spec = tmpl["spec"]
         spec["imagePullSecrets"] = [{"name": cfg.pull_secret}]
-        if cfg.kv_dir:
+        if tier.host_path:
             spec["volumes"] = [
                 kv_volume(cfg) | {"name": v["name"]}
                 if v.get("persistentVolumeClaim", {}).get("claimName") == cfg.kv_pvc
@@ -613,18 +669,20 @@ def evictor_manifests(cfg: RunConfig) -> list[Manifest]:
             ]
         spec["volumes"] += [bench_volume(cfg), SAMPLES_VOLUME]
         env = dict(cfg.evictor_env)
-        if cfg.kv_dir:
+        if tier.host_path:
             env.setdefault("CAPACITY_BYTES", str(cfg.capacity_bytes))
         if cfg.kv_events:
             env.setdefault("KV_EVENTS_ENDPOINTS", cfg.kv_events_endpoint)
             env.setdefault("KV_EVENTS_DISK_MEDIUM", "STORAGE")
+            if tier.locality:
+                env.setdefault("KV_EVENTS_LOCALITY", tier.locality)
         for c in spec["containers"]:
             if c["name"] == "evictor":
                 c.setdefault("env", []).extend({"name": k, "value": v} for k, v in env.items())
         spec["containers"].append(
-            sampler_container("kv-cache-storage", capacity_bytes=cfg.capacity_bytes if cfg.kv_dir else None)
+            sampler_container("kv-cache-storage", capacity_bytes=cfg.capacity_bytes if tier.host_path else None)
         )
-        placement = "colocated" if cfg.kv_dir else cfg.placement
+        placement = "colocated" if tier.host_path else cfg.placement
         if placement != "any":
             kind = "podAffinity" if placement == "colocated" else "podAntiAffinity"
             spec["affinity"] = {
@@ -668,24 +726,24 @@ def wait_loadgen_done(cfg: RunConfig, timeout_s: int) -> None:
     raise TimeoutError(f"loadgen did not finish within {timeout_s}s")
 
 
-def collect(cfg: RunConfig, evictor_pod: str | None, events: dict[str, float]) -> None:
+def collect(cfg: RunConfig, evictor_pods: dict[str, str], events: dict[str, float]) -> None:
+    """Copies results out; each evictor's files are named by its role (evictor.log, evictor-shared.log, ...)."""
     c = cfg.cluster
     out = cfg.out
     out.mkdir(parents=True, exist_ok=True)
     vllm = f"{cfg.run_id}-vllm"
     c.kubectl("cp", f"{vllm}:{SAMPLES_FILE}", str(out / "vllm-sampler.jsonl"), "-c", "sampler")
     (out / "vllm.log").write_text(c.kubectl("logs", vllm, "-c", "vllm", "--timestamps"))
-    if evictor_pod:
-        c.kubectl("cp", f"{evictor_pod}:{SAMPLES_FILE}", str(out / "evictor-sampler.jsonl"), "-c", "sampler")
-        (out / "evictor.log").write_text(c.kubectl("logs", evictor_pod, "-c", "evictor", "--timestamps"))
+    for role, pod in evictor_pods.items():
+        c.kubectl("cp", f"{pod}:{SAMPLES_FILE}", str(out / f"{role}-sampler.jsonl"), "-c", "sampler")
+        (out / f"{role}.log").write_text(c.kubectl("logs", pod, "-c", "evictor", "--timestamps"))
     c.kubectl("cp", f"{cfg.run_id}-loadgen:/results", str(out / "loadgen"), "-c", "loadgen")
     meta = {k: (str(v) if isinstance(v, (Path, Cluster)) else v) for k, v in asdict(cfg).items()}
     meta["events"] = events
+    node = "jsonpath={.spec.nodeName}"
     meta["nodes"] = {
-        "vllm": c.kubectl("get", "pod", vllm, "-o", "jsonpath={.spec.nodeName}").strip(),
-        "evictor": c.kubectl("get", "pod", evictor_pod, "-o", "jsonpath={.spec.nodeName}").strip()
-        if evictor_pod
-        else None,
+        "vllm": c.kubectl("get", "pod", vllm, "-o", node).strip(),
+        **{role: c.kubectl("get", "pod", pod, "-o", node).strip() for role, pod in evictor_pods.items()},
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
 
@@ -700,8 +758,8 @@ def teardown(cfg: RunConfig, evictor: list[Manifest]) -> None:
         )
     c.delete(vllm_manifests(cfg))
     c.delete([sampler_configmap(cfg)])
-    if not cfg.kv_dir:
-        c.delete([pvc(cfg.kv_pvc, cfg.storage_class, cfg.pvc_size, {})])
+    if cfg.kv_pvc_size:
+        c.delete([pvc(cfg.kv_pvc, cfg.storage_class, cfg.kv_pvc_size, {})])
 
 
 def run(cfg: RunConfig, keep: bool = False) -> None:
@@ -715,27 +773,28 @@ def run(cfg: RunConfig, keep: bool = False) -> None:
     teardown(cfg, evictor)
 
     events: dict[str, float] = {}
-    if not cfg.kv_dir:
-        c.apply([pvc(cfg.kv_pvc, cfg.storage_class, cfg.pvc_size, labels(cfg, "kv"))])
+    if cfg.kv_pvc_size:
+        c.apply([pvc(cfg.kv_pvc, cfg.storage_class, cfg.kv_pvc_size, labels(cfg, "kv"))])
     c.apply([sampler_configmap(cfg)])
     c.apply(vllm_manifests(cfg))
     print(f"[{cfg.variant}] waiting for vLLM", flush=True)
     wait_pod_ready(c, f"{cfg.run_id}-vllm", timeout_s=1800)
     events["vllm_ready"] = time.time()
 
-    evictor_pod = None
+    evictor_pods: dict[str, str] = {}
     try:
         if evictor:
             c.apply(evictor)
-            c.kubectl("rollout", "status", f"deployment/{cfg.run_id}-evictor-pvc-evictor", "--timeout=300s")
-            evictor_pod = c.kubectl(
-                "get",
-                "pods",
-                "-l",
-                f"kvreap-bench/run={cfg.variant},kvreap-bench/role=evictor",
-                "-o",
-                "jsonpath={.items[0].metadata.name}",
-            ).strip()
+            for tier in evictor_tiers(cfg):
+                c.kubectl("rollout", "status", f"deployment/{tier.deployment(cfg)}", "--timeout=300s")
+                evictor_pods[tier.role] = c.kubectl(
+                    "get",
+                    "pods",
+                    "-l",
+                    f"kvreap-bench/run={cfg.variant},kvreap-bench/role={tier.role}",
+                    "-o",
+                    "jsonpath={.items[0].metadata.name}",
+                ).strip()
         events["evictor_ready"] = time.time()
 
         c.apply([loadgen_manifest(cfg)])
@@ -746,7 +805,7 @@ def run(cfg: RunConfig, keep: bool = False) -> None:
         events["load_end"] = time.time()
         time.sleep(cfg.settle_s)
         events["collect"] = time.time()
-        collect(cfg, evictor_pod, events)
+        collect(cfg, evictor_pods, events)
         print(f"[{cfg.variant}] results in {cfg.out}", flush=True)
     finally:
         if not keep:

@@ -257,6 +257,13 @@ class RunSummary:
     bench: dict[str, Any] = field(default_factory=dict)
     metrics: dict[str, float] = field(default_factory=dict)
     chains: dict[str, int] = field(default_factory=dict)
+    shared_max_usage_pct: float | None = None
+    shared_pct_time_above_cleanup: float | None = None
+    shared_chains: dict[str, int] = field(default_factory=dict)
+
+
+def usage_pcts(samples: list[Sample]) -> list[float]:
+    return [x.usage["used"] / x.usage["total"] * 100 for x in samples if x.usage and x.usage["total"]]
 
 
 def rtt_in_windows(samples: list[Sample], op: str, windows: list[tuple[float, float]], inside: bool) -> float | None:
@@ -298,10 +305,16 @@ def summarize(dir_: Path, cleanup_pct: float = 85.0) -> RunSummary:
             }
         )
 
-    usages = [x.usage["used"] / x.usage["total"] * 100 for x in vllm if x.usage and x.usage["total"]]
+    usages = usage_pcts(vllm)
     if usages:
         s.max_usage_pct = max(usages)
         s.pct_time_above_cleanup = 100 * sum(u >= cleanup_pct for u in usages) / len(usages)
+    shared = dir_ / "evictor-shared-sampler.jsonl"
+    shared_usages = usage_pcts(window(load_samples(shared), start, end)) if shared.exists() else []
+    if shared_usages:
+        s.shared_max_usage_pct = max(shared_usages)
+        s.shared_pct_time_above_cleanup = 100 * sum(u >= cleanup_pct for u in shared_usages) / len(shared_usages)
+    s.shared_chains = chain_counters(dir_ / "evictor-shared.log")
 
     log = (dir_ / "vllm.log").read_text() if (dir_ / "vllm.log").exists() else ""
     s.errors = {k: len(p.findall(log)) for k, p in ERROR_PATTERNS.items()}
@@ -369,6 +382,9 @@ def report(summaries: list[RunSummary]) -> str:
     )
     row("max usage %", [fmt(s.max_usage_pct) for s in summaries])
     row("% time >= cleanup threshold", [fmt(s.pct_time_above_cleanup) for s in summaries])
+    if any(s.shared_max_usage_pct is not None for s in summaries):
+        row("shared tier max usage %", [fmt(s.shared_max_usage_pct) for s in summaries])
+        row("shared tier % time >= cleanup threshold", [fmt(s.shared_pct_time_above_cleanup) for s in summaries])
     for k in ("hot_ttft_p50_ms", "hot_ttft_p90_ms", "hot_ttft_p99_ms"):
         row(k.replace("_", " "), [fmt(s.bench.get(k)) for s in summaries])
     for k in AGENT_KEYS:
@@ -384,6 +400,9 @@ def report(summaries: list[RunSummary]) -> str:
     if any(s.chains for s in summaries):
         for k, label in CHAIN_COUNTERS:
             row(label, [fmt(s.chains.get(k)) for s in summaries])
+    if any(s.shared_chains for s in summaries):
+        for k, label in CHAIN_COUNTERS:
+            row(f"shared tier {label}", [fmt(s.shared_chains.get(k)) for s in summaries])
     metric_names = sorted({k for s in summaries for k in s.metrics})
     for k in metric_names:
         row(f"`{k}` Δ", [fmt(s.metrics.get(k), 0) for s in summaries])

@@ -116,6 +116,29 @@ def test_no_chain_rows_without_a_chains_line(run_dir: Path) -> None:
     assert "chain deletions" not in report([s])
 
 
+def test_shared_tier_rows_come_from_its_own_evictor(run_dir: Path) -> None:
+    plain = summarize(run_dir)
+    assert plain.shared_max_usage_pct is None
+    assert "shared tier" not in report([plain])
+
+    used = [70, 80, 86, 88, 75] + [70] * 96
+    (run_dir / "evictor-shared-sampler.jsonl").write_text(
+        "\n".join(sample(T0 + i, {}, u) for i, u in enumerate(used)) + "\n" + sample(T0 + 500, {}, 99)
+    )
+    (run_dir / "evictor-shared.log").write_text(
+        f"{iso(T0 + 90)} INFO chains disk_medium=STORAGE locality=REMOTE event_batches=40 deleted_internal=3 "
+        "deleted_leaf=9\n"
+    )
+    s = summarize(run_dir)
+    assert s.shared_max_usage_pct == pytest.approx(88.0), "samples after load_end are outside the window"
+    assert s.shared_pct_time_above_cleanup == pytest.approx(200 / 101)
+    assert s.shared_chains["deleted_internal"] == 3
+    assert s.chains == {}, "the node-local tier's counters stay its own"
+    out = report([s])
+    assert "| shared tier max usage % | 88.0 |" in out
+    assert "| shared tier chain deletions: internal | 3 |" in out
+
+
 def test_agent_records_split_first_and_returning_turns(tmp_path: Path) -> None:
     from kvbench.analyze import load_bench
 

@@ -27,6 +27,12 @@ def main() -> int:
         "the evictor runs on vLLM's node with CAPACITY_BYTES set to --pvc-size",
     )
     r.add_argument("--node", help="pin vLLM (and so a --kv-host-path evictor) to this node")
+    r.add_argument(
+        "--shared-tier-size",
+        help="with --kv-host-path: add a PVC of this size as a second fs tier (locality REMOTE) behind the "
+        "host path (LOCAL), each with its own evictor release; collects evictor-shared.log and "
+        "evictor-shared-sampler.jsonl for the PVC tier",
+    )
     r.add_argument("--duration", type=int, default=1200, help="load duration in seconds")
     r.add_argument("--offload-block-tokens", type=int, default=16)
     r.add_argument(
@@ -111,6 +117,8 @@ def main() -> int:
 
     if args.variant != "none" and (args.image is None or args.chart is None):
         p.error("--image and --chart are required unless --variant none")
+    if args.shared_tier_size and not args.kv_host_path:
+        p.error("--shared-tier-size needs --kv-host-path for the node-local tier")
     evictor_env: dict[str, str] = {}
     for kv in args.evictor_env:
         key, sep, value = kv.partition("=")
@@ -156,6 +164,7 @@ def main() -> int:
         evictor_env=evictor_env,
         kv_host_path=args.kv_host_path,
         node=args.node,
+        shared_tier_size=args.shared_tier_size,
         storage_class="kvreap-bench-vast-shared" if args.share_nfs_client else "kvreap-bench-vast",
     )
     run(cfg, keep=args.keep)

@@ -199,6 +199,67 @@ def test_pvc_cache_has_no_init_container_or_node_pin() -> None:
     assert "--capacity-bytes" not in pod["spec"]["containers"][1]["command"]
 
 
+def tiered() -> RunConfig:
+    return cfg(kv_host_path="/mnt/local/kvreap-bench", pvc_size="80Gi", shared_tier_size="160Gi", kv_events=True)
+
+
+def test_tiered_vllm_writes_the_host_path_then_the_shared_pvc() -> None:
+    from kvbench.run import CACHE_DIRECTORY, KV_MOUNT, SHARED_KV_MOUNT
+
+    c = tiered()
+    assert c.tiered and c.kv_pvc_size == "160Gi"
+    pod, _ = vllm_manifests(c)
+    container = pod["spec"]["containers"][0]
+    [kv] = [a for a in container["args"] if a.startswith("--kv-transfer-config=")]
+    local, shared = json.loads(kv.split("=", 1)[1])["kv_connector_extra_config"]["secondary_tiers"]
+    assert (local["root_dir"], local["locality"]) == (f"{KV_MOUNT}/{CACHE_DIRECTORY}", "LOCAL")
+    assert (shared["root_dir"], shared["locality"]) == (f"{SHARED_KV_MOUNT}/{CACHE_DIRECTORY}", "REMOTE")
+    assert local["enable_kv_events"] and shared["enable_kv_events"]
+    assert {"name": "kv-shared", "mountPath": SHARED_KV_MOUNT} in container["volumeMounts"]
+    volumes = {v["name"]: v for v in pod["spec"]["volumes"]}
+    assert volumes["kv"]["hostPath"]["path"] == "/mnt/local/kvreap-bench/d"
+    assert volumes["kv-shared"]["persistentVolumeClaim"]["claimName"] == c.kv_pvc
+
+    single, _ = vllm_parts(cfg(kv_host_path="/mnt/local/kvreap-bench", kv_events=True))
+    [kv] = [a for a in single["args"] if a.startswith("--kv-transfer-config=")]
+    [tier] = json.loads(kv.split("=", 1)[1])["kv_connector_extra_config"]["secondary_tiers"]
+    assert "locality" not in tier
+    assert not any(m["name"] == "kv-shared" for m in single["volumeMounts"])
+    assert cfg(kv_host_path="/mnt/local/kvreap-bench").kv_pvc_size is None
+    assert cfg(pvc_size="100Gi").kv_pvc_size == "100Gi"
+
+
+@needs_chart
+def test_tiered_runs_one_evictor_per_tier() -> None:
+    from kvbench.run import evictor_tiers
+
+    c = tiered()
+    deps = {o["metadata"]["name"]: o for o in evictor_manifests(c) if o["kind"] == "Deployment"}
+    assert set(deps) == {t.deployment(c) for t in evictor_tiers(c)}
+    by_role = {d["spec"]["template"]["metadata"]["labels"]["kvreap-bench/role"]: d for d in deps.values()}
+    assert set(by_role) == {"evictor", "evictor-shared"}
+
+    def env(role: str) -> dict[str, str]:
+        [ev] = [x for x in by_role[role]["spec"]["template"]["spec"]["containers"] if x["name"] == "evictor"]
+        return {e["name"]: e.get("value") for e in ev.get("env", [])}
+
+    assert env("evictor")["KV_EVENTS_LOCALITY"] == "LOCAL"
+    assert env("evictor")["CAPACITY_BYTES"] == str(80 * 1024**3)
+    assert env("evictor-shared")["KV_EVENTS_LOCALITY"] == "REMOTE"
+    assert "CAPACITY_BYTES" not in env("evictor-shared")
+    for role in by_role:
+        assert env(role)["KV_EVENTS_ENDPOINTS"] == c.kv_events_endpoint
+    local = by_role["evictor"]["spec"]["template"]["spec"]
+    shared = by_role["evictor-shared"]["spec"]["template"]["spec"]
+    assert "podAffinity" in local["affinity"]
+    assert "affinity" not in shared
+    assert {"path": "/mnt/local/kvreap-bench/d", "type": "DirectoryOrCreate"} in [
+        v.get("hostPath") for v in local["volumes"]
+    ]
+    assert c.kv_pvc in [v.get("persistentVolumeClaim", {}).get("claimName") for v in shared["volumes"]]
+    assert "KV_EVENTS_LOCALITY" not in evictor_env(cfg(kv_events=True))
+
+
 @needs_chart
 def test_host_path_evictor_runs_on_vllms_node_with_capacity_bytes() -> None:
     c = cfg(kv_host_path="/mnt/local/kvreap-bench", pvc_size="160Gi")
