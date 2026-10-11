@@ -348,7 +348,7 @@ fn encode_chains(enc: &mut DescriptorEncoder, chains: &Chains) -> Result<(), std
     counter(
         enc,
         "kvreap_chain_young_edges",
-        "Eviction rounds that stopped at a recently written edge below the cleanup threshold.",
+        "Eviction rounds that stopped at a recently written edge below the pressure line.",
         Stats::get(&c.young_edges),
     )
 }

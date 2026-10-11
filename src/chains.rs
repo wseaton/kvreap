@@ -93,7 +93,7 @@ pub struct ChainStats {
     pub vanished: AtomicU64,
     /// Edges or subtrees skipped because another worker was deleting them.
     pub claim_conflicts: AtomicU64,
-    /// Rounds that stopped at a recently written edge below the cleanup threshold.
+    /// Rounds that stopped at a recently written edge below the pressure line.
     pub young_edges: AtomicU64,
 }
 
