@@ -26,17 +26,18 @@ thresholds. Full reports: [VAST](benchmarks/final-vast.md),
 
 | shared VAST PVC | Python `pvc_evictor` | kvreap, chain-aware |
 |---|---|---|
-| requests completed | 2,748 | **4,345** (+58%) |
-| prefix tokens served from offload | 35.5M | **70.8M** (2.0×) |
-| returning-turn TTFT p90 / p99 | 6.3 s / 18.1 s | **0.94 s / 3.2 s** |
-| KV rewritten to storage | 2.19 TB | **0.90 TB** |
-| evictor NFS metadata ops/s | 14,765 | **704** |
+| requests completed | 2,748 | **4,471** (+63%) |
+| prefix tokens served from offload | 35.5M | **74.6M** (2.1×) |
+| returning-turn TTFT p90 / p99 | 6.3 s / 18.1 s | **0.99 s / 2.2 s** |
+| KV rewritten to storage | 2.19 TB | **0.72 TB** |
+| evictor NFS metadata ops/s | 14,765 | **2,801** |
 
 On node-local NVMe through a hostPath the Python evictor never runs at all:
 `statvfs` reports the whole node disk, so usage never reaches the threshold
 ([proof](benchmarks/hostpath-proof/)). kvreap sizes the budget from
-`CAPACITY_BYTES`; there, chain-aware eviction completes 27% more requests than
-kvreap's own plain LRU and halves returning-turn TTFT p99.
+`CAPACITY_BYTES`; there, chain-aware eviction completes 30% more requests than
+kvreap's own plain LRU, cuts returning-turn TTFT p99 2.3×, and keeps usage
+within the budget (91.4% peak).
 
 ## How it works
 
@@ -153,11 +154,14 @@ live chain). The same counters go to the log every status interval.
 
 ## Known limitations
 
-- `CAPACITY_BYTES` estimates usage from bucket samples. In the NVMe run the
-  estimate trailed the disk (buckets were listed every 60 s and sampled once
-  a second, now every 5 s and ten a second) and the true footprint peaked at
-  111% of the budget. Not yet re-measured; leave headroom between the budget
-  and the disk.
+- `CAPACITY_BYTES` estimates usage from bucket samples, so it trails the disk
+  by a few seconds; the NVMe run peaked at 91.4% of the budget. Leave
+  headroom between the budget and the disk.
+- Chain-aware eviction runs usage higher than the Python evictor on VAST
+  (96.6% peak, 12.9% of the run above the cleanup threshold against 6.6%):
+  below the pressure line it holds back recently written sessions while the
+  sampler looks for finished ones. Lower `CLEANUP_THRESHOLD` if the volume's
+  quota is hard.
 - kvreap does not publish `BlockRemoved` events for the files it deletes.
   The Python evictor's events go to the `SHARED_STORAGE` topic, which only
   the old `llmd_fs_backend` (<= 0.23) used; vLLM 0.31's fs tier publishes
