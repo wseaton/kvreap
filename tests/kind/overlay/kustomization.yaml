@@ -9,6 +9,7 @@ resources:
   - pvc.yaml
 components:
   - ../../../deploy/kserve/kvreap
+  - ../../../deploy/kserve/kv-events-policy
 images:
   - name: quay.io/wseaton/kvreap
     newName: kvreap
@@ -22,6 +23,10 @@ patches:
       spec:
         template:
           spec:
+            securityContext:
+              runAsUser: 1000
+              runAsGroup: 1000
+              fsGroup: 1000
             containers:
               - name: kvreap
                 imagePullPolicy: Never

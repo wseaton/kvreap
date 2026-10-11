@@ -46,14 +46,11 @@ spec:
         app.kubernetes.io/name: LLMISVC_NAME
         app.kubernetes.io/component: kvreap
     spec:
-      # Run as the uid vLLM writes the cache with (or share its group), so
-      # kvreap can unlink in the directories vLLM creates.
+      # No uid here: on OpenShift the restricted-v2 SCC gives every pod in the
+      # namespace the same uid, so kvreap can unlink what vLLM writes. Elsewhere
+      # patch runAsUser (or fsGroup) to match vLLM's.
       securityContext:
         runAsNonRoot: true
-        runAsUser: 1000
-        runAsGroup: 1000
-        fsGroup: 1000
-        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -76,8 +73,6 @@ spec:
               value: "5558"
             - name: KV_EVENTS_DISK_MEDIUM
               value: STORAGE
-            - name: CHAIN_EVICTION
-              value: radix
             - name: METRICS_ADDR
               value: 0.0.0.0:9090
           ports:
@@ -101,41 +96,3 @@ spec:
         - name: kv-cache
           persistentVolumeClaim:
             claimName: KV_CACHE_PVC
----
-# Selecting the workload pods for Ingress denies every port not listed, so
-# vLLM's 8000 stays open to all and only 5557 and 5558 (replay) are limited
-# to kvreap and the EPP: BlockStored carries prompt token ids. Add any other port the workload
-# serves before applying.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: LLMISVC_NAME-kv-events
-  labels:
-    app.kubernetes.io/name: LLMISVC_NAME
-    app.kubernetes.io/component: kvreap
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/part-of: llminferenceservice
-      app.kubernetes.io/name: LLMISVC_NAME
-      kserve.io/component: workload
-  policyTypes: [Ingress]
-  ingress:
-    - ports:
-        - port: 8000
-          protocol: TCP
-    - from:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: LLMISVC_NAME
-              app.kubernetes.io/component: kvreap
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/part-of: llminferenceservice
-              app.kubernetes.io/name: LLMISVC_NAME
-              app.kubernetes.io/component: llminferenceservice-router-scheduler
-      ports:
-        - port: 5557
-          protocol: TCP
-        - port: 5558
-          protocol: TCP

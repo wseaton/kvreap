@@ -1,0 +1,37 @@
+# Selecting the workload pods for Ingress denies every port not listed, so
+# vLLM's 8000 stays open to all and only 5557 and 5558 (replay) are limited
+# to kvreap and the EPP: BlockStored carries prompt token ids. Add any other port the workload
+# serves before applying.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: LLMISVC_NAME-kv-events
+  labels:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: llminferenceservice
+      app.kubernetes.io/name: LLMISVC_NAME
+      kserve.io/component: workload
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - port: 8000
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: LLMISVC_NAME
+              app.kubernetes.io/component: kvreap
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: llminferenceservice
+              app.kubernetes.io/name: LLMISVC_NAME
+              app.kubernetes.io/component: llminferenceservice-router-scheduler
+      ports:
+        - port: 5557
+          protocol: TCP
+        - port: 5558
+          protocol: TCP

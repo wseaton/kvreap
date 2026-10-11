@@ -19,9 +19,9 @@ spec:
       scheme: http
       interval: 30s
 ---
-# kvreap takes no other inbound traffic; only the monitoring namespace may
-# reach its metrics port. Change the namespace for a Prometheus outside
-# OpenShift user workload monitoring.
+# kvreap takes no other inbound traffic; only the namespaces OpenDataHub
+# admits for scraping LLMInferenceService pods may reach its metrics port.
+# Add your Prometheus's namespace if it runs elsewhere.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -39,7 +39,13 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
+              kubernetes.io/metadata.name: openshift-monitoring
+        - namespaceSelector:
+            matchLabels:
               kubernetes.io/metadata.name: openshift-user-workload-monitoring
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: redhat-ods-monitoring
       ports:
         - port: 9090
           protocol: TCP

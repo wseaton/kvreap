@@ -1,0 +1,25 @@
+# Optional NetworkPolicy limiting the KV events and replay ports to kvreap and
+# the EPP, for clusters without OpenDataHub's per-service policy (see the
+# README). Include it after ../kvreap.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - networkpolicy.yaml
+replacements:
+  - source:
+      kind: ConfigMap
+      name: kvreap-target
+      fieldPath: data.llmisvc
+    targets:
+      - select:
+          kind: NetworkPolicy
+          name: LLMISVC_NAME-kv-events
+        fieldPaths:
+          - metadata.name
+          - metadata.labels.[app.kubernetes.io/name]
+          - spec.podSelector.matchLabels.[app.kubernetes.io/name]
+          - spec.ingress.1.from.0.podSelector.matchLabels.[app.kubernetes.io/name]
+          - spec.ingress.1.from.1.podSelector.matchLabels.[app.kubernetes.io/name]
+        options:
+          delimiter: "-"
+          index: 0

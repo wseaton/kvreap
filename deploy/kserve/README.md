@@ -2,13 +2,14 @@
 
 Chain-aware eviction for an `LLMInferenceService` whose `kvCacheOffloading`
 puts a filesystem tier on a shared (RWX) PVC. kvreap deletes whole unshared
-conversation tails (`CHAIN_EVICTION=radix`) instead of cutting prefix chains in
-the middle; see `benchmarks/chain-spike-agent.md` for the measured effect.
+conversation tails instead of cutting prefix chains in the middle; see
+`benchmarks/final-vast.md` and `benchmarks/final-nvme.md` for the measured effect.
 
 | path | what |
 |---|---|
 | `preset/` | `LLMInferenceServiceConfig` `kv-offloading-kvreap`, added to the service's `spec.baseRefs` |
-| `kvreap/` | kustomize Component: headless Service over the workload pods, the kvreap Deployment on the PVC, a NetworkPolicy for the KV events port |
+| `kvreap/` | kustomize Component: headless Service over the workload pods and the kvreap Deployment on the PVC |
+| `kv-events-policy/` | optional kustomize Component, not for OpenDataHub/RHOAI: a NetworkPolicy limiting 5557/5558 to kvreap and the EPP |
 | `kvreap-monitoring/` | optional kustomize Component: a PodMonitor for kvreap's metrics and a NetworkPolicy for its port |
 | `example/` | an overlay that includes the preset and the kvreap Component for a service named `qwen3-32b` |
 
@@ -21,8 +22,10 @@ kubectl kustomize deploy/kserve/example
 - `spec.kvCacheOffloading.secondary[0].fileSystem.pvc.ref` naming an RWX PVC.
   kvreap mounts the same PVC; set `data.pvc` in your `kvreap-target` ConfigMap
   to that name. If the ref sets a `path`, set kvreap's `CACHE_DIRECTORY` to it.
-- kvreap runs as uid/gid 1000 with `fsGroup: 1000`; change these to the uid
-  vLLM writes the cache with, or kvreap cannot unlink in its directories.
+- kvreap must run as the uid vLLM writes the cache with, or it cannot unlink
+  in vLLM's directories. On OpenShift (OpenDataHub/RHOAI) leave the uid unset:
+  the restricted-v2 SCC gives both pods the namespace's uid. Elsewhere patch
+  the Deployment's `runAsUser` (or a shared `fsGroup`) to vLLM's.
 - `spec.baseRefs: [{name: kv-offloading-kvreap}]`. The preset makes vLLM bind
   its KV events PUB socket on 5557 (`tcp://*:5557`) and replay socket on 5558,
   send full block hashes
@@ -32,7 +35,9 @@ kubectl kustomize deploy/kserve/example
   keep `cpu_bytes_to_use` in line with `kvCacheOffloading.cpu`. With a KServe
   that has `secondary[].fileSystem.kvEvents` (wseaton/kserve branch
   `llmisvc-fs-tier-kv-events`), set `kvEvents: true` on the tier and drop the
-  `--kv-transfer-config` from the preset.
+  `--kv-transfer-config` from the preset. RHOAI's KServe module ships the CRDs
+  vendored from a release ref, so the field reaches RHOAI only after that
+  copy is refreshed, not when the code merges.
 - The EPP in discovery mode, so it and kvreap both connect to each vLLM pod:
   in the precise prefix cache producer's `kvEventsConfig`, set
   `discoverPods: true` and `podDiscoveryConfig.socketPort: 5557`, and drop the
@@ -61,20 +66,32 @@ kvreap serves Prometheus metrics on port 9090 (`METRICS_ADDR`, plain HTTP,
 `GET /metrics`): deletions, metadata-op latency, prune duration, usage, the
 delete grant and op-rate limit, chain deletions by position, and KV event
 batches, gaps, replays and losses. Include `kvreap-monitoring` as a second
-component for a PodMonitor and a NetworkPolicy that admits only
-`openshift-user-workload-monitoring`; it needs the Prometheus Operator CRDs.
+component for a PodMonitor and a NetworkPolicy that admits the same
+monitoring namespaces OpenDataHub admits for vLLM (`openshift-monitoring`,
+`openshift-user-workload-monitoring`, `redhat-ods-monitoring`); it needs the
+Prometheus Operator CRDs.
 For a TLS scrape, set `METRICS_ADDR=127.0.0.1:9090` and put kube-rbac-proxy
 in front of it.
 
 ## Security
 
 BlockStored events carry prompt token ids. kvreap implements no ZMQ
-authentication (NULL mechanism, no crypto in the binary); run both sides in
-the mesh so the sidecars provide mTLS, keep the port named `tcp-kv-events` so
-the mesh treats it as opaque TCP, and apply the NetworkPolicy, which allows
-5557 and 5558 only from kvreap and the EPP. The policy selects the workload pods for
-Ingress, so it lists 8000 as open to all; add any other port your workload
-serves before applying it.
+authentication (NULL mechanism, no crypto in the binary), the same as the EPP's
+own KV event subscription, so the events are plaintext on the pod network.
+
+- **OpenDataHub/RHOAI.** The KServe controller gives each LLMInferenceService a
+  NetworkPolicy that admits the gateway, the monitoring namespaces, and every
+  pod in the service's namespace on any port. That covers kvreap and the EPP,
+  and it also means any pod in the namespace can read 5557 and 5558: the
+  namespace is the boundary. Workload pods are not in a service mesh by
+  default, so there is no sidecar mTLS. Run the service in a namespace that
+  holds only trusted workloads, and do not add `kv-events-policy`, which
+  keeps 8000 open to all and would widen the controller's policy.
+- **Elsewhere.** Include `kv-events-policy` to allow 5557 and 5558 only from
+  kvreap and the EPP. It selects the workload pods for Ingress, so it lists
+  8000 as open to all; add any other port your workload serves. In a mesh,
+  keep the ports named `tcp-*` so the sidecars carry them as opaque TCP with
+  mTLS.
 
 ## Optional: faster fs tier reads
 
