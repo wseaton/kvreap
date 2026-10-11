@@ -20,13 +20,13 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::budget::{Budget, OpKind};
 use crate::capacity::Samples;
 use crate::chains::Chains;
 use crate::config::Config;
-use crate::controller::SharedState;
+use crate::controller::{SharedState, pressure_line};
 use crate::fsops;
 use crate::layout::Shard;
 use crate::shutdown::Shutdown;
@@ -121,7 +121,7 @@ impl Worker {
                             ?wait,
                             "no cold files found, backing off"
                         );
-                        self.ctx.shutdown.wait(wait);
+                        self.back_off(wait);
                     }
                 }
                 Ok(None) => {
@@ -155,6 +155,23 @@ impl Worker {
         let wait = self.backoff;
         self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
         Some(wait)
+    }
+
+    /// Usage is past the pressure line, where radix also takes young edges.
+    pub(crate) fn pressed(&self) -> bool {
+        self.ctx.shared.usage() >= pressure_line(self.ctx.config.cleanup_threshold)
+    }
+
+    /// Sleeps `wait`, or less if usage crosses the pressure line meanwhile:
+    /// a pass that held young edges back is no reason to sleep through it.
+    fn back_off(&self, wait: Duration) {
+        let pressed = self.pressed();
+        let deadline = Instant::now() + wait;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            if self.ctx.shutdown.wait(left.min(IDLE_POLL)) || (!pressed && self.pressed()) {
+                return;
+            }
+        }
     }
 
     fn acquire(&self) -> bool {
@@ -317,6 +334,33 @@ mod tests {
         run_rounds(&mut h, 50);
         assert_eq!(bins(&fx.cache).len(), 4);
         assert!(Stats::get(&h.stats.files_deleted) > 0);
+    }
+
+    #[test]
+    fn back_off_wakes_when_usage_crosses_the_pressure_line() {
+        let fx = fixture(1, 0);
+        let h = harness(config(&fx.cache, &[]));
+        h.shared.set_usage(80.0);
+        let shared = Arc::clone(&h.shared);
+        let raise = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            shared.set_usage(92.0);
+        });
+        let start = Instant::now();
+        h.worker.back_off(Duration::from_secs(30));
+        raise.join().expect("join");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+
+        let start = Instant::now();
+        h.worker.back_off(Duration::from_millis(600));
+        assert!(
+            start.elapsed() >= Duration::from_millis(600),
+            "already past the line: sleeps the whole wait"
+        );
     }
 
     #[test]

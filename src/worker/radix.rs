@@ -6,7 +6,6 @@ use std::time::SystemTime;
 
 use crate::chains::index::LeafEdge;
 use crate::chains::{Chains, Claim, Gone, RadixKey};
-use crate::controller::pressure_line;
 use crate::layout::BlockHash;
 use crate::stats::Stats;
 use crate::worker::pool::Candidate;
@@ -90,10 +89,6 @@ impl Worker {
         SystemTime::now()
             .duration_since(newest_store)
             .map_or(true, |age| age < self.ctx.config.hot_threshold)
-    }
-
-    fn pressed(&self) -> bool {
-        self.ctx.shared.usage() >= pressure_line(self.ctx.config.cleanup_threshold)
     }
 
     /// Deletes `edge` leaf first in every rank dir of `c`'s model. Returns
