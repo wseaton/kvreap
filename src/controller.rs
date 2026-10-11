@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::budget::Pacing;
+
 use crate::capacity::Samples;
 use crate::config::{CapacityBytes, Percent};
 
@@ -34,6 +36,13 @@ impl Mode {
             1 => Self::Evicting,
             2 => Self::Emergency,
             _ => Self::Idle,
+        }
+    }
+
+    pub fn pacing(self) -> Pacing {
+        match self {
+            Self::Emergency => Pacing::Unpaced,
+            Self::Idle | Self::Evicting => Pacing::Paced,
         }
     }
 

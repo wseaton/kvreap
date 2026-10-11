@@ -1,5 +1,5 @@
-//! `CHAIN_EVICTION=radix`: delete whole radix-tree leaf edges (unshared
-//! tails), least recently written first, never a prefix that still has two
+//! Chain-aware eviction: delete whole radix-tree leaf edges (unshared tails),
+//! least recently written first, never a prefix that still has two
 //! continuations on disk.
 
 use std::time::Instant;
@@ -9,7 +9,7 @@ use crate::chains::{Chains, Claim, Gone, RadixKey};
 use crate::layout::BlockHash;
 use crate::stats::Stats;
 use crate::worker::pool::Candidate;
-use crate::worker::unlink::{Named, leaf_group};
+use crate::worker::unlink::leaf_group;
 use crate::worker::{CHAIN_WINDOW, Worker};
 
 /// `hash`'s leaf edge, reserved for this worker: the edge is read again
@@ -22,13 +22,12 @@ pub(crate) fn claim_edge(chains: &Chains, hash: BlockHash) -> Option<(LeafEdge, 
 }
 
 impl Worker {
-    /// Dead candidates take their whole subtree with them. Any other
-    /// candidate maps to the radix leaf edge it belongs to (or, inside a
-    /// shared prefix, the oldest edge below it), deleted leaf first.
-    /// Dead blocks first, then blocks the index does not know, then leaf
-    /// edges by their newest write, oldest first. Edges written within the
-    /// hot threshold are dropped from the pool so the sampler brings in
-    /// others, and only go in the emergency band.
+    /// Evicts dead blocks (with their whole subtree) first, then blocks the
+    /// index does not know, then leaf edges by their newest write, oldest
+    /// first. A candidate maps to the leaf edge it belongs to (or, inside a
+    /// shared prefix, the oldest edge below it), deleted leaf first. Edges
+    /// written within the hot threshold are dropped from the pool so the
+    /// sampler brings in others, and only go in the emergency band.
     pub(crate) fn evict_radix(&mut self, quota: usize, chains: &Chains) -> usize {
         let mut window: Vec<(RadixKey, Candidate)> = std::iter::from_fn(|| self.pool.pop_oldest())
             .take(quota.saturating_mul(CHAIN_WINDOW))
@@ -112,39 +111,29 @@ impl Worker {
             .file_name()
             .and_then(|n| n.to_str())
             .map(str::to_owned);
-        let mut targets = Vec::new();
-        let mut spans = Vec::new();
-        for b in edge.blocks.iter().rev() {
-            let is_candidate = b.hash == c.hash;
-            let Some(name) = b
-                .file_name()
-                .or_else(|| own_name.clone().filter(|_| is_candidate))
-            else {
-                break;
-            };
-            let start = targets.len();
-            targets.extend(self.targets(&ranks, &name, &group, b.hash, c.size));
-            spans.push((b.hash, is_candidate, start..targets.len()));
-        }
-        let results = self.ctx.unlink_all(&targets);
-        let (mut files, mut candidate_gone, mut stopped) = (0, false, false);
+        let blocks: Vec<(BlockHash, String)> = edge
+            .blocks
+            .iter()
+            .rev()
+            .map_while(|b| {
+                let name = b
+                    .file_name()
+                    .or_else(|| own_name.clone().filter(|_| b.hash == c.hash))?;
+                Some((b.hash, name))
+            })
+            .collect();
+        let (mut files, mut candidate_gone) = (0, false);
         let mut gone = Vec::new();
-        for (hash, is_candidate, span) in spans {
-            let named = Named::of(results.get(span).unwrap_or_default());
-            if named.deleted > 0 {
-                files += named.deleted;
-                gone.push((hash, Gone::Deleted));
-                if is_candidate {
-                    candidate_gone = true;
-                } else {
-                    Stats::add(&chains.stats.cascaded, 1);
-                }
-            } else if named.vanished() && !stopped {
-                gone.push((hash, Gone::Vanished));
-                candidate_gone |= is_candidate;
-            } else {
-                stopped = true;
+        for (hash, named) in self.unlink_blocks(&ranks, &group, c.size, &blocks) {
+            files += named.deleted;
+            let Some(what) = named.gone() else {
+                continue;
+            };
+            candidate_gone |= hash == c.hash;
+            if what == Gone::Deleted && hash != c.hash {
+                Stats::add(&chains.stats.cascaded, 1);
             }
+            gone.push((hash, what));
         }
         chains.record(&gone);
         (files, candidate_gone)

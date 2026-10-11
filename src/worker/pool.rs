@@ -1,4 +1,4 @@
-//! Cold files ordered by atime, capped at `cap` by evicting the youngest.
+//! The pool of eviction candidates a worker has sampled.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;

@@ -52,6 +52,14 @@ const SETTLE_TICKS: u32 = 2;
 pub const TICK: Duration = Duration::from_secs(1);
 
 /// What a tick did to the rate.
+/// Whether `Budget::acquire` waits for the op rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pacing {
+    Paced,
+    /// The emergency band: take the slot now.
+    Unpaced,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Increased,
@@ -228,8 +236,8 @@ impl Budget {
         }
     }
 
-    /// Waits for the next slot unless `unpaced`. Returns false if shutdown fired while waiting.
-    pub fn acquire(&self, shutdown: &Shutdown, unpaced: bool) -> bool {
+    /// Waits for the next slot when paced. Returns false if shutdown fired while waiting.
+    pub fn acquire(&self, shutdown: &Shutdown, pacing: Pacing) -> bool {
         let delay = {
             let Ok(mut g) = self.inner.lock() else {
                 return !shutdown.is_set();
@@ -249,7 +257,7 @@ impl Budget {
                     Verdict::Increased | Verdict::Held => {}
                 }
             }
-            if unpaced {
+            if pacing == Pacing::Unpaced {
                 g.next_slot = now;
                 Duration::ZERO
             } else {
@@ -272,7 +280,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::budget::{
-        ADDITIVE_STEP, Aimd, Budget, MIN_RATE, OpKind, SETTLE_TICKS, START_RATE, Verdict,
+        ADDITIVE_STEP, Aimd, Budget, MIN_RATE, OpKind, Pacing, SETTLE_TICKS, START_RATE, Verdict,
     };
     use crate::shutdown::Shutdown;
 
@@ -446,7 +454,7 @@ mod tests {
         let shutdown = Shutdown::default();
         let start = Instant::now();
         for _ in 0..11 {
-            assert!(budget.acquire(&shutdown, false));
+            assert!(budget.acquire(&shutdown, Pacing::Paced));
         }
         let elapsed = start.elapsed();
         assert!(elapsed >= ms(190), "{elapsed:?}");
@@ -459,7 +467,7 @@ mod tests {
         let shutdown = Shutdown::default();
         let start = Instant::now();
         for _ in 0..100 {
-            assert!(budget.acquire(&shutdown, true));
+            assert!(budget.acquire(&shutdown, Pacing::Unpaced));
         }
         assert!(start.elapsed() < ms(200));
     }
@@ -468,10 +476,10 @@ mod tests {
     fn acquire_returns_false_on_shutdown() {
         let budget = Budget::new(1.0);
         let shutdown = Shutdown::default();
-        assert!(budget.acquire(&shutdown, false));
+        assert!(budget.acquire(&shutdown, Pacing::Paced));
         shutdown.trigger();
         let start = Instant::now();
-        assert!(!budget.acquire(&shutdown, false));
+        assert!(!budget.acquire(&shutdown, Pacing::Paced));
         assert!(start.elapsed() < ms(200));
     }
 }

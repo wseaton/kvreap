@@ -8,8 +8,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::budget::OpKind;
+use crate::chains::Gone;
 use crate::config::DeleteMode;
-use crate::controller::Mode;
 use crate::fsops;
 use crate::layout::BlockHash;
 use crate::stats::Stats;
@@ -47,9 +47,16 @@ impl Named {
         out
     }
 
-    /// No rank had the file, so the block is gone without a deletion of ours.
-    pub(crate) fn vanished(self) -> bool {
-        self.deleted == 0 && self.skipped == 0 && self.missing > 0
+    /// What became of the block: deleted from some rank, already gone from
+    /// every rank, or `None` while a file of it may remain.
+    pub(crate) fn gone(self) -> Option<Gone> {
+        if self.deleted > 0 {
+            Some(Gone::Deleted)
+        } else if self.skipped == 0 && self.missing > 0 {
+            Some(Gone::Vanished)
+        } else {
+            None
+        }
     }
 }
 
@@ -87,7 +94,7 @@ pub(crate) fn block_path(
 impl Context {
     pub(crate) fn acquire(&self) -> bool {
         self.budget
-            .acquire(&self.shutdown, self.shared.mode() == Mode::Emergency)
+            .acquire(&self.shutdown, self.shared.mode().pacing())
     }
 
     pub(crate) fn timed<T>(
@@ -146,18 +153,6 @@ impl Context {
     /// `Skipped`.
     pub(crate) fn unlink_all(&self, targets: &[Target]) -> Vec<Unlink> {
         let lanes = self.config.delete_fanout.get().min(targets.len());
-        if lanes <= 1 {
-            let mut out = Vec::with_capacity(targets.len());
-            for t in targets {
-                let r = self.unlink(t);
-                out.push(r);
-                if r == Unlink::Skipped {
-                    break;
-                }
-            }
-            out.resize(targets.len(), Unlink::Skipped);
-            return out;
-        }
         let next = AtomicUsize::new(0);
         let stop = AtomicBool::new(false);
         let results: Vec<OnceLock<Unlink>> = targets.iter().map(|_| OnceLock::new()).collect();
@@ -186,6 +181,29 @@ impl Context {
 }
 
 impl Worker {
+    /// Unlinks each block's file `name` in every one of `ranks`, in order with
+    /// up to `DELETE_FANOUT` in flight, and returns what became of each block.
+    pub(crate) fn unlink_blocks(
+        &self,
+        ranks: &[Arc<RankDir>],
+        group: &str,
+        size: u64,
+        blocks: &[(BlockHash, String)],
+    ) -> Vec<(BlockHash, Named)> {
+        let mut targets = Vec::new();
+        let mut spans = Vec::new();
+        for (hash, name) in blocks {
+            let start = targets.len();
+            targets.extend(self.targets(ranks, name, group, *hash, size));
+            spans.push((*hash, start..targets.len()));
+        }
+        let results = self.ctx.unlink_all(&targets);
+        spans
+            .into_iter()
+            .map(|(hash, span)| (hash, Named::of(results.get(span).unwrap_or_default())))
+            .collect()
+    }
+
     /// The paths of block file `name` in each of `ranks`.
     pub(crate) fn targets(
         &self,

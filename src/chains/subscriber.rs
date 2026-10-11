@@ -3,7 +3,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::chains::Chains;
@@ -86,8 +85,6 @@ pub fn subscribe(
                     };
             }
             if let Ok(Some(feed)) = tokio::time::timeout(RECV_TIMEOUT, rx.recv()).await {
-                let depth = u64::try_from(rx.len()).unwrap_or(u64::MAX);
-                chains.stats.queue_depth_max.fetch_max(depth, Ordering::Relaxed);
                 record(chains, feed);
             }
         }
@@ -265,11 +262,13 @@ async fn follow(peer: Peer) {
             let message = match sub.recv().await {
                 Ok(message) => message,
                 Err(e) => {
-                    tracing::debug!(endpoint, error = %e, "KV events receive failed");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
+                    tracing::warn!(endpoint, error = %e, retry_in = ?wait, "KV events receive failed, reconnecting");
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(RECONNECT_MAX);
+                    break;
                 }
             };
+            wait = RECONNECT_MIN;
             let Some((seq, payload)) = sequenced(message.into_vec()) else {
                 continue;
             };

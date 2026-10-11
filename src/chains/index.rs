@@ -46,9 +46,8 @@ pub enum Store {
 #[derive(Debug, Clone)]
 struct Node {
     parent: Option<BlockHash>,
-    /// Every child ever linked; filter by residence when walking.
+    /// Children on disk whose parent link points here.
     children: Vec<BlockHash>,
-    children_on_disk: u32,
     residence: Residence,
     generation: u64,
     /// Full block hash, which names the block's file.
@@ -124,7 +123,6 @@ impl ChainIndex {
         self.nodes.entry(hash).or_insert(Node {
             parent: None,
             children: Vec::new(),
-            children_on_disk: 0,
             residence: Residence::Unknown,
             generation,
             digest: None,
@@ -132,20 +130,20 @@ impl ChainIndex {
         })
     }
 
-    fn child_stored(&mut self, parent: Option<BlockHash>) {
-        if let Some(p) = parent {
-            let n = self.node_mut(p);
-            n.children_on_disk = n.children_on_disk.saturating_add(1);
+    fn child_stored(&mut self, parent: BlockHash, child: BlockHash) {
+        let children = &mut self.node_mut(parent).children;
+        if !children.contains(&child) {
+            children.push(child);
         }
     }
 
-    fn child_removed(&mut self, parent: Option<BlockHash>) {
+    fn child_removed(&mut self, parent: Option<BlockHash>, child: BlockHash) {
         let Some(p) = parent else {
             return;
         };
         if let Some(n) = self.nodes.get_mut(&p) {
-            n.children_on_disk = n.children_on_disk.saturating_sub(1);
-            if n.residence != Residence::OnDisk && n.children_on_disk == 0 && n.parent.is_none() {
+            n.children.retain(|c| *c != child);
+            if n.residence != Residence::OnDisk && n.children.is_empty() && n.parent.is_none() {
                 self.nodes.remove(&p);
             }
         }
@@ -163,25 +161,14 @@ impl ChainIndex {
 
     fn store_one(&mut self, hash: BlockHash, parent: Option<BlockHash>, store: Store) {
         let n = self.node_mut(hash);
-        let was_on_disk = n.residence == Residence::OnDisk;
-        let old_parent = n.parent;
-        let parent = old_parent.or(parent);
+        let parent = n.parent.or(parent);
         n.parent = parent;
-        if store == Store::OnDisk && !was_on_disk {
+        if store == Store::OnDisk && n.residence != Residence::OnDisk {
             n.residence = Residence::OnDisk;
             n.stored_at = Some(Instant::now());
         }
-        let now_on_disk = n.residence == Residence::OnDisk;
-        let gained_parent = old_parent.is_none() && parent.is_some();
-        if let (true, Some(p)) = (gained_parent, parent) {
-            let siblings = &mut self.node_mut(p).children;
-            if !siblings.contains(&hash) {
-                siblings.push(hash);
-            }
-        }
-        let counted = was_on_disk && !gained_parent;
-        if now_on_disk && !counted {
-            self.child_stored(parent);
+        if let (Residence::OnDisk, Some(p)) = (n.residence, parent) {
+            self.child_stored(p, hash);
         }
     }
 
@@ -201,9 +188,6 @@ impl ChainIndex {
             .unwrap_or_default()
             .iter()
             .copied()
-            .filter(move |c| {
-                self.on_disk(*c) && self.nodes.get(c).is_some_and(|n| n.parent == Some(hash))
-            })
     }
 
     fn descendant(&self, hash: BlockHash) -> Descendant {
@@ -307,11 +291,11 @@ impl ChainIndex {
             return position;
         }
         node.residence = Residence::Gone;
-        let (parent, children) = (node.parent, node.children_on_disk);
-        if children == 0 {
+        let parent = node.parent;
+        if node.children.is_empty() {
             self.nodes.remove(&hash);
         }
-        self.child_removed(parent);
+        self.child_removed(parent, hash);
         position
     }
 
@@ -339,21 +323,10 @@ impl ChainIndex {
         };
         match node.parent {
             Some(p) if self.gone(p) => Position::Orphan,
-            Some(p) if self.on_disk(p) && node.children_on_disk > 0 => Position::Internal,
+            Some(p) if self.on_disk(p) && !node.children.is_empty() => Position::Internal,
             Some(p) if self.on_disk(p) => Position::Leaf,
             _ => Position::Root,
         }
-    }
-
-    /// On disk with a parent kvreap saw on disk and then removed:
-    /// unreachable by a prefix lookup.
-    pub fn is_dead(&self, hash: BlockHash) -> bool {
-        self.on_disk(hash)
-            && self
-                .nodes
-                .get(&hash)
-                .and_then(|n| n.parent)
-                .is_some_and(|p| self.gone(p))
     }
 
     fn enforce_cap(&mut self) {
@@ -368,7 +341,7 @@ impl ChainIndex {
             if let Some(node) = current.then(|| self.nodes.remove(&hash)).flatten()
                 && node.residence == Residence::OnDisk
             {
-                self.child_removed(node.parent);
+                self.child_removed(node.parent, hash);
             }
         }
         if self.order.len() > self.cap.saturating_mul(2) {
@@ -388,8 +361,8 @@ mod tests {
     use crate::chains::testing::h;
     use crate::layout::BlockHash;
 
-    fn children(ix: &ChainIndex, hash: BlockHash) -> u32 {
-        ix.nodes.get(&hash).map_or(0, |n| n.children_on_disk)
+    fn children(ix: &ChainIndex, hash: BlockHash) -> usize {
+        ix.nodes.get(&hash).map_or(0, |n| n.children.len())
     }
 
     #[test]
@@ -419,7 +392,7 @@ mod tests {
         ix.store(None, &[h(1), h(2), h(3)], Store::OnDisk);
         assert_eq!(ix.remove(h(1)), Position::Root);
         assert_eq!(ix.position(h(2)), Position::Orphan);
-        assert!(ix.is_dead(h(2)));
+        assert_eq!(ix.position(h(2)), Position::Orphan);
         assert_eq!(ix.remove(h(2)), Position::Orphan);
         assert_eq!(ix.remove(h(3)), Position::Orphan);
         assert_eq!(
@@ -509,11 +482,15 @@ mod tests {
         assert_eq!(ix.position(h(1)), Position::Root);
         ix.remove(h(1));
         assert_eq!(ix.position(h(2)), Position::Orphan, "seen and then removed");
-        assert!(ix.is_dead(h(2)));
+        assert_eq!(ix.position(h(2)), Position::Orphan);
 
         let mut ix = ChainIndex::new(100);
         ix.store(Some(h(99)), &[h(10), h(11)], Store::OnDisk);
-        assert!(!ix.is_dead(h(10)), "parent unknown to kvreap");
+        assert_eq!(
+            ix.position(h(10)),
+            Position::Root,
+            "parent unknown to kvreap"
+        );
         assert_eq!(ix.position(h(10)), Position::Root);
     }
 
@@ -527,6 +504,24 @@ mod tests {
         assert_eq!(ix.position(h(2)), Position::Leaf);
         assert_eq!(ix.remove(h(2)), Position::Leaf);
         assert_eq!(children(&ix, h(1)), 0);
+    }
+
+    #[test]
+    fn a_shared_prefix_forgets_conversations_that_left_the_disk() {
+        let mut ix = ChainIndex::new(100_000);
+        ix.store(None, &[h(1)], Store::OnDisk);
+        for c in 0..1000u64 {
+            ix.store(Some(h(1)), &[h(10_000 + c)], Store::LinksOnly);
+            ix.store(Some(h(1)), &[h(10_000 + c)], Store::OnDisk);
+            ix.remove(h(10_000 + c));
+        }
+        ix.store(Some(h(1)), &[h(2)], Store::OnDisk);
+        assert_eq!(
+            ix.nodes.get(&h(1)).map(|n| n.children.clone()),
+            Some(vec![h(2)])
+        );
+        assert_eq!(ix.position(h(1)), Position::Root);
+        assert_eq!(ix.position(h(2)), Position::Leaf);
     }
 
     #[test]

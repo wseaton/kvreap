@@ -19,7 +19,7 @@ use prometheus_client::metrics::gauge::ConstGauge;
 use prometheus_client::registry::Registry;
 
 use crate::budget::{Budget, OpKind};
-use crate::chains::{Chains, LockStats};
+use crate::chains::Chains;
 use crate::controller::{Mode, SharedState, UNGRANTED};
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
@@ -356,20 +356,6 @@ fn encode_chains(enc: &mut DescriptorEncoder, chains: &Chains) -> Result<(), std
         "kvreap_chain_claim_conflicts",
         "Edges skipped because another worker was deleting them.",
         Stats::get(&c.claim_conflicts),
-    )?;
-    lock_seconds(
-        enc,
-        "kvreap_index_lock_wait_seconds",
-        "Time spent waiting for the chain index lock.",
-        |l| &l.wait_us,
-        chains,
-    )?;
-    lock_seconds(
-        enc,
-        "kvreap_index_lock_hold_seconds",
-        "Time the chain index lock was held.",
-        |l| &l.hold_us,
-        chains,
     )
 }
 
@@ -401,24 +387,6 @@ fn labeled_counters(
     let mut family = enc.encode_descriptor(name, help, None, MetricType::Counter)?;
     for &(value, n) in values {
         ConstCounter::new(n).encode(family.encode_family(&[(label, value)])?)?;
-    }
-    Ok(())
-}
-
-fn lock_seconds(
-    enc: &mut DescriptorEncoder,
-    name: &str,
-    help: &str,
-    field: impl Fn(&LockStats) -> &std::sync::atomic::AtomicU64,
-    chains: &Chains,
-) -> Result<(), std::fmt::Error> {
-    let mut family = enc.encode_descriptor(name, help, None, MetricType::Counter)?;
-    for (side, stats) in [
-        ("events", &chains.stats.events_lock),
-        ("workers", &chains.stats.worker_lock),
-    ] {
-        let seconds = Stats::get(field(stats)) as f64 / 1e6;
-        ConstCounter::new(seconds).encode(family.encode_family(&[("side", side)])?)?;
     }
     Ok(())
 }
@@ -517,7 +485,6 @@ mod tests {
             "kvreap_chain_deletions_total{position=\"leaf\"} 1",
             "kvreap_chain_deletions_total{position=\"root\"} 1",
             "kvreap_chain_deletions_total{position=\"internal\"} 0",
-            "kvreap_index_lock_wait_seconds_total{side=\"workers\"}",
             "kvreap_grant_bytes 1000",
         ] {
             assert!(body.contains(line), "missing {line:?} in\n{body}");

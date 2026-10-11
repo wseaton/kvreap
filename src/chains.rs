@@ -13,10 +13,9 @@
 //! ```
 
 use std::collections::HashSet;
-use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicU64;
+use std::sync::{Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Instant;
 
 use crate::chains::decode::KvEvent;
 use crate::chains::index::{ChainIndex, Descendant, LeafEdge, Position, Store};
@@ -98,74 +97,6 @@ pub struct ChainStats {
     pub vanished: AtomicU64,
     /// Edges or subtrees skipped because another worker was deleting them.
     pub claim_conflicts: AtomicU64,
-    pub events_lock: LockStats,
-    pub worker_lock: LockStats,
-    /// Most batches waiting in the subscriber's queue since the last status line.
-    pub queue_depth_max: AtomicU64,
-}
-
-/// Time spent waiting for and holding the index lock, in microseconds.
-#[derive(Debug, Default)]
-pub struct LockStats {
-    pub acquisitions: AtomicU64,
-    pub wait_us: AtomicU64,
-    pub max_wait_us: AtomicU64,
-    pub hold_us: AtomicU64,
-    pub max_hold_us: AtomicU64,
-}
-
-impl LockStats {
-    fn waited(&self, d: Duration) {
-        let us = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
-        Stats::add(&self.acquisitions, 1);
-        Stats::add(&self.wait_us, us);
-        self.max_wait_us.fetch_max(us, Ordering::Relaxed);
-    }
-
-    fn held(&self, d: Duration) {
-        let us = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
-        Stats::add(&self.hold_us, us);
-        self.max_hold_us.fetch_max(us, Ordering::Relaxed);
-    }
-}
-
-/// An index lock guard, timed from acquisition to drop.
-struct Held<'a, G> {
-    guard: G,
-    since: Instant,
-    stats: &'a LockStats,
-}
-
-fn timed<G>(stats: &LockStats, lock: impl FnOnce() -> G) -> Held<'_, G> {
-    let asked = Instant::now();
-    let guard = lock();
-    let since = Instant::now();
-    stats.waited(since.duration_since(asked));
-    Held {
-        guard,
-        since,
-        stats,
-    }
-}
-
-impl<G: Deref<Target = ChainIndex>> Deref for Held<'_, G> {
-    type Target = ChainIndex;
-
-    fn deref(&self) -> &ChainIndex {
-        &self.guard
-    }
-}
-
-impl<G: DerefMut<Target = ChainIndex>> DerefMut for Held<'_, G> {
-    fn deref_mut(&mut self) -> &mut ChainIndex {
-        &mut self.guard
-    }
-}
-
-impl<G> Drop for Held<'_, G> {
-    fn drop(&mut self) {
-        self.stats.held(self.since.elapsed());
-    }
 }
 
 /// The index shared by the subscriber and every worker.
@@ -191,16 +122,12 @@ impl Chains {
     }
 
     /// Shares the index with other readers, for eviction workers.
-    fn index(&self) -> Held<'_, impl Deref<Target = ChainIndex>> {
-        timed(&self.stats.worker_lock, || {
-            self.index.read().unwrap_or_else(PoisonError::into_inner)
-        })
+    fn index(&self) -> RwLockReadGuard<'_, ChainIndex> {
+        self.index.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn write<'a>(&'a self, stats: &'a LockStats) -> Held<'a, impl DerefMut<Target = ChainIndex>> {
-        timed(stats, || {
-            self.index.write().unwrap_or_else(PoisonError::into_inner)
-        })
+    fn write(&self) -> RwLockWriteGuard<'_, ChainIndex> {
+        self.index.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn index_blocks(&self) -> usize {
@@ -229,7 +156,7 @@ impl Chains {
 
     pub fn radix_key(&self, hash: BlockHash) -> RadixKey {
         let index = self.index();
-        if index.is_dead(hash) {
+        if index.position(hash) == Position::Orphan {
             return RadixKey::Dead;
         }
         match index.edge_newest(hash, WALK_BUDGET) {
@@ -245,11 +172,7 @@ impl Chains {
 
     /// Records a deletion by kvreap and counts its chain position.
     pub fn deleted(&self, hash: BlockHash) -> Position {
-        self.note(
-            &mut self.write(&self.stats.worker_lock),
-            hash,
-            Gone::Deleted,
-        )
+        self.note(&mut self.write(), hash, Gone::Deleted)
     }
 
     /// Records blocks kvreap deleted or found gone, in order, under one lock.
@@ -257,7 +180,7 @@ impl Chains {
         if gone.is_empty() {
             return;
         }
-        let mut index = self.write(&self.stats.worker_lock);
+        let mut index = self.write();
         for &(hash, what) in gone {
             self.note(&mut index, hash, what);
         }
@@ -279,7 +202,7 @@ impl Chains {
     }
 
     pub fn apply(&self, events: &[KvEvent]) {
-        let mut index = self.write(&self.stats.events_lock);
+        let mut index = self.write();
         for event in events {
             match event {
                 KvEvent::Stored {
@@ -346,16 +269,6 @@ impl Chains {
             events_lost = Stats::get(&s.events_lost),
             vanished = Stats::get(&s.vanished),
             claim_conflicts = Stats::get(&s.claim_conflicts),
-            events_lock_wait_ms = Stats::get(&s.events_lock.wait_us) / 1000,
-            events_lock_max_wait_us = s.events_lock.max_wait_us.swap(0, Ordering::Relaxed),
-            events_lock_hold_ms = Stats::get(&s.events_lock.hold_us) / 1000,
-            events_lock_max_hold_us = s.events_lock.max_hold_us.swap(0, Ordering::Relaxed),
-            worker_lock_acquisitions = Stats::get(&s.worker_lock.acquisitions),
-            worker_lock_wait_ms = Stats::get(&s.worker_lock.wait_us) / 1000,
-            worker_lock_max_wait_us = s.worker_lock.max_wait_us.swap(0, Ordering::Relaxed),
-            worker_lock_hold_ms = Stats::get(&s.worker_lock.hold_us) / 1000,
-            worker_lock_max_hold_us = s.worker_lock.max_hold_us.swap(0, Ordering::Relaxed),
-            queue_depth_max = s.queue_depth_max.swap(0, Ordering::Relaxed),
             "chains"
         );
     }
@@ -363,7 +276,6 @@ impl Chains {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
     use crate::chains::Chains;
@@ -420,64 +332,6 @@ mod tests {
     }
 
     #[test]
-    fn index_lock_records_wait_and_hold_per_side() {
-        let chains = Arc::new(Chains::new(100, None));
-        let held = {
-            let chains = Arc::clone(&chains);
-            let (tx, rx) = std::sync::mpsc::channel();
-            let handle = std::thread::spawn(move || {
-                let _events = chains.write(&chains.stats.events_lock);
-                tx.send(()).expect("locked");
-                std::thread::sleep(Duration::from_millis(60));
-            });
-            rx.recv().expect("locked");
-            handle
-        };
-        chains.radix_key(h(1));
-        held.join().expect("join");
-        let (ev, wk) = (&chains.stats.events_lock, &chains.stats.worker_lock);
-        assert_eq!(Stats::get(&ev.acquisitions), 1);
-        assert!(
-            Stats::get(&ev.hold_us) >= 50_000,
-            "{}",
-            Stats::get(&ev.hold_us)
-        );
-        assert_eq!(Stats::get(&wk.acquisitions), 1);
-        assert!(
-            Stats::get(&wk.wait_us) >= 40_000,
-            "{}",
-            Stats::get(&wk.wait_us)
-        );
-        assert_eq!(Stats::get(&wk.max_wait_us), Stats::get(&wk.wait_us));
-    }
-
-    #[test]
-    fn workers_read_the_index_together_and_writers_wait() {
-        let chains = Arc::new(Chains::new(100, None));
-        let reader = {
-            let chains = Arc::clone(&chains);
-            let (tx, rx) = std::sync::mpsc::channel();
-            let handle = std::thread::spawn(move || {
-                let _shared = chains.index();
-                tx.send(()).expect("locked");
-                std::thread::sleep(Duration::from_millis(60));
-            });
-            rx.recv().expect("locked");
-            handle
-        };
-        chains.leaf_edge(h(1));
-        let read_wait = Stats::get(&chains.stats.worker_lock.max_wait_us);
-        chains.apply(&[stored(None, &[1], "STORAGE")]);
-        reader.join().expect("join");
-        assert!(read_wait < 20_000, "a second reader waited {read_wait}us");
-        let write_wait = Stats::get(&chains.stats.events_lock.wait_us);
-        assert!(
-            write_wait >= 30_000,
-            "the writer waited only {write_wait}us"
-        );
-    }
-
-    #[test]
     fn radix_key_orders_dead_untracked_then_edges_by_newest_write() {
         use crate::chains::RadixKey;
 
@@ -495,22 +349,17 @@ mod tests {
     }
 
     #[test]
-    fn record_applies_a_batch_in_order_under_one_lock() {
+    fn record_applies_a_batch_in_order() {
         use crate::chains::Gone;
 
         let chains = Chains::new(100, None);
         chains.apply(&[stored(None, &[1, 2, 3], "STORAGE")]);
-        let before = Stats::get(&chains.stats.worker_lock.acquisitions);
         chains.record(&[
             (h(3), Gone::Deleted),
             (h(2), Gone::Vanished),
             (h(1), Gone::Deleted),
             (h(9), Gone::Vanished),
         ]);
-        assert_eq!(
-            Stats::get(&chains.stats.worker_lock.acquisitions),
-            before + 1
-        );
         let s = &chains.stats;
         assert_eq!(Stats::get(&s.deleted_leaf), 1, "3 went while 2 was on disk");
         assert_eq!(Stats::get(&s.vanished), 1, "9 was never tracked");

@@ -4,10 +4,11 @@
 use std::sync::Arc;
 
 use crate::chains::{Chains, Gone};
+use crate::layout::BlockHash;
 use crate::stats::Stats;
 use crate::worker::Worker;
 use crate::worker::pool::Candidate;
-use crate::worker::unlink::{Named, leaf_group};
+use crate::worker::unlink::leaf_group;
 
 impl Worker {
     /// Deletes `root` and every on-disk block below it, in every rank dir of
@@ -26,35 +27,31 @@ impl Worker {
         if !self.evict_one(root) {
             return 0;
         }
-        let siblings = self.sibling_ranks(&rank);
         let (Some(group), Some(name)) = (group, name) else {
             return 1;
         };
+        let siblings = self.sibling_ranks(&rank);
+        let mut removed = 1 + self
+            .unlink_blocks(&siblings, &group, size, &[(hash, name)])
+            .iter()
+            .map(|(_, named)| named.deleted)
+            .sum::<usize>();
         let all_ranks = [std::slice::from_ref(&rank), siblings.as_slice()].concat();
-        let mut targets = self.targets(&siblings, &name, &group, hash, size);
-        let mut spans = Vec::new();
-        for d in chains.descendants(hash) {
-            let Some(name) = d.file_name() else {
+        let below: Vec<(BlockHash, String)> = chains
+            .descendants(hash)
+            .into_iter()
+            .filter_map(|d| Some((d.hash, d.file_name()?)))
+            .collect();
+        let mut gone = Vec::new();
+        for (h, named) in self.unlink_blocks(&all_ranks, &group, size, &below) {
+            removed += named.deleted;
+            let Some(what) = named.gone() else {
                 continue;
             };
-            let start = targets.len();
-            targets.extend(self.targets(&all_ranks, &name, &group, d.hash, size));
-            spans.push((d.hash, start..targets.len()));
-        }
-        let results = self.ctx.unlink_all(&targets);
-        let tally = |r: std::ops::Range<usize>| Named::of(results.get(r).unwrap_or_default());
-        let first = spans.first().map_or(targets.len(), |(_, r)| r.start);
-        let mut removed = 1 + tally(0..first).deleted;
-        let mut gone = Vec::new();
-        for (h, span) in spans {
-            let named = tally(span);
-            if named.deleted > 0 {
-                removed += named.deleted;
-                gone.push((h, Gone::Deleted));
+            if what == Gone::Deleted {
                 Stats::add(&chains.stats.cascaded, 1);
-            } else if named.vanished() {
-                gone.push((h, Gone::Vanished));
             }
+            gone.push((h, what));
         }
         chains.record(&gone);
         removed

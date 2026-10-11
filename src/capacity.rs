@@ -113,7 +113,7 @@ fn bucket_sample(bucket: &Path, stats: &Stats) -> io::Result<BucketSample> {
     Ok(sample)
 }
 
-/// Keeps `Samples` fresh while workers are idle: counts buckets every
+/// Keeps `Samples` fresh whatever the workers do: counts buckets every
 /// `BUCKET_LIST_REFRESH` and samples one random bucket per `IDLE_SAMPLE_INTERVAL`
 /// (back to back until `MIN_SAMPLES` are in).
 pub struct Sampler {
