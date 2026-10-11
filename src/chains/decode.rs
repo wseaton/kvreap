@@ -8,6 +8,33 @@
 use crate::layout::BlockHash;
 
 const MAX_DEPTH: usize = 16;
+
+/// Where an offload tier's storage sits relative to the vLLM instance that
+/// published the event: node-local disk or storage shared across instances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Locality {
+    Local,
+    Remote,
+}
+
+impl Locality {
+    /// Parses vLLM's `Locality` enum value.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "LOCAL" => Some(Self::Local),
+            "REMOTE" => Some(Self::Remote),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "LOCAL",
+            Self::Remote => "REMOTE",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KvEvent {
     Stored {
@@ -16,10 +43,13 @@ pub enum KvEvent {
         /// Full hashes, parallel to `hashes`; empty when vLLM sends int hashes.
         digests: Vec<Vec<u8>>,
         medium: Option<String>,
+        /// `None` when the tier sets no locality or vLLM predates the field.
+        locality: Option<Locality>,
     },
     Removed {
         hashes: Vec<BlockHash>,
         medium: Option<String>,
+        locality: Option<Locality>,
     },
     Other,
 }
@@ -192,6 +222,10 @@ fn string(v: Option<&Value<'_>>) -> Option<String> {
     }
 }
 
+fn locality(v: Option<&Value<'_>>) -> Option<Locality> {
+    string(v).as_deref().and_then(Locality::parse)
+}
+
 /// A tagged struct's fields: by name when map-encoded, by position when array-encoded.
 enum Fields<'v, 'a> {
     Map(&'v [(Value<'a>, Value<'a>)]),
@@ -222,10 +256,12 @@ fn event(v: &Value<'_>) -> KvEvent {
             digests: digests(fields.get("block_hashes", 1)),
             parent: fields.get("parent_block_hash", 2).and_then(block_hash),
             medium: string(fields.get("medium", 6)),
+            locality: locality(fields.get("locality", 12)),
         },
         Some("BlockRemoved") => KvEvent::Removed {
             hashes: hashes(fields.get("block_hashes", 1)),
             medium: string(fields.get("medium", 2)),
+            locality: locality(fields.get("locality", 4)),
         },
         _ => KvEvent::Other,
     }
@@ -251,9 +287,10 @@ pub fn decode_batch(payload: &[u8]) -> Result<Vec<KvEvent>, DecodeError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::chains::decode::{DecodeError, KvEvent, decode_batch};
+    use crate::chains::decode::{DecodeError, KvEvent, Locality, decode_batch};
     use crate::chains::testing::{
-        GOLDEN_LEGACY, GOLDEN_V031, removed, stored, unhex, with_digests,
+        GOLDEN_LEGACY, GOLDEN_TIERED_ARRAY, GOLDEN_V031, GOLDEN_V031_TIERED, at, removed, stored,
+        unhex, with_digests,
     };
 
     #[test]
@@ -281,6 +318,37 @@ mod tests {
                 removed(&[0x22], "STORAGE"),
             ]
         );
+    }
+
+    #[test]
+    fn decodes_tier_locality_in_both_encodings() {
+        let expected = |digested: fn(KvEvent) -> KvEvent| {
+            vec![
+                at(digested(stored(None, &[0x31], "STORAGE")), Locality::Local),
+                at(digested(stored(None, &[0x31], "STORAGE")), Locality::Remote),
+                digested(stored(None, &[0x32], "STORAGE")),
+                at(removed(&[0x31], "STORAGE"), Locality::Remote),
+            ]
+        };
+        assert_eq!(
+            decode_batch(&unhex(GOLDEN_V031_TIERED)).expect("decode"),
+            expected(with_digests)
+        );
+        assert_eq!(
+            decode_batch(&unhex(GOLDEN_TIERED_ARRAY)).expect("decode"),
+            expected(|e| e)
+        );
+    }
+
+    #[test]
+    fn unknown_locality_decodes_as_none() {
+        assert_eq!(Locality::parse("LOCAL"), Some(Locality::Local));
+        assert_eq!(Locality::parse("REMOTE"), Some(Locality::Remote));
+        assert_eq!(Locality::parse("local"), None, "vLLM sends the enum value");
+        assert_eq!(Locality::parse("NEARBY"), None);
+        for l in [Locality::Local, Locality::Remote] {
+            assert_eq!(Locality::parse(l.as_str()), Some(l));
+        }
     }
 
     #[test]

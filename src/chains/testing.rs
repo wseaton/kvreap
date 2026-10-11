@@ -1,6 +1,6 @@
 //! Fixtures shared by the chain modules' tests.
 
-use crate::chains::decode::KvEvent;
+use crate::chains::decode::{KvEvent, Locality};
 use crate::layout::BlockHash;
 
 pub(crate) fn h(n: u64) -> BlockHash {
@@ -22,12 +22,20 @@ pub(crate) const GOLDEN_V031: &str = "93cb41da39de00200000958aa474797065ab426c6f
 // Same, with array_like tagged events (vLLM <= 0.11) and int hashes.
 pub(crate) const GOLDEN_LEGACY: &str = "93cb41da39de002000009297ab426c6f636b53746f7265649221222092010210c0a347505593ac426c6f636b52656d6f7665649122a753544f52414745c0";
 
+// vLLM v0.31.0 structs as the fs tier publishes them with `locality` set:
+// STORAGE BlockStored of 0x31 at LOCAL, of 0x31 at REMOTE, of 0x32 with no
+// locality, and a REMOTE STORAGE BlockRemoved of 0x31.
+pub(crate) const GOLDEN_V031_TIERED: &str = "93cb41da39de00200000948aa474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657391c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000031b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f69647390aa626c6f636b5f73697a6500a76c6f72615f6964c0a66d656469756da753544f52414745a96c6f72615f6e616d65c0a967726f75705f69647800a86c6f63616c697479a54c4f43414c8aa474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657391c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000031b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f69647390aa626c6f636b5f73697a6500a76c6f72615f6964c0a66d656469756da753544f52414745a96c6f72615f6e616d65c0a967726f75705f69647800a86c6f63616c697479a652454d4f544589a474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657391c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000032b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f69647390aa626c6f636b5f73697a6500a76c6f72615f6964c0a66d656469756da753544f52414745a96c6f72615f6e616d65c0a967726f75705f6964780085a474797065ac426c6f636b52656d6f766564ac626c6f636b5f68617368657391c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000031a66d656469756da753544f52414745a967726f75705f69647800a86c6f63616c697479a652454d4f5445c0";
+// Same events with the structs array_like and int hashes.
+pub(crate) const GOLDEN_TIERED_ARRAY: &str = "93cb41da39de00200000949fab426c6f636b53746f7265649131c09000c0a753544f52414745c0c000c0c0a54c4f43414cc0c09fab426c6f636b53746f7265649131c09000c0a753544f52414745c0c000c0c0a652454d4f5445c0c09fab426c6f636b53746f7265649132c09000c0a753544f52414745c0c000c0c0c0c0c096ac426c6f636b52656d6f7665649131a753544f5241474500a652454d4f5445c0c0";
+
 pub(crate) fn stored(parent: Option<u64>, hashes: &[u64], medium: &str) -> KvEvent {
     KvEvent::Stored {
         parent: parent.map(BlockHash),
         hashes: hashes.iter().copied().map(BlockHash).collect(),
         digests: Vec::new(),
         medium: Some(medium.to_string()),
+        locality: None,
     }
 }
 
@@ -35,7 +43,15 @@ pub(crate) fn removed(hashes: &[u64], medium: &str) -> KvEvent {
     KvEvent::Removed {
         hashes: hashes.iter().copied().map(BlockHash).collect(),
         medium: Some(medium.to_string()),
+        locality: None,
     }
+}
+
+pub(crate) fn at(mut e: KvEvent, tier: Locality) -> KvEvent {
+    if let KvEvent::Stored { locality, .. } | KvEvent::Removed { locality, .. } = &mut e {
+        *locality = Some(tier);
+    }
+    e
 }
 
 pub(crate) fn digest(n: u64) -> Vec<u8> {

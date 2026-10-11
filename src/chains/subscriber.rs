@@ -408,10 +408,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use crate::chains::Chains;
     use crate::chains::index::Position;
     use crate::chains::subscriber::subscribe;
     use crate::chains::testing::{GOLDEN_LEGACY, GOLDEN_V031, h, stored_batch, unhex};
+    use crate::chains::{Chains, Tier};
     use crate::shutdown::Shutdown;
     use crate::stats::Stats;
 
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn subscriber_applies_batches_from_a_real_pub_socket() {
-        let chains = Arc::new(Chains::new(100, None));
+        let chains = Arc::new(Chains::new(100, Tier::default()));
         let shutdown = Arc::new(Shutdown::default());
         let endpoint = {
             let chains = Arc::clone(&chains);
@@ -500,7 +500,7 @@ mod tests {
 
     #[test]
     fn subscriber_resolves_a_hostname_to_its_addresses() {
-        let chains = Arc::new(Chains::new(100, None));
+        let chains = Arc::new(Chains::new(100, Tier::default()));
         let shutdown = Arc::new(Shutdown::default());
         let endpoint = {
             let chains = Arc::clone(&chains);
@@ -529,7 +529,7 @@ mod tests {
             .and_then(|l| l.local_addr())
             .expect("free port")
             .port();
-        let chains = Arc::new(Chains::new(100, None));
+        let chains = Arc::new(Chains::new(100, Tier::default()));
         let shutdown = Arc::new(Shutdown::default());
         let handle = {
             let (chains, shutdown) = (Arc::clone(&chains), Arc::clone(&shutdown));
@@ -749,7 +749,7 @@ mod tests {
 
     #[test]
     fn subscriber_replays_what_the_sub_socket_missed() {
-        let chains = Arc::new(Chains::new(1000, None));
+        let chains = Arc::new(Chains::new(1000, Tier::default()));
         let shutdown = Arc::new(Shutdown::default());
         let recovered = {
             let chains = Arc::clone(&chains);
@@ -788,7 +788,7 @@ mod tests {
 
     #[test]
     fn subscriber_counts_losses_when_replay_is_down() {
-        let chains = Arc::new(Chains::new(1000, None));
+        let chains = Arc::new(Chains::new(1000, Tier::default()));
         let shutdown = Arc::new(Shutdown::default());
         let dead_port = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|l| l.local_addr())

@@ -108,6 +108,7 @@ mod tests {
             hashes: vec![hash(3), hash(4)],
             digests: Vec::new(),
             medium: Some("GPU".into()),
+            locality: None,
         }]);
         h.worker.round().expect("round");
         assert_eq!(

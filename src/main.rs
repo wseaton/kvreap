@@ -263,11 +263,17 @@ fn start_chains(config: &Config, shutdown: &Arc<Shutdown>) -> anyhow::Result<Cha
     }
     let chains = Arc::new(chains::Chains::new(
         chains::INDEX_CAP,
-        config.kv_events_disk_medium.clone(),
+        chains::Tier {
+            medium: config.kv_events_disk_medium.clone(),
+            locality: config.kv_events_locality,
+        },
     ));
     tracing::info!(
         endpoints = config.kv_events_endpoints.join(","),
         disk_medium = config.kv_events_disk_medium.as_deref().unwrap_or("any"),
+        locality = config
+            .kv_events_locality
+            .map_or("any", chains::decode::Locality::as_str),
         replay_port = ?config.kv_events_replay_port,
         "building prefix-chain index from KV cache events"
     );

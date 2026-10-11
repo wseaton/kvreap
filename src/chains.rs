@@ -17,7 +17,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
 
-use crate::chains::decode::KvEvent;
+use crate::chains::decode::{KvEvent, Locality};
 use crate::chains::index::{ChainIndex, Descendant, LeafEdge, Position, Store};
 use crate::layout::BlockHash;
 use crate::stats::Stats;
@@ -103,18 +103,59 @@ pub struct Chains {
     index: RwLock<ChainIndex>,
     /// Leaves of the edges and roots of the subtrees workers are deleting.
     claims: Mutex<HashSet<BlockHash>>,
-    /// When set, only `BlockStored` events of this medium mark blocks on
-    /// disk; the rest only teach parent links.
-    pub disk_medium: Option<String>,
+    tier: Tier,
     pub stats: ChainStats,
 }
 
+/// Which events describe the cache tier this kvreap evicts. Events of other
+/// tiers only teach parent links.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tier {
+    /// When set, only `BlockStored` events of this medium mark blocks on disk.
+    pub medium: Option<String>,
+    /// When set, only `STORAGE` events at this locality mark or remove
+    /// blocks. vLLM's tiering writes every block to every tier, each tier's
+    /// events carry its locality, and a LOCAL tier is backed by the REMOTE one.
+    pub locality: Option<Locality>,
+}
+
+impl Tier {
+    fn at_locality(&self, locality: Option<Locality>) -> bool {
+        self.locality.is_none_or(|l| locality == Some(l))
+    }
+
+    fn stores_here(&self, medium: Option<&str>, locality: Option<Locality>) -> bool {
+        self.medium.as_deref().is_none_or(|m| medium == Some(m)) && self.at_locality(locality)
+    }
+
+    fn removes_here(&self, medium: Option<&str>, locality: Option<Locality>) -> bool {
+        medium == Some(self.medium.as_deref().unwrap_or(MEDIUM_STORAGE))
+            && self.at_locality(locality)
+    }
+
+    fn backing(&self, medium: Option<&str>, locality: Option<Locality>) -> bool {
+        self.locality == Some(Locality::Local)
+            && medium == Some(MEDIUM_STORAGE)
+            && locality == Some(Locality::Remote)
+    }
+
+    fn store(&self, medium: Option<&str>, locality: Option<Locality>) -> Store {
+        if self.stores_here(medium, locality) {
+            Store::OnDisk
+        } else if self.backing(medium, locality) {
+            Store::Backing
+        } else {
+            Store::LinksOnly
+        }
+    }
+}
+
 impl Chains {
-    pub fn new(cap: usize, disk_medium: Option<String>) -> Self {
+    pub fn new(cap: usize, tier: Tier) -> Self {
         Self {
             index: RwLock::new(ChainIndex::new(cap)),
             claims: Mutex::default(),
-            disk_medium,
+            tier,
             stats: ChainStats::default(),
         }
     }
@@ -208,16 +249,9 @@ impl Chains {
                     hashes,
                     digests,
                     medium,
+                    locality,
                 } => {
-                    let store = if self
-                        .disk_medium
-                        .as_deref()
-                        .is_none_or(|m| medium.as_deref() == Some(m))
-                    {
-                        Store::OnDisk
-                    } else {
-                        Store::LinksOnly
-                    };
+                    let store = self.tier.store(medium.as_deref(), *locality);
                     index.store(*parent, hashes, store);
                     if digests.is_empty() {
                         Stats::add(&self.stats.undigested, hashes.len() as u64);
@@ -229,12 +263,22 @@ impl Chains {
                         Stats::add(&self.stats.blocks_stored, hashes.len() as u64);
                     }
                 }
-                KvEvent::Removed { hashes, medium }
-                    if medium.as_deref()
-                        == Some(self.disk_medium.as_deref().unwrap_or(MEDIUM_STORAGE)) =>
-                {
+                KvEvent::Removed {
+                    hashes,
+                    medium,
+                    locality,
+                } if self.tier.removes_here(medium.as_deref(), *locality) => {
                     for &h in hashes {
                         index.remove(h);
+                    }
+                }
+                KvEvent::Removed {
+                    hashes,
+                    medium,
+                    locality,
+                } if self.tier.backing(medium.as_deref(), *locality) => {
+                    for &h in hashes {
+                        index.unback(h);
                     }
                 }
                 KvEvent::Removed { .. } | KvEvent::Other => {}
@@ -245,7 +289,8 @@ impl Chains {
     pub fn log_status(&self) {
         let s = &self.stats;
         tracing::info!(
-            disk_medium = self.disk_medium.as_deref().unwrap_or("any"),
+            disk_medium = self.tier.medium.as_deref().unwrap_or("any"),
+            locality = self.tier.locality.map_or("any", Locality::as_str),
             index_blocks = self.index_blocks(),
             event_batches = Stats::get(&s.batches),
             decode_errors = Stats::get(&s.decode_errors),
@@ -275,14 +320,99 @@ impl Chains {
 mod tests {
     use std::time::Duration;
 
-    use crate::chains::Chains;
+    use crate::chains::decode::Locality;
     use crate::chains::index::Position;
-    use crate::chains::testing::{h, removed, stored};
+    use crate::chains::testing::{at, h, removed, stored};
+    use crate::chains::{Chains, RadixKey, Tier};
     use crate::stats::Stats;
+
+    fn storage(locality: Option<Locality>) -> Tier {
+        Tier {
+            medium: Some("STORAGE".into()),
+            locality,
+        }
+    }
+
+    #[test]
+    fn each_tier_marks_only_its_own_stores_and_removals() {
+        let local = Chains::new(100, storage(Some(Locality::Local)));
+        let remote = Chains::new(100, storage(Some(Locality::Remote)));
+        let events = [
+            stored(None, &[1, 2, 3], "GPU"),
+            at(stored(None, &[1, 2, 3], "STORAGE"), Locality::Local),
+            at(stored(None, &[1, 2], "STORAGE"), Locality::Remote),
+            at(stored(Some(3), &[4], "STORAGE"), Locality::Remote),
+            stored(None, &[5], "STORAGE"),
+        ];
+        local.apply(&events);
+        remote.apply(&events);
+        assert_eq!(Stats::get(&local.stats.blocks_stored), 3);
+        assert_eq!(Stats::get(&remote.stats.blocks_stored), 3);
+        assert_eq!(local.index().position(h(3)), Position::Leaf);
+        assert_eq!(local.index().position(h(4)), Position::Untracked);
+        assert_eq!(
+            remote.index().position(h(3)),
+            Position::Untracked,
+            "the LOCAL store of 3 is not a store on the shared tier"
+        );
+        assert_eq!(remote.index().position(h(4)), Position::Root);
+        remote.apply(&[at(stored(None, &[3], "STORAGE"), Locality::Remote)]);
+        assert_eq!(
+            remote.index().position(h(3)),
+            Position::Internal,
+            "the link 3 -> 2 came from the GPU and LOCAL stores"
+        );
+        assert_eq!(
+            local.index().position(h(5)),
+            Position::Untracked,
+            "no locality: another publisher's tier"
+        );
+
+        let gone = [at(removed(&[3, 4], "STORAGE"), Locality::Remote)];
+        local.apply(&gone);
+        remote.apply(&gone);
+        assert_eq!(
+            local.index().position(h(3)),
+            Position::Leaf,
+            "REMOTE removal"
+        );
+        assert_eq!(remote.index().position(h(4)), Position::Untracked);
+        local.apply(&[at(removed(&[3], "STORAGE"), Locality::Local)]);
+        assert_eq!(local.index().position(h(2)), Position::Leaf);
+    }
+
+    #[test]
+    fn a_local_tier_counts_the_shared_tier_as_backing() {
+        let local = Chains::new(100, storage(Some(Locality::Local)));
+        local.apply(&[
+            at(stored(None, &[1, 2, 3], "STORAGE"), Locality::Local),
+            at(stored(None, &[1, 2, 3], "STORAGE"), Locality::Remote),
+        ]);
+        local.deleted(h(2));
+        assert_ne!(
+            local.radix_key(h(3)),
+            RadixKey::Dead,
+            "a lookup that misses 2 here loads it from the shared tier"
+        );
+        local.apply(&[at(removed(&[2], "STORAGE"), Locality::Remote)]);
+        assert_eq!(local.radix_key(h(3)), RadixKey::Dead);
+
+        let remote = Chains::new(100, storage(Some(Locality::Remote)));
+        remote.apply(&[
+            at(stored(None, &[1, 2, 3], "STORAGE"), Locality::Local),
+            at(stored(None, &[1, 2, 3], "STORAGE"), Locality::Remote),
+        ]);
+        remote.deleted(h(2));
+        assert_eq!(
+            remote.radix_key(h(3)),
+            RadixKey::Dead,
+            "node-local copies are not a backing for the shared tier"
+        );
+    }
 
     #[test]
     fn chains_counts_deletions_and_ignores_non_storage_removals() {
-        let chains = Chains::new(100, None);
+        let chains = Chains::new(100, Tier::default());
         chains.apply(&[stored(None, &[1, 2, 3], "GPU"), removed(&[3], "GPU")]);
         assert_eq!(
             chains.index().position(h(2)),
@@ -305,7 +435,7 @@ mod tests {
 
     #[test]
     fn disk_medium_limits_which_stores_mark_disk() {
-        let chains = Chains::new(100, Some("STORAGE".into()));
+        let chains = Chains::new(100, storage(None));
         chains.apply(&[stored(None, &[1, 2, 3], "GPU")]);
         assert_eq!(
             chains.index().position(h(1)),
@@ -332,7 +462,7 @@ mod tests {
     fn radix_key_orders_dead_untracked_then_edges_by_newest_write() {
         use crate::chains::RadixKey;
 
-        let chains = Chains::new(100, None);
+        let chains = Chains::new(100, Tier::default());
         chains.apply(&[stored(None, &[1, 2], "STORAGE")]);
         std::thread::sleep(Duration::from_millis(5));
         chains.apply(&[stored(None, &[3, 4], "STORAGE")]);
@@ -349,7 +479,7 @@ mod tests {
     fn record_applies_a_batch_in_order() {
         use crate::chains::Gone;
 
-        let chains = Chains::new(100, None);
+        let chains = Chains::new(100, Tier::default());
         chains.apply(&[stored(None, &[1, 2, 3], "STORAGE")]);
         chains.record(&[
             (h(3), Gone::Deleted),
@@ -368,7 +498,7 @@ mod tests {
 
     #[test]
     fn one_worker_at_a_time_claims_an_edge() {
-        let chains = Chains::new(100, None);
+        let chains = Chains::new(100, Tier::default());
         let first = chains.claim(h(7)).expect("free");
         assert!(chains.claim(h(7)).is_none(), "held by the first worker");
         assert!(chains.claim(h(8)).is_some(), "other edges are independent");

@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use crate::chains::decode::Locality;
+
 #[derive(Debug, Error, PartialEq)]
 pub enum ConfigError {
     #[error("{var}={value:?} is not a number")]
@@ -22,6 +24,8 @@ pub enum ConfigError {
     InvalidWorkerCount(i64),
     #[error("{var}={value:?} is not a host:port socket address")]
     NotAnAddress { var: &'static str, value: String },
+    #[error("KV_EVENTS_LOCALITY={0:?} is not LOCAL or REMOTE")]
+    NotALocality(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
@@ -158,6 +162,9 @@ pub struct Config {
     pub kv_events_replay_port: Option<u16>,
     /// Only `BlockStored` events of this medium mark blocks on disk (vLLM fs tier: `STORAGE`).
     pub kv_events_disk_medium: Option<String>,
+    /// Only events of the offload tier at this locality mark or remove blocks,
+    /// for one kvreap per tier of a tiered (node-local + shared) cache.
+    pub kv_events_locality: Option<Locality>,
 }
 
 /// How the Python evictor reads a variable kvreap accepts and ignores.
@@ -334,6 +341,12 @@ impl Config {
                 })
                 .transpose()?,
             kv_events_disk_medium: optional("KV_EVENTS_DISK_MEDIUM"),
+            kv_events_locality: optional("KV_EVENTS_LOCALITY")
+                .map(|raw| {
+                    Locality::parse(&raw.trim().to_ascii_uppercase())
+                        .ok_or(ConfigError::NotALocality(raw))
+                })
+                .transpose()?,
         })
     }
 }
@@ -343,6 +356,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    use crate::chains::decode::Locality;
     use crate::config::{Config, ConfigError, DeleteMode, LogLevel};
 
     fn cfg(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
@@ -382,6 +396,20 @@ mod tests {
                 .kv_events_disk_medium
                 .as_deref(),
             Some("STORAGE")
+        );
+    }
+
+    #[test]
+    fn kv_events_locality_parses_either_case_and_rejects_others() {
+        let locality =
+            |raw: &str| cfg(&[("KV_EVENTS_LOCALITY", raw)]).map(|c| c.kv_events_locality);
+        assert_eq!(cfg(&[]).expect("parse").kv_events_locality, None);
+        assert_eq!(locality(""), Ok(None));
+        assert_eq!(locality("LOCAL"), Ok(Some(Locality::Local)));
+        assert_eq!(locality(" remote "), Ok(Some(Locality::Remote)));
+        assert_eq!(
+            locality("nvme"),
+            Err(ConfigError::NotALocality("nvme".into()))
         );
     }
 

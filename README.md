@@ -126,6 +126,7 @@ digests; `kvreap_blocks_undigested` counts blocks it could not name.
 | `KV_EVENTS_ENDPOINTS` | unset | comma-separated vLLM `--kv-events-config` PUB endpoints; a hostname resolving to several addresses (a headless Service) subscribes to each pod. Enables chain-aware eviction |
 | `KV_EVENTS_REPLAY_PORT` | unset | port of each publisher's `replay_endpoint`; without it gaps are counted but not repaired |
 | `KV_EVENTS_DISK_MEDIUM` | unset | only `BlockStored` events of this medium mark a block on disk; `STORAGE` for vLLM's fs tier |
+| `KV_EVENTS_LOCALITY` | unset | `LOCAL` or `REMOTE`: only events of the fs tier with this `locality` mark or remove blocks, for one kvreap per tier of a tiered cache. A `LOCAL` instance treats blocks the `REMOTE` tier stored as reachable when deciding whether a chain is cut |
 | `METRICS_ADDR` | unset | `host:port` to serve Prometheus metrics on `/metrics` |
 | `DRY_RUN`, `LOG_LEVEL`, `LOG_FILE_PATH` | | as in the Python evictor |
 | `FILE_QUEUE_MAXSIZE`, `FILE_QUEUE_MIN_SIZE`, `STORAGE_EVENTS_ENDPOINT`, `DELETION_BATCH_SIZE` | | accepted and ignored (logged at startup) |
@@ -167,7 +168,8 @@ live chain). The same counters go to the log every status interval.
   the old `llmd_fs_backend` (<= 0.23) used; vLLM 0.31's fs tier publishes
   under its own pod identity, so nothing consumes them.
 - One cache tier per kvreap. Tiered NVMe + shared storage needs one kvreap
-  per tier.
+  per tier, each with `KV_EVENTS_LOCALITY` set to its tier's `locality`
+  ([deploy/kserve/](deploy/kserve/README.md) has the KServe shape).
 
 ## Development
 

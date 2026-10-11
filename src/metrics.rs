@@ -393,8 +393,8 @@ mod tests {
     use std::time::Duration;
 
     use crate::budget::{Budget, OpKind};
-    use crate::chains::Chains;
     use crate::chains::testing::{h, stored};
+    use crate::chains::{Chains, Tier};
     use crate::controller::{Mode, SharedState};
     use crate::metrics::{Sources, render, request_target, serve};
     use crate::shutdown::Shutdown;
@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn scrape_reports_chain_metrics_when_events_are_followed() {
-        let chains = Arc::new(Chains::new(100, None));
+        let chains = Arc::new(Chains::new(100, Tier::default()));
         chains.apply(&[stored(None, &[1, 2, 3], "STORAGE")]);
         chains.deleted(h(3));
         chains.deleted(h(1));

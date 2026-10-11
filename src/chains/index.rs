@@ -30,7 +30,7 @@ enum Residence {
     OnDisk,
     /// Seen on disk and then removed. A block whose parent was never seen on
     /// disk (vLLM wrote it before kvreap started) is not dead; one whose
-    /// parent is gone is.
+    /// parent is gone, and not held by a backing tier, is.
     Gone,
 }
 
@@ -39,8 +39,18 @@ enum Residence {
 pub enum Store {
     /// The blocks were written to the tier kvreap evicts.
     OnDisk,
+    /// The blocks were written to a tier that serves the lookups this tier
+    /// misses, so a block here whose parent is only there is still reachable.
+    Backing,
     /// The blocks live elsewhere (GPU, CPU); only their parent links count.
     LinksOnly,
+}
+
+/// Whether the backing tier holds a block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backup {
+    Missing,
+    Held,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +59,7 @@ struct Node {
     /// Children on disk whose parent link points here.
     children: Vec<BlockHash>,
     residence: Residence,
+    backup: Backup,
     generation: u64,
     /// Full block hash, which names the block's file.
     digest: Option<Arc<[u8]>>,
@@ -124,6 +135,7 @@ impl ChainIndex {
             parent: None,
             children: Vec::new(),
             residence: Residence::Unknown,
+            backup: Backup::Missing,
             generation,
             digest: None,
             stored_at: None,
@@ -163,9 +175,13 @@ impl ChainIndex {
         let n = self.node_mut(hash);
         let parent = n.parent.or(parent);
         n.parent = parent;
-        if store == Store::OnDisk && n.residence != Residence::OnDisk {
-            n.residence = Residence::OnDisk;
-            n.stored_at = Some(SystemTime::now());
+        match store {
+            Store::OnDisk if n.residence != Residence::OnDisk => {
+                n.residence = Residence::OnDisk;
+                n.stored_at = Some(SystemTime::now());
+            }
+            Store::Backing => n.backup = Backup::Held,
+            Store::OnDisk | Store::LinksOnly => {}
         }
         if let (Residence::OnDisk, Some(p)) = (n.residence, parent) {
             self.child_stored(p, hash);
@@ -309,8 +325,19 @@ impl ChainIndex {
         self.residence(hash) == Residence::OnDisk
     }
 
-    fn gone(&self, hash: BlockHash) -> bool {
-        self.residence(hash) == Residence::Gone
+    /// Records that the backing tier dropped `hash`.
+    pub fn unback(&mut self, hash: BlockHash) {
+        if let Some(n) = self.nodes.get_mut(&hash) {
+            n.backup = Backup::Missing;
+        }
+    }
+
+    /// Gone from this tier and not held by the backing tier, so no prefix
+    /// lookup reaches past it.
+    fn unreachable(&self, hash: BlockHash) -> bool {
+        self.nodes
+            .get(&hash)
+            .is_some_and(|n| n.residence == Residence::Gone && n.backup == Backup::Missing)
     }
 
     pub fn position(&self, hash: BlockHash) -> Position {
@@ -322,7 +349,7 @@ impl ChainIndex {
             return Position::Untracked;
         };
         match node.parent {
-            Some(p) if self.gone(p) => Position::Orphan,
+            Some(p) if self.unreachable(p) => Position::Orphan,
             Some(p) if self.on_disk(p) && !node.children.is_empty() => Position::Internal,
             Some(p) if self.on_disk(p) => Position::Leaf,
             _ => Position::Root,
@@ -400,6 +427,31 @@ mod tests {
             1,
             "2 keeps its parent link until the cap drops it"
         );
+    }
+
+    #[test]
+    fn a_backed_parent_keeps_its_children_reachable() {
+        let mut ix = ChainIndex::new(100);
+        ix.store(None, &[h(1), h(2), h(3)], Store::OnDisk);
+        ix.store(None, &[h(1), h(2)], Store::Backing);
+        assert_eq!(
+            ix.position(h(1)),
+            Position::Root,
+            "backing does not move blocks"
+        );
+        assert_eq!(ix.position(h(2)), Position::Internal);
+        assert_eq!(ix.remove(h(2)), Position::Internal);
+        assert_eq!(
+            ix.position(h(3)),
+            Position::Root,
+            "a lookup that misses 2 here finds it on the backing tier"
+        );
+        assert_eq!(ix.remove(h(1)), Position::Root);
+        ix.unback(h(2));
+        assert_eq!(ix.position(h(3)), Position::Orphan, "gone from both tiers");
+        ix.store(None, &[h(4)], Store::Backing);
+        assert!(!ix.on_disk(h(4)), "a backing store is not a store here");
+        assert_eq!(ix.remove(h(4)), Position::Untracked);
     }
 
     #[test]

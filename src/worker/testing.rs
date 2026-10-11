@@ -8,8 +8,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::budget::Budget;
 use crate::capacity::Samples;
-use crate::chains::Chains;
 use crate::chains::decode::KvEvent;
+use crate::chains::{Chains, Tier};
 use crate::config::Config;
 use crate::controller::SharedState;
 use crate::layout::{BlockHash, Shard};
@@ -151,7 +151,7 @@ pub(crate) fn names(ns: &[u64]) -> Vec<String> {
 
 pub(crate) fn chain_harness(cache: &Path, chain: &[u64]) -> Harness {
     let mut h = harness(config(cache, &[]));
-    let chains = Arc::new(Chains::new(1000, None));
+    let chains = Arc::new(Chains::new(1000, Tier::default()));
     chains.apply(&[stored(None, chain)]);
     h.worker.ctx.chains = Some(chains);
     h
@@ -168,6 +168,7 @@ pub(crate) fn stored(parent: Option<u64>, chain: &[u64]) -> KvEvent {
             .map(|&n| hash(n).0.to_be_bytes().to_vec())
             .collect(),
         medium: Some("GPU".into()),
+        locality: None,
     }
 }
 
