@@ -261,14 +261,40 @@ impl SharedState {
         self.mode().is_evicting() && self.to_free() > 0
     }
 
-    /// Records `bytes` deleted against the remaining budget.
-    pub fn freed(&self, bytes: u64) {
-        self.freed_total.fetch_add(bytes, Ordering::Relaxed);
+    /// Takes `bytes` from the budget before deleting them; false once the
+    /// budget is spent or eviction stopped. Concurrent deleters each reserve,
+    /// so together they overshoot the grant by at most one file.
+    pub fn reserve(&self, bytes: u64) -> bool {
+        if !self.mode().is_evicting() {
+            return false;
+        }
+        let mut left = self.to_free.load(Ordering::Acquire);
+        loop {
+            if left == UNGRANTED {
+                return true;
+            }
+            if left == 0 {
+                return false;
+            }
+            match self.to_free.compare_exchange_weak(
+                left,
+                left.saturating_sub(bytes),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(now) => left = now,
+            }
+        }
+    }
+
+    /// Returns a reservation whose file was not deleted.
+    pub fn release(&self, bytes: u64) {
         let mut left = self.to_free.load(Ordering::Acquire);
         while left != UNGRANTED {
             match self.to_free.compare_exchange_weak(
                 left,
-                left.saturating_sub(bytes),
+                left.saturating_add(bytes).min(UNGRANTED - 1),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -276,6 +302,11 @@ impl SharedState {
                 Err(now) => left = now,
             }
         }
+    }
+
+    /// Counts `bytes` deleted.
+    pub fn freed(&self, bytes: u64) {
+        self.freed_total.fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
@@ -387,16 +418,27 @@ mod tests {
         assert!(!s.should_delete(), "idle");
         s.set_mode(Mode::Evicting);
         assert!(s.should_delete(), "no budget published yet: unbounded");
+        assert!(s.reserve(10));
         s.freed(10);
         assert_eq!(s.to_free(), UNGRANTED, "an unbounded budget is not spent");
         s.set_to_free(250);
-        s.freed(100);
-        s.freed(100);
+        assert!(s.reserve(100) && s.reserve(100));
         assert!(s.should_delete());
-        s.freed(100);
+        s.release(100);
+        assert_eq!(
+            s.to_free(),
+            150,
+            "a file that was already gone frees nothing"
+        );
+        assert!(s.reserve(100) && s.reserve(100));
         assert_eq!(s.to_free(), 0);
+        assert!(!s.reserve(1));
         assert!(!s.should_delete());
+        s.freed(300);
         assert_eq!(s.freed_total(), 310);
+        s.set_mode(Mode::Idle);
+        s.set_to_free(UNGRANTED);
+        assert!(!s.reserve(1), "idle");
     }
 
     #[test]

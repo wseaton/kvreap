@@ -117,18 +117,25 @@ impl Context {
     /// Unlinks one block file and counts it as freed and as a removal event.
     pub(crate) fn unlink(&self, t: &Target) -> Unlink {
         if self.config.delete_mode == DeleteMode::DryRun {
+            if !self.shared.reserve(t.size) {
+                return Unlink::Skipped;
+            }
             tracing::debug!(path = %t.path.display(), "[DRY RUN] would delete");
             Stats::add(&self.stats.files_deleted, 1);
             self.shared.freed(t.size);
             return Unlink::Deleted;
         }
-        if !self.acquire() || !self.shared.should_delete() {
+        if !self.acquire() || !self.shared.reserve(t.size) {
             return Unlink::Skipped;
         }
         match self.timed(OpKind::Unlink, || fsops::unlink_path(&t.path)) {
             Ok(()) => {}
-            Err(e) if fsops::is_not_found(&e) => return Unlink::Missing,
+            Err(e) if fsops::is_not_found(&e) => {
+                self.shared.release(t.size);
+                return Unlink::Missing;
+            }
             Err(e) => {
+                self.shared.release(t.size);
                 Stats::add(&self.stats.errors, 1);
                 tracing::warn!(path = %t.path.display(), error = %e, "unlink failed");
                 return Unlink::Skipped;
