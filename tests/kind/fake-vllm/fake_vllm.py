@@ -1,4 +1,4 @@
-"""A stand-in for vLLM with a filesystem KV offload tier, for kvreap's kind e2e test.
+"""A stand-in for vLLM with filesystem KV offload tiers, for kvreap's kind e2e test.
 
 `serve` binds a ZMQ PUB on $PUB_PORT and a ROUTER replay socket on $REPLAY_PORT like
 `--kv-events-config '{"endpoint": "tcp://*:5557", "replay_endpoint": "tcp://*:5558"}'`,
@@ -6,13 +6,17 @@ answers replay requests from a buffer of the last REPLAY_BUFFER batches, writes 
 a GPU BlockStored (with parent and full digest) for every computed chain, then a STORAGE
 BlockStored per block once its file is written (fs tier `enable_kv_events`).
 
+With $LOCAL_ROOT set it runs two tiers the way TieringOffloadingSpec does with a
+node-local tier listed first: every block is written to both, and each tier's STORAGE
+stores carry its `locality`, LOCAL for $LOCAL_ROOT and REMOTE for $ROOT.
+
 The traffic is a shared preamble, LIVE sessions that keep adding turns for the whole run,
 and short sessions that finish after a few turns and are never used again. The live
 sessions' first turns are among the oldest blocks on disk, so an evictor that deletes by
 age cuts them; one that ages whole unshared tails by their last write keeps them.
 
 `check` reads the manifest `serve` keeps and exits non-zero unless the preamble and every
-block of every live session are still on disk.
+block of every live session are still on disk in every tier.
 """
 
 from __future__ import annotations
@@ -29,9 +33,7 @@ from typing import Any
 import msgspec
 import zmq
 
-ROOT = Path(os.environ.get("ROOT", "/kv-cache"))
-MODEL_BASE = ROOT / "e2e-model_0123456789ab"
-RANK_DIR = ROOT / "e2e-model_0123456789ab_r0"
+MODEL = "e2e-model_0123456789ab"
 MANIFEST = Path(os.environ.get("MANIFEST", "/tmp/fake-vllm-manifest.json"))
 BLOCK_BYTES = int(os.environ.get("BLOCK_BYTES", str(64 * 1024)))
 PREAMBLE_BLOCKS = int(os.environ.get("PREAMBLE_BLOCKS", "16"))
@@ -46,6 +48,28 @@ REPLAY_PORT = int(os.environ.get("REPLAY_PORT", "5558"))
 REPLAY_BUFFER = int(os.environ.get("REPLAY_BUFFER", "10000"))
 END_SEQ = (-1).to_bytes(8, "big", signed=True)
 TOPIC = b"kv@fake@e2e/model"
+
+
+class Tier(msgspec.Struct, frozen=True):
+    name: str
+    root: Path
+    locality: str | None
+
+    @property
+    def rank_dir(self) -> Path:
+        return self.root / f"{MODEL}_r0"
+
+    def block_path(self, h: bytes) -> Path:
+        name = h.hex()
+        return self.rank_dir / name[:3] / f"{name[3:5]}_g0" / f"{name}.bin"
+
+
+def tiers() -> list[Tier]:
+    shared = Path(os.environ.get("ROOT", "/kv-cache"))
+    local = os.environ.get("LOCAL_ROOT")
+    if local is None:
+        return [Tier("shared", shared, None)]
+    return [Tier("local", Path(local), "LOCAL"), Tier("shared", shared, "REMOTE")]
 
 
 class EventBatch(msgspec.Struct, array_like=True, omit_defaults=True, gc=False):
@@ -66,19 +90,19 @@ class BlockStored(KVCacheEvent):
     lora_id: int | None
     medium: str | None
     lora_name: str | None
+    extra_keys: list[tuple[Any, ...] | None] | None = None
+    group_idx: int | None = None
+    kv_cache_spec_kind: str | None = None
+    kv_cache_spec_sliding_window: int | None = None
+    locality: str | None = None
 
 
 def digest(parent: bytes | None, label: str) -> bytes:
     return hashlib.sha256((parent or b"") + label.encode()).digest()
 
 
-def block_path(h: bytes) -> Path:
-    name = h.hex()
-    return RANK_DIR / name[:3] / f"{name[3:5]}_g0" / f"{name}.bin"
-
-
 class FakeVllm:
-    def __init__(self) -> None:
+    def __init__(self, tiers: list[Tier]) -> None:
         context = zmq.Context.instance()
         self.socket = context.socket(zmq.PUB)
         self.socket.bind(f"tcp://*:{PUB_PORT}")
@@ -88,6 +112,8 @@ class FakeVllm:
         self.encoder = msgspec.msgpack.Encoder()
         self.seq = 0
         self.payload = os.urandom(BLOCK_BYTES)
+        self.tiers = tiers
+        self.blocks_written = 0
 
     def publish(self, events: list[BlockStored]) -> None:
         batch = self.encoder.encode(EventBatch(ts=time.time(), events=events, data_parallel_rank=0))
@@ -117,27 +143,32 @@ class FakeVllm:
             self.serve_replays(int(left * 1000) + 1)
 
     def store_chain(self, parent: bytes | None, label: str, n: int) -> list[bytes]:
-        """Computes `n` blocks after `parent`, announces them, writes them, announces the writes."""
+        """Computes `n` blocks after `parent`, announces them, writes them to every tier, announces each tier's writes."""
         hashes, p = [], parent
         for i in range(n):
             p = digest(p, f"{label}/{i}")
             hashes.append(p)
-        stored = BlockStored(hashes, parent, [], 16, None, "GPU", None)
-        self.publish([stored])
-        for h in hashes:
-            path = block_path(h)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".bin.tmp")
-            tmp.write_bytes(self.payload)
-            tmp.rename(path)
-        self.publish([BlockStored([h], None, [], 0, None, "STORAGE", None) for h in hashes])
+        self.publish([BlockStored(hashes, parent, [], 16, None, "GPU", None)])
+        for tier in self.tiers:
+            for h in hashes:
+                path = tier.block_path(h)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".bin.tmp")
+                tmp.write_bytes(self.payload)
+                tmp.rename(path)
+            self.publish(
+                [BlockStored([h], None, [], 0, None, "STORAGE", None, locality=tier.locality) for h in hashes]
+            )
+        self.blocks_written += n
         return hashes
 
 
 def serve() -> None:
-    MODEL_BASE.mkdir(parents=True, exist_ok=True)
-    (MODEL_BASE / "config.json").write_text(json.dumps({"model_name": "e2e/model"}))
-    vllm = FakeVllm()
+    for tier in tiers():
+        base = tier.root / MODEL
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "config.json").write_text(json.dumps({"model_name": "e2e/model"}))
+    vllm = FakeVllm(tiers())
 
     preamble = vllm.store_chain(None, "preamble", PREAMBLE_BLOCKS)
     live: dict[str, list[bytes]] = {}
@@ -158,6 +189,7 @@ def serve() -> None:
             "preamble": [h.hex() for h in preamble],
             "live": {name: [h.hex() for h in chain] for name, chain in live.items()},
             "short_sessions": short,
+            "blocks_written_per_tier": vllm.blocks_written,
         }
         MANIFEST.write_text(json.dumps(manifest))
         vllm.idle(TICK_SECONDS)
@@ -165,25 +197,26 @@ def serve() -> None:
 
 def check() -> int:
     manifest = json.loads(MANIFEST.read_text())
-    missing_preamble = [h for h in manifest["preamble"] if not block_path(bytes.fromhex(h)).exists()]
-    missing_live = {
-        name: sum(not block_path(bytes.fromhex(h)).exists() for h in chain)
-        for name, chain in manifest["live"].items()
+    report: dict[str, Any] = {
+        "short_sessions_written": manifest["short_sessions"],
+        "blocks_written_per_tier": manifest["blocks_written_per_tier"],
+        "live_blocks": sum(len(c) for c in manifest["live"].values()),
     }
-    total_live = sum(len(c) for c in manifest["live"].values())
-    on_disk = sum(1 for _ in RANK_DIR.rglob("*.bin"))
-    print(
-        json.dumps(
-            {
-                "short_sessions_written": manifest["short_sessions"],
-                "blocks_on_disk": on_disk,
-                "preamble_missing": len(missing_preamble),
-                "live_blocks": total_live,
-                "live_missing": missing_live,
-            }
-        )
-    )
-    return 1 if missing_preamble or any(missing_live.values()) else 0
+    failed = False
+    for tier in tiers():
+        missing_preamble = [h for h in manifest["preamble"] if not tier.block_path(bytes.fromhex(h)).exists()]
+        missing_live = {
+            name: sum(not tier.block_path(bytes.fromhex(h)).exists() for h in chain)
+            for name, chain in manifest["live"].items()
+        }
+        report[tier.name] = {
+            "blocks_on_disk": sum(1 for _ in tier.rank_dir.rglob("*.bin")),
+            "preamble_missing": len(missing_preamble),
+            "live_missing": missing_live,
+        }
+        failed |= bool(missing_preamble) or any(missing_live.values())
+    print(json.dumps(report))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

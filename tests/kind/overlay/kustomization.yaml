@@ -1,5 +1,5 @@
 # kind e2e: the kvreap component from deploy/kserve against a fake vLLM labelled
-# like a KServe workload pod, sharing one PVC.
+# like a KServe workload pod, sharing one PVC as the REMOTE tier of two.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: kvreap-e2e
@@ -9,6 +9,7 @@ resources:
   - pvc.yaml
 components:
   - ../../../deploy/kserve/kvreap
+  - ../../../deploy/kserve/kvreap-shared-tier
   - ../../../deploy/kserve/kv-events-policy
   - ../../../deploy/kserve/kvreap-metrics-rbac
 images:
