@@ -334,7 +334,6 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-
     use std::time::Duration;
 
     use crate::config::{Config, ConfigError, DeleteMode, LogLevel};

@@ -398,8 +398,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use prometheus_client::registry::Registry;
-
     use crate::budget::{Budget, OpKind};
     use crate::chains::Chains;
     use crate::chains::testing::{h, stored};
@@ -407,6 +405,7 @@ mod tests {
     use crate::metrics::{Sources, render, request_target, serve};
     use crate::shutdown::Shutdown;
     use crate::stats::Stats;
+    use prometheus_client::registry::Registry;
 
     fn sources(chains: Option<Arc<Chains>>) -> Sources {
         Sources {

@@ -159,7 +159,7 @@ fn controller_loop(
                 }
             }
             Ok(None) => {}
-            Err(e) => tracing::warn!(error = %e, "statvfs failed"),
+            Err(e) => tracing::warn!(error = %e, "reading usage failed"),
         }
         if shutdown.wait(config.usage_poll_interval) {
             break;
@@ -209,7 +209,7 @@ fn start_usage_source(
             "statvfs reports more than 10x CAPACITY_BYTES: the filesystem does not report this volume's size (VAST before the first write, hostPath, emptyDir); using sampled usage"
         ),
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "statvfs failed"),
+        Err(e) => tracing::warn!(error = %e, "reading usage failed"),
     }
     tracing::info!(
         capacity_bytes = capacity.get(),

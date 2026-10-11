@@ -67,14 +67,11 @@ impl Pool {
 
 #[cfg(test)]
 mod tests {
-
     use std::path::PathBuf;
     use std::sync::Arc;
-
     use std::time::{Duration, Instant, SystemTime};
 
     use crate::layout::BlockHash;
-
     use crate::worker::buckets::RankDir;
     use crate::worker::pool::{Candidate, Pool};
 

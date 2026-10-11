@@ -204,21 +204,16 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
-
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
-
     use std::time::{Duration, Instant};
 
     use crate::capacity::BucketSample;
-
     use crate::controller::Mode;
     use crate::layout::Shard;
-
     use crate::stats::Stats;
     use crate::worker::buckets::{BucketIndex, RankDir};
-
     use crate::worker::testing::{age, bins, config, fixture, harness, run_rounds};
 
     #[test]

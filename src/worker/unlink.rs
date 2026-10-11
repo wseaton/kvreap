@@ -270,17 +270,14 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
-
     use std::fs;
     use std::path::Path;
     use std::sync::Arc;
 
     use crate::controller::Mode;
     use crate::layout::BlockHash;
-
     use crate::stats::Stats;
     use crate::worker::buckets::RankDir;
-
     use crate::worker::testing::{config, harness};
     use crate::worker::unlink::{Target, Unlink};
 

@@ -234,21 +234,15 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
-
     use std::fs;
-
     use std::sync::Arc;
-
     use std::time::{Duration, Instant};
 
     use crate::controller::Mode;
     use crate::layout::BlockHash;
-
     use crate::stats::Stats;
-
-    use crate::worker::testing::{age, bins, config, fixture, harness, run_rounds};
-
     use crate::worker::Removed;
+    use crate::worker::testing::{age, bins, config, fixture, harness, run_rounds};
 
     #[test]
     fn evicts_cold_files_oldest_first_and_spares_hot_ones() {

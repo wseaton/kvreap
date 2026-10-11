@@ -2,6 +2,7 @@
 name = "kvreap"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.91"
 license = "Apache-2.0"
 description = "Drop-in evictor for llm-d filesystem KV-cache PVCs that keeps metadata load off the shared filesystem"
 repository = "https://github.com/wseaton/kvreap"

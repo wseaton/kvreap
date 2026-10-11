@@ -142,14 +142,11 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
-
     use std::path::Path;
     use std::sync::Arc;
 
     use crate::controller::Mode;
-
     use crate::stats::Stats;
-
     use crate::worker::testing::{
         Harness, bins, bucket, chain_harness, chains, config, hash, names, run_rounds, stored,
     };
