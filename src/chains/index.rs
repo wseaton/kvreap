@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::SystemTime;
 
 use crate::layout::BlockHash;
 
@@ -53,7 +53,7 @@ struct Node {
     /// Full block hash, which names the block's file.
     digest: Option<Arc<[u8]>>,
     /// When the block was last marked on disk.
-    stored_at: Option<Instant>,
+    stored_at: Option<SystemTime>,
 }
 
 /// A radix-tree leaf edge: the on-disk blocks from just below the last fork
@@ -64,7 +64,7 @@ struct Node {
 pub struct LeafEdge {
     pub blocks: Vec<Descendant>,
     /// Most recent on-disk mark of any block in the edge.
-    pub newest_store: Instant,
+    pub newest_store: SystemTime,
 }
 
 /// A block below a subtree root, with its digest if known.
@@ -165,7 +165,7 @@ impl ChainIndex {
         n.parent = parent;
         if store == Store::OnDisk && n.residence != Residence::OnDisk {
             n.residence = Residence::OnDisk;
-            n.stored_at = Some(Instant::now());
+            n.stored_at = Some(SystemTime::now());
         }
         if let (Residence::OnDisk, Some(p)) = (n.residence, parent) {
             self.child_stored(p, hash);
@@ -237,7 +237,7 @@ impl ChainIndex {
 
     /// The newest on-disk mark on the leaf edge `hash` maps to, without
     /// building the edge.
-    pub fn edge_newest(&self, hash: BlockHash, budget: usize) -> Option<Instant> {
+    pub fn edge_newest(&self, hash: BlockHash, budget: usize) -> Option<SystemTime> {
         let mut newest = None;
         self.walk_edge(hash, budget, |b| {
             newest = newest.max(self.nodes.get(&b).and_then(|n| n.stored_at));

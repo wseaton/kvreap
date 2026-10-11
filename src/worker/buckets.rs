@@ -153,7 +153,7 @@ impl Worker {
                     rank: Arc::clone(rank),
                     hash,
                     size: meta.size,
-                    atime: meta.atime,
+                    last_used: self.last_used(hash, meta.atime),
                     sampled_at: Instant::now(),
                 });
             }

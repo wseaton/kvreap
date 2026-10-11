@@ -14,11 +14,13 @@ pub(crate) struct Candidate {
     pub(crate) rank: Arc<RankDir>,
     pub(crate) hash: BlockHash,
     pub(crate) size: u64,
-    pub(crate) atime: SystemTime,
+    /// When the block was last useful: its atime, or with the chain index
+    /// the newest write on its leaf edge. The pool evicts the earliest first.
+    pub(crate) last_used: SystemTime,
     pub(crate) sampled_at: Instant,
 }
 
-/// Cold files ordered by atime, capped at `cap` by evicting the youngest.
+/// Candidates ordered by `last_used`, capped at `cap` by dropping the latest.
 #[derive(Debug)]
 pub(crate) struct Pool {
     pub(crate) cap: usize,
@@ -43,7 +45,7 @@ impl Pool {
             self.by_age.remove(&old);
         }
         self.seq += 1;
-        let key = (c.atime, self.seq);
+        let key = (c.last_used, self.seq);
         self.keys.insert(c.path.clone(), key);
         self.by_age.insert(key, c);
         while self.by_age.len() > self.cap {
@@ -84,7 +86,7 @@ mod tests {
             }),
             hash: BlockHash(0),
             size: 1,
-            atime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - age_secs),
+            last_used: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - age_secs),
             sampled_at: Instant::now(),
         }
     }

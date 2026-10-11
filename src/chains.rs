@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Instant;
+use std::time::SystemTime;
 
 use crate::chains::decode::KvEvent;
 use crate::chains::index::{ChainIndex, Descendant, LeafEdge, Position, Store};
@@ -39,7 +39,7 @@ pub enum RadixKey {
     /// Not on disk in the index, or its edge is longer than the walk budget.
     Untracked,
     /// On a leaf edge whose newest block was marked on disk at this instant.
-    Edge(Instant),
+    Edge(SystemTime),
 }
 
 /// A block one worker is deleting from; released on drop.

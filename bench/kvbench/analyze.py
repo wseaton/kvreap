@@ -31,6 +31,7 @@ CHAIN_COUNTERS = (
     ("undigested", "blocks announced without a digest"),
     ("young_edges", "leaf edges skipped as too young"),
     ("young_fallbacks", "young leaf edges deleted under pressure"),
+    ("young_emergency", "young leaf edges deleted in the emergency band"),
     ("event_batches", "KV event batches received"),
     ("decode_errors", "KV event decode errors"),
 )

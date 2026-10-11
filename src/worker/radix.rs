@@ -2,7 +2,8 @@
 //! least recently written first, never a prefix that still has two
 //! continuations on disk.
 
-use std::time::Instant;
+use std::collections::VecDeque;
+use std::time::SystemTime;
 
 use crate::chains::index::LeafEdge;
 use crate::chains::{Chains, Claim, Gone, RadixKey};
@@ -22,39 +23,52 @@ pub(crate) fn claim_edge(chains: &Chains, hash: BlockHash) -> Option<(LeafEdge, 
 }
 
 impl Worker {
-    /// Evicts dead blocks (with their whole subtree) first, then blocks the
-    /// index does not know, then leaf edges by their newest write, oldest
-    /// first. A candidate maps to the leaf edge it belongs to (or, inside a
-    /// shared prefix, the oldest edge below it), deleted leaf first. Edges
-    /// written within the hot threshold are dropped from the pool so the
-    /// sampler brings in others, and only go in the emergency band.
+    /// When `hash` was last useful, for ordering the pool: never for a dead
+    /// block, the newest write on its leaf edge for one the index knows, and
+    /// `atime` otherwise. Without the chain index, `atime`.
+    pub(crate) fn last_used(&self, hash: BlockHash, atime: SystemTime) -> SystemTime {
+        match self.ctx.chains.as_ref().map(|c| c.radix_key(hash)) {
+            Some(RadixKey::Dead) => SystemTime::UNIX_EPOCH,
+            Some(RadixKey::Edge(newest)) => newest,
+            Some(RadixKey::Untracked) | None => atime,
+        }
+    }
+
+    /// Evicts from the pool in `last_used` order: a dead block with its whole
+    /// subtree, a block the index does not know by itself, and any other block
+    /// as the whole leaf edge it belongs to (or, inside a shared prefix, the
+    /// oldest edge below it), leaf first. A candidate whose edge was written
+    /// since it was sampled goes back with its new time. The first edge
+    /// written within the hot threshold ends the round outside the emergency
+    /// band: everything after it in the pool is younger still.
     pub(crate) fn evict_radix(&mut self, quota: usize, chains: &Chains) -> usize {
-        let mut window: Vec<(RadixKey, Candidate)> = std::iter::from_fn(|| self.pool.pop_oldest())
+        let mut window: VecDeque<Candidate> = std::iter::from_fn(|| self.pool.pop_oldest())
             .take(quota.saturating_mul(CHAIN_WINDOW))
-            .map(|c| (chains.radix_key(c.hash), c))
             .collect();
-        window.sort_by_key(|(key, _)| *key);
-        let mut window = window.into_iter();
-        let mut held = Vec::new();
         let mut evicted = 0;
         while evicted < quota && self.evicting() {
-            let Some((key, c)) = window.next() else {
+            let Some(mut c) = window.pop_front() else {
                 break;
             };
-            match (key, chains.radix_key(c.hash)) {
-                (_, RadixKey::Dead) => evicted += self.delete_subtree(c, chains),
-                (_, RadixKey::Untracked) => {
+            match chains.radix_key(c.hash) {
+                RadixKey::Dead => evicted += self.delete_subtree(c, chains),
+                RadixKey::Untracked => {
                     if self.evict_one(c) {
                         evicted += 1;
                     }
                 }
-                (RadixKey::Edge(planned), RadixKey::Edge(now)) if now > planned => held.push(c),
-                (_, RadixKey::Edge(newest)) if self.holds_back(newest) => {
-                    Stats::add(&chains.stats.young_edges, 1);
+                RadixKey::Edge(newest) if newest > c.last_used => {
+                    c.last_used = newest;
+                    self.pool.insert(c);
                 }
-                (_, RadixKey::Edge(newest)) => {
+                RadixKey::Edge(newest) if self.holds_back(newest) => {
+                    Stats::add(&chains.stats.young_edges, 1);
+                    window.push_front(c);
+                    break;
+                }
+                RadixKey::Edge(newest) => {
                     let Some((edge, _claim)) = claim_edge(chains, c.hash) else {
-                        held.push(c);
+                        self.pool.insert(c);
                         continue;
                     };
                     let (files, candidate_gone) = self.delete_edge(&c, &edge, chains);
@@ -63,30 +77,24 @@ impl Worker {
                     }
                     evicted += files;
                     if !candidate_gone {
-                        held.push(c);
+                        self.pool.insert(c);
                     }
                 }
             }
         }
-        for (key, c) in window {
-            match key {
-                RadixKey::Edge(newest) if self.holds_back(newest) => {
-                    Stats::add(&chains.stats.young_edges, 1);
-                }
-                _ => self.pool.insert(c),
-            }
-        }
-        for c in held {
+        for c in window {
             self.pool.insert(c);
         }
         evicted
     }
 
-    pub(crate) fn young(&self, newest_store: Instant) -> bool {
-        newest_store.elapsed() < self.ctx.config.hot_threshold
+    pub(crate) fn young(&self, newest_store: SystemTime) -> bool {
+        SystemTime::now()
+            .duration_since(newest_store)
+            .map_or(true, |age| age < self.ctx.config.hot_threshold)
     }
 
-    pub(crate) fn holds_back(&self, newest_store: Instant) -> bool {
+    pub(crate) fn holds_back(&self, newest_store: SystemTime) -> bool {
         self.young(newest_store) && !self.unpaced()
     }
 
@@ -247,6 +255,34 @@ mod tests {
         let s = &chains(&h).stats;
         assert_eq!(Stats::get(&s.young_edges), 0);
         assert_eq!(Stats::get(&s.young_emergency), 2);
+    }
+
+    #[test]
+    fn a_live_session_with_old_files_waits_behind_a_finished_one() {
+        // Live session 1-2-3 has the oldest files but was written last; the
+        // finished conversation 10-11 has newer files written long ago.
+        let (_tmp, cache) = bucket(&[
+            (1, Some(9000)),
+            (2, Some(8999)),
+            (3, Some(8998)),
+            (10, Some(8000)),
+            (11, Some(7999)),
+        ]);
+        let mut h = chain_harness(&cache, &[10, 11]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        chains(&h).apply(&[stored(None, &[1, 2, 3])]);
+        h.worker.ctx.config = Arc::new(config(
+            &cache,
+            &[("FILE_ACCESS_TIME_THRESHOLD_MINUTES", "0.003")],
+        ));
+        h.shared.set_mode(Mode::Evicting);
+        run_rounds(&mut h, 4);
+        assert_eq!(bins(&cache), names(&[1, 2, 3]));
+        let s = &chains(&h).stats;
+        assert_eq!(Stats::get(&s.cascaded), 1, "10-11 went as one edge");
+        assert_eq!(Stats::get(&s.deleted_internal), 0);
+        assert_eq!(Stats::get(&s.young_emergency), 0);
+        assert!(Stats::get(&s.young_edges) >= 1, "the live edge was reached and kept");
     }
 
     #[test]
