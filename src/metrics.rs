@@ -335,18 +335,6 @@ fn encode_chains(enc: &mut DescriptorEncoder, chains: &Chains) -> Result<(), std
     )?;
     counter(
         enc,
-        "kvreap_chain_young_edges",
-        "Leaf edges held back as recently written.",
-        Stats::get(&c.young_edges),
-    )?;
-    counter(
-        enc,
-        "kvreap_chain_young_emergency",
-        "Recently written edges deleted in the emergency band.",
-        Stats::get(&c.young_emergency),
-    )?;
-    counter(
-        enc,
         "kvreap_chain_vanished",
         "Indexed blocks whose files were already gone.",
         Stats::get(&c.vanished),

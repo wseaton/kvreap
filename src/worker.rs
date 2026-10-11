@@ -26,7 +26,7 @@ use crate::budget::{Budget, OpKind};
 use crate::capacity::Samples;
 use crate::chains::Chains;
 use crate::config::Config;
-use crate::controller::{Mode, SharedState};
+use crate::controller::SharedState;
 use crate::fsops;
 use crate::layout::Shard;
 use crate::shutdown::Shutdown;
@@ -155,10 +155,6 @@ impl Worker {
         let wait = self.backoff;
         self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
         Some(wait)
-    }
-
-    fn unpaced(&self) -> bool {
-        self.ctx.shared.mode() == Mode::Emergency
     }
 
     fn acquire(&self) -> bool {

@@ -80,10 +80,6 @@ pub struct ChainStats {
     pub cascaded: AtomicU64,
     /// Stored blocks announced as int hashes, whose files cannot be named.
     pub undigested: AtomicU64,
-    /// Leaf edges left alone because a block in them is younger than the hot threshold.
-    pub young_edges: AtomicU64,
-    /// Young edges deleted in the emergency band.
-    pub young_emergency: AtomicU64,
     /// Live batches whose sequence number skipped ahead of the last applied.
     pub gaps: AtomicU64,
     /// Publishers whose sequence numbers went backwards (restarted).
@@ -259,8 +255,6 @@ impl Chains {
             deleted_untracked = Stats::get(&s.deleted_untracked),
             cascaded = Stats::get(&s.cascaded),
             undigested = Stats::get(&s.undigested),
-            young_edges = Stats::get(&s.young_edges),
-            young_emergency = Stats::get(&s.young_emergency),
             gaps = Stats::get(&s.gaps),
             resets = Stats::get(&s.resets),
             replays = Stats::get(&s.replays),

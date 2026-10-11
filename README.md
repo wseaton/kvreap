@@ -59,13 +59,13 @@ unshared tail from the last fork down to a leaf.
   system ── s1 ──┬── a1 ── a2 ── a3      session A, last written 20 min ago
                  └── b1 ── b2            session B, written 5 s ago
 
-  evict [a1 a2 a3] whole, leaf first; never s1 (two continuations);
-  never [b1 b2] while it is younger than FILE_ACCESS_TIME_THRESHOLD_MINUTES
+  evict [a1 a2 a3] whole, leaf first, before [b1 b2];
+  never s1 while it has two continuations on disk
 ```
 
-Edges go least recently written first, regardless of atime. Edges written
-within the hot threshold are skipped unless usage reaches the emergency band
-(97%, or `CLEANUP_THRESHOLD` if higher). Blocks whose parent is already gone
+Edges go least recently written first, regardless of atime: a live session's
+first turn is among the oldest files on disk but sorts by its latest turn.
+Blocks whose parent is already gone
 are unreachable and go first, with everything below them. The subscriber
 follows the llm-d router's protocol: it replays from vLLM's `replay_endpoint`
 on connect, on a sequence gap and on a publisher restart, so a dropped
@@ -114,7 +114,7 @@ digests; `kvreap_blocks_undigested` counts blocks it could not name.
 | `LOGGER_INTERVAL_SECONDS` | `0.5` | usage poll interval |
 | `DELETION_MAX_FILES_PER_SECOND` | `0` | 0 = no cap (AIMD still applies) |
 | `DELETE_FANOUT` | `16` | unlinks in flight per worker while deleting an edge or subtree |
-| `FILE_ACCESS_TIME_THRESHOLD_MINUTES` | `60` | files (and, with KV events, edges) touched more recently are kept outside the emergency band |
+| `FILE_ACCESS_TIME_THRESHOLD_MINUTES` | `60` | files accessed (on `noatime` mounts, written) more recently are never sampled for eviction |
 | `ENABLE_DIR_CLEANUP` / `DIR_CLEANUP_TTL_SECONDS` | `true` / `120` | remove leaf and bucket dirs that sampling finds empty and unchanged for the TTL |
 | `HEX_BUCKET_LEN` | `3` | |
 | `CAPACITY_BYTES` | unset | volume size in bytes. When set, used bytes are estimated from bucket samples instead of `statvfs`, for volumes whose `statvfs` reports another filesystem (hostPath on a shared node disk). Warns at startup if `statvfs` reports more than 10× this |
