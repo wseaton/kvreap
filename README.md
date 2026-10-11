@@ -66,10 +66,9 @@ unshared tail from the last fork down to a leaf.
 
 Edges go least recently written first, regardless of atime: a live session's
 first turn is among the oldest files on disk but sorts by its latest turn.
-Edges written within the hot threshold wait while usage is below the pressure
-line, halfway from `CLEANUP_THRESHOLD` to the emergency band (91% with the
-defaults), so the sampler looks for finished sessions first; above it,
-eviction is plain LRU over edges.
+While usage is at or above `CLEANUP_THRESHOLD`, eviction is plain LRU over
+edges. In the tail of a prune, below it, edges written within the hot
+threshold wait so the sampler looks for finished sessions first.
 Blocks whose parent is already gone
 are unreachable and go first, with everything below them. The subscriber
 follows the llm-d router's protocol: it replays from vLLM's `replay_endpoint`
@@ -160,7 +159,7 @@ live chain). The same counters go to the log every status interval.
   headroom between the budget and the disk.
 - Chain-aware eviction runs usage higher than the Python evictor on VAST
   (96.6% peak, 12.9% of the run above the cleanup threshold against 6.6%):
-  below the pressure line it holds back recently written sessions while the
+  in the tail of a prune it holds back recently written sessions while the
   sampler looks for finished ones. Lower `CLEANUP_THRESHOLD` if the volume's
   quota is hard.
 - kvreap does not publish `BlockRemoved` events for the files it deletes.

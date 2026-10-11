@@ -26,7 +26,7 @@ use crate::budget::{Budget, OpKind};
 use crate::capacity::Samples;
 use crate::chains::Chains;
 use crate::config::Config;
-use crate::controller::{SharedState, pressure_line};
+use crate::controller::SharedState;
 use crate::fsops;
 use crate::layout::Shard;
 use crate::shutdown::Shutdown;
@@ -157,13 +157,15 @@ impl Worker {
         Some(wait)
     }
 
-    /// Usage is past the pressure line, where radix also takes young edges.
+    /// Usage is at or past the cleanup threshold, where radix also takes
+    /// young edges.
     pub(crate) fn pressed(&self) -> bool {
-        self.ctx.shared.usage() >= pressure_line(self.ctx.config.cleanup_threshold)
+        self.ctx.shared.usage() >= self.ctx.config.cleanup_threshold.get()
     }
 
-    /// Sleeps `wait`, or less if usage crosses the pressure line meanwhile:
-    /// a pass that held young edges back is no reason to sleep through it.
+    /// Sleeps `wait`, or less if usage reaches the cleanup threshold
+    /// meanwhile: a pass that held young edges back is no reason to sleep
+    /// through it.
     fn back_off(&self, wait: Duration) {
         let pressed = self.pressed();
         let deadline = Instant::now() + wait;
@@ -337,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn back_off_wakes_when_usage_crosses_the_pressure_line() {
+    fn back_off_wakes_when_usage_reaches_the_cleanup_threshold() {
         let fx = fixture(1, 0);
         let h = harness(config(&fx.cache, &[]));
         h.shared.set_usage(80.0);

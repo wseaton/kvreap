@@ -37,9 +37,9 @@ impl Worker {
     /// subtree, a block the index does not know by itself, and any other block
     /// as the whole leaf edge it belongs to (or, inside a shared prefix, the
     /// oldest edge below it), leaf first. A candidate whose edge was written
-    /// since it was sampled goes back with its new time. Below the pressure
-    /// line, the first edge written within the hot threshold ends the round,
-    /// so the sampler looks for older ones first.
+    /// since it was sampled goes back with its new time. Below the cleanup
+    /// threshold, in the tail of a prune, the first edge written within the
+    /// hot threshold ends the round, so the sampler looks for older ones first.
     pub(crate) fn evict_radix(&mut self, quota: usize, chains: &Chains) -> usize {
         let mut window: Vec<Candidate> = std::iter::from_fn(|| self.pool.pop_oldest())
             .take(quota.saturating_mul(CHAIN_WINDOW))
@@ -222,14 +222,14 @@ mod tests {
         assert_eq!(
             bins(&cache),
             names(&[1, 2, 5]),
-            "above the pressure line the conversations stored first go first, \
+            "at the cleanup threshold the conversations stored first go first, \
              young or not, whatever their atimes"
         );
         assert_eq!(Stats::get(&chains(&h).stats.deleted_leaf), 2);
     }
 
     #[test]
-    fn young_edges_wait_below_the_pressure_line() {
+    fn young_edges_wait_below_the_cleanup_threshold() {
         let (_tmp, cache) = bucket(&[
             (1, Some(9000)),
             (2, Some(8999)),
@@ -238,16 +238,16 @@ mod tests {
             (5, Some(8300)),
         ]);
         let mut h = radix_harness(&cache, "60");
-        h.shared.set_usage(88.0);
+        h.shared.set_usage(84.0);
         run_rounds(&mut h, 4);
         assert_eq!(bins(&cache), names(&[1, 2, 3, 4, 5]));
         assert!(Stats::get(&chains(&h).stats.young_edges) >= 1);
-        h.shared.set_usage(91.0);
+        h.shared.set_usage(85.0);
         h.worker.round().expect("round");
         assert_eq!(
             bins(&cache),
             names(&[1, 2, 5]),
-            "91% is the line for cleanup at 85%"
+            "the default cleanup threshold"
         );
     }
 
