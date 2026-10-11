@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use crate::chains::index::LeafEdge;
 use crate::chains::{Chains, Claim, Gone, RadixKey};
+use crate::controller::pressure_line;
 use crate::layout::BlockHash;
 use crate::stats::Stats;
 use crate::worker::pool::Candidate;
@@ -37,7 +38,9 @@ impl Worker {
     /// subtree, a block the index does not know by itself, and any other block
     /// as the whole leaf edge it belongs to (or, inside a shared prefix, the
     /// oldest edge below it), leaf first. A candidate whose edge was written
-    /// since it was sampled goes back with its new time.
+    /// since it was sampled goes back with its new time. Below the pressure
+    /// line, the first edge written within the hot threshold ends the round,
+    /// so the sampler looks for older ones first.
     pub(crate) fn evict_radix(&mut self, quota: usize, chains: &Chains) -> usize {
         let mut window: Vec<Candidate> = std::iter::from_fn(|| self.pool.pop_oldest())
             .take(quota.saturating_mul(CHAIN_WINDOW))
@@ -59,6 +62,11 @@ impl Worker {
                     c.last_used = newest;
                     self.pool.insert(c);
                 }
+                RadixKey::Edge(newest) if self.young(newest) && !self.pressed() => {
+                    Stats::add(&chains.stats.young_edges, 1);
+                    self.pool.insert(c);
+                    break;
+                }
                 RadixKey::Edge(_) => {
                     let Some((edge, _claim)) = claim_edge(chains, c.hash) else {
                         self.pool.insert(c);
@@ -76,6 +84,16 @@ impl Worker {
             self.pool.insert(c);
         }
         evicted
+    }
+
+    fn young(&self, newest_store: SystemTime) -> bool {
+        SystemTime::now()
+            .duration_since(newest_store)
+            .map_or(true, |age| age < self.ctx.config.hot_threshold)
+    }
+
+    fn pressed(&self) -> bool {
+        self.ctx.shared.usage() >= pressure_line(self.ctx.config.cleanup_threshold)
     }
 
     /// Deletes `edge` leaf first in every rank dir of `c`'s model. Returns
@@ -204,13 +222,38 @@ mod tests {
             (5, Some(8300)),
         ]);
         let mut h = radix_harness(&cache, "60");
+        h.shared.set_usage(95.0);
         h.worker.round().expect("round");
         assert_eq!(
             bins(&cache),
             names(&[1, 2, 5]),
-            "the conversations stored first go first, whatever their atimes"
+            "above the pressure line the conversations stored first go first, \
+             young or not, whatever their atimes"
         );
         assert_eq!(Stats::get(&chains(&h).stats.deleted_leaf), 2);
+    }
+
+    #[test]
+    fn young_edges_wait_below_the_pressure_line() {
+        let (_tmp, cache) = bucket(&[
+            (1, Some(9000)),
+            (2, Some(8999)),
+            (3, Some(8500)),
+            (4, Some(8400)),
+            (5, Some(8300)),
+        ]);
+        let mut h = radix_harness(&cache, "60");
+        h.shared.set_usage(88.0);
+        run_rounds(&mut h, 4);
+        assert_eq!(bins(&cache), names(&[1, 2, 3, 4, 5]));
+        assert!(Stats::get(&chains(&h).stats.young_edges) >= 1);
+        h.shared.set_usage(91.0);
+        h.worker.round().expect("round");
+        assert_eq!(
+            bins(&cache),
+            names(&[1, 2, 5]),
+            "91% is the line for cleanup at 85%"
+        );
     }
 
     #[test]
@@ -228,6 +271,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         chains(&h).apply(&[stored(None, &[1, 2, 3])]);
         h.shared.set_mode(Mode::Evicting);
+        h.shared.set_usage(95.0);
         h.shared.set_to_free(2);
         run_rounds(&mut h, 4);
         assert_eq!(bins(&cache), names(&[1, 2, 3]));

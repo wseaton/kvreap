@@ -93,6 +93,8 @@ pub struct ChainStats {
     pub vanished: AtomicU64,
     /// Edges or subtrees skipped because another worker was deleting them.
     pub claim_conflicts: AtomicU64,
+    /// Rounds that stopped at a recently written edge below the pressure line.
+    pub young_edges: AtomicU64,
 }
 
 /// The index shared by the subscriber and every worker.
@@ -263,6 +265,7 @@ impl Chains {
             events_lost = Stats::get(&s.events_lost),
             vanished = Stats::get(&s.vanished),
             claim_conflicts = Stats::get(&s.claim_conflicts),
+            young_edges = Stats::get(&s.young_edges),
             "chains"
         );
     }

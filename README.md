@@ -65,6 +65,10 @@ unshared tail from the last fork down to a leaf.
 
 Edges go least recently written first, regardless of atime: a live session's
 first turn is among the oldest files on disk but sorts by its latest turn.
+Edges written within the hot threshold wait while usage is below the pressure
+line, halfway from `CLEANUP_THRESHOLD` to the emergency band (91% with the
+defaults), so the sampler looks for finished sessions first; above it,
+eviction is plain LRU over edges.
 Blocks whose parent is already gone
 are unreachable and go first, with everything below them. The subscriber
 follows the llm-d router's protocol: it replays from vLLM's `replay_endpoint`
