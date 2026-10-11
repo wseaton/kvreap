@@ -19,8 +19,7 @@ use std::sync::{Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::chains::decode::KvEvent;
-use crate::chains::index::{ChainIndex, Descendant, LeafEdge, Position, Rank, Store, SubtreeKey};
-use crate::config::ChainPolicy;
+use crate::chains::index::{ChainIndex, Descendant, LeafEdge, Position, Store};
 use crate::layout::BlockHash;
 use crate::stats::Stats;
 
@@ -31,7 +30,7 @@ pub mod subscriber;
 pub mod testing;
 
 pub const INDEX_CAP: usize = 4 << 20;
-const SUBTREE_BUDGET: usize = 4096;
+const WALK_BUDGET: usize = 4096;
 const MEDIUM_STORAGE: &str = "STORAGE";
 
 /// Where radix eviction ranks a block, first to go first.
@@ -79,14 +78,13 @@ pub struct ChainStats {
     pub deleted_orphan: AtomicU64,
     pub deleted_internal: AtomicU64,
     pub deleted_leaf: AtomicU64,
-    pub deferrals: AtomicU64,
     pub cascaded: AtomicU64,
     /// Stored blocks announced as int hashes, whose files cannot be named.
     pub undigested: AtomicU64,
     /// Leaf edges left alone because a block in them is younger than the hot threshold.
     pub young_edges: AtomicU64,
-    /// Young edges deleted because nothing older was left to free.
-    pub young_fallbacks: AtomicU64,
+    /// Young edges deleted in the emergency band.
+    pub young_emergency: AtomicU64,
     /// Live batches whose sequence number skipped ahead of the last applied.
     pub gaps: AtomicU64,
     /// Publishers whose sequence numbers went backwards (restarted).
@@ -176,8 +174,6 @@ pub struct Chains {
     index: RwLock<ChainIndex>,
     /// Leaves of the edges and roots of the subtrees workers are deleting.
     claims: Mutex<HashSet<BlockHash>>,
-    pub policy: ChainPolicy,
-    pub max_deferrals: u32,
     /// When set, only `BlockStored` events of this medium mark blocks on
     /// disk; the rest only teach parent links.
     pub disk_medium: Option<String>,
@@ -185,17 +181,10 @@ pub struct Chains {
 }
 
 impl Chains {
-    pub fn new(
-        cap: usize,
-        policy: ChainPolicy,
-        max_deferrals: u32,
-        disk_medium: Option<String>,
-    ) -> Self {
+    pub fn new(cap: usize, disk_medium: Option<String>) -> Self {
         Self {
             index: RwLock::new(ChainIndex::new(cap)),
             claims: Mutex::default(),
-            policy,
-            max_deferrals,
             disk_medium,
             stats: ChainStats::default(),
         }
@@ -214,24 +203,16 @@ impl Chains {
         })
     }
 
-    pub fn rank(&self, hash: BlockHash, deferrals: u32) -> Rank {
-        self.index().rank(hash, deferrals, self.max_deferrals)
-    }
-
     pub fn index_blocks(&self) -> usize {
         self.index().len()
     }
 
-    pub fn subtree_key(&self, hash: BlockHash) -> SubtreeKey {
-        self.index().subtree_key(hash, SUBTREE_BUDGET)
-    }
-
     pub fn descendants(&self, hash: BlockHash) -> Vec<Descendant> {
-        self.index().descendants(hash, SUBTREE_BUDGET)
+        self.index().descendants(hash, WALK_BUDGET)
     }
 
     pub fn leaf_edge(&self, hash: BlockHash) -> Option<LeafEdge> {
-        self.index().leaf_edge(hash, SUBTREE_BUDGET)
+        self.index().leaf_edge(hash, WALK_BUDGET)
     }
 
     /// Reserves `hash` for one worker until the claim drops; `None` while
@@ -248,10 +229,10 @@ impl Chains {
 
     pub fn radix_key(&self, hash: BlockHash) -> RadixKey {
         let index = self.index();
-        if index.rank(hash, 0, self.max_deferrals) == Rank::Dead {
+        if index.is_dead(hash) {
             return RadixKey::Dead;
         }
-        match index.edge_newest(hash, SUBTREE_BUDGET) {
+        match index.edge_newest(hash, WALK_BUDGET) {
             Some(newest) => RadixKey::Edge(newest),
             None => RadixKey::Untracked,
         }
@@ -342,25 +323,21 @@ impl Chains {
 
     pub fn log_status(&self) {
         let s = &self.stats;
-        let (root, orphan) = (Stats::get(&s.deleted_root), Stats::get(&s.deleted_orphan));
         tracing::info!(
-            policy = ?self.policy,
             disk_medium = self.disk_medium.as_deref().unwrap_or("any"),
             index_blocks = self.index_blocks(),
             event_batches = Stats::get(&s.batches),
             decode_errors = Stats::get(&s.decode_errors),
             blocks_stored = Stats::get(&s.blocks_stored),
-            deleted_heads = root + orphan,
-            deleted_root = root,
-            deleted_orphan = orphan,
+            deleted_root = Stats::get(&s.deleted_root),
+            deleted_orphan = Stats::get(&s.deleted_orphan),
             deleted_internal = Stats::get(&s.deleted_internal),
             deleted_leaf = Stats::get(&s.deleted_leaf),
             deleted_untracked = Stats::get(&s.deleted_untracked),
-            deferrals = Stats::get(&s.deferrals),
             cascaded = Stats::get(&s.cascaded),
             undigested = Stats::get(&s.undigested),
             young_edges = Stats::get(&s.young_edges),
-            young_fallbacks = Stats::get(&s.young_fallbacks),
+            young_emergency = Stats::get(&s.young_emergency),
             gaps = Stats::get(&s.gaps),
             resets = Stats::get(&s.resets),
             replays = Stats::get(&s.replays),
@@ -390,22 +367,21 @@ mod tests {
     use std::time::Duration;
 
     use crate::chains::Chains;
-    use crate::chains::index::{Position, Rank};
+    use crate::chains::index::Position;
     use crate::chains::testing::{h, removed, stored};
-    use crate::config::ChainPolicy;
     use crate::stats::Stats;
 
     #[test]
     fn chains_counts_deletions_and_ignores_non_storage_removals() {
-        let chains = Chains::new(100, ChainPolicy::TailFirst, 2, None);
+        let chains = Chains::new(100, None);
         chains.apply(&[stored(None, &[1, 2, 3], "GPU"), removed(&[3], "GPU")]);
         assert_eq!(
-            chains.rank(h(2), 0),
-            Rank::Interior,
+            chains.index().position(h(2)),
+            Position::Internal,
             "GPU removal is not a disk removal"
         );
         chains.apply(&[removed(&[3], "STORAGE")]);
-        assert_eq!(chains.rank(h(2), 0), Rank::Childless);
+        assert_eq!(chains.index().position(h(2)), Position::Leaf);
         assert_eq!(chains.deleted(h(1)), Position::Root);
         assert_eq!(chains.deleted(h(2)), Position::Orphan);
         assert_eq!(chains.deleted(h(9)), Position::Untracked);
@@ -420,11 +396,11 @@ mod tests {
 
     #[test]
     fn disk_medium_limits_which_stores_mark_disk() {
-        let chains = Chains::new(100, ChainPolicy::TailFirst, 2, Some("STORAGE".into()));
+        let chains = Chains::new(100, Some("STORAGE".into()));
         chains.apply(&[stored(None, &[1, 2, 3], "GPU")]);
         assert_eq!(
-            chains.rank(h(1), 0),
-            Rank::Childless,
+            chains.index().position(h(1)),
+            Position::Untracked,
             "GPU only: not on disk"
         );
         assert_eq!(Stats::get(&chains.stats.blocks_stored), 0);
@@ -435,45 +411,17 @@ mod tests {
             stored(None, &[3], "STORAGE"),
         ]);
         assert_eq!(Stats::get(&chains.stats.blocks_stored), 3);
-        assert_eq!(chains.rank(h(1), 0), Rank::Interior);
-        assert_eq!(chains.rank(h(3), 0), Rank::Childless);
+        assert_eq!(chains.index().position(h(2)), Position::Internal);
+        assert_eq!(chains.index().position(h(3)), Position::Leaf);
         chains.apply(&[removed(&[3], "STORAGE")]);
-        assert_eq!(chains.rank(h(2), 0), Rank::Childless);
+        assert_eq!(chains.index().position(h(2)), Position::Leaf);
         assert_eq!(chains.deleted(h(2)), Position::Leaf);
         assert_eq!(chains.deleted(h(1)), Position::Root);
     }
 
     #[test]
-    fn subtree_key_prefers_dead_then_most_blocks_per_leaf() {
-        // Shared prefix 1-2 with four continuations; unshared chain 10-11-12.
-        let chains = Chains::new(100, ChainPolicy::Subtree, 2, None);
-        chains.apply(&[
-            stored(None, &[1, 2], "GPU"),
-            stored(Some(2), &[3], "GPU"),
-            stored(Some(2), &[4], "GPU"),
-            stored(Some(2), &[5], "GPU"),
-            stored(Some(2), &[6], "GPU"),
-            stored(None, &[10, 11, 12], "GPU"),
-        ]);
-        let (shared, unshared, leaf) = (
-            chains.subtree_key(h(1)),
-            chains.subtree_key(h(10)),
-            chains.subtree_key(h(12)),
-        );
-        assert!(unshared < shared, "3 blocks per leaf beats 6 / 4");
-        assert!(unshared < leaf, "a whole chain beats its last block");
-        assert!(
-            shared < leaf,
-            "6 blocks for 4 continuations beats 1 block for 1"
-        );
-        chains.deleted(h(10));
-        let dead = chains.subtree_key(h(11));
-        assert!(dead < unshared.min(shared).min(leaf), "dead blocks first");
-    }
-
-    #[test]
     fn index_lock_records_wait_and_hold_per_side() {
-        let chains = Arc::new(Chains::new(100, ChainPolicy::Radix, 2, None));
+        let chains = Arc::new(Chains::new(100, None));
         let held = {
             let chains = Arc::clone(&chains);
             let (tx, rx) = std::sync::mpsc::channel();
@@ -485,7 +433,7 @@ mod tests {
             rx.recv().expect("locked");
             handle
         };
-        chains.rank(h(1), 0);
+        chains.radix_key(h(1));
         held.join().expect("join");
         let (ev, wk) = (&chains.stats.events_lock, &chains.stats.worker_lock);
         assert_eq!(Stats::get(&ev.acquisitions), 1);
@@ -505,7 +453,7 @@ mod tests {
 
     #[test]
     fn workers_read_the_index_together_and_writers_wait() {
-        let chains = Arc::new(Chains::new(100, ChainPolicy::Radix, 2, None));
+        let chains = Arc::new(Chains::new(100, None));
         let reader = {
             let chains = Arc::clone(&chains);
             let (tx, rx) = std::sync::mpsc::channel();
@@ -533,7 +481,7 @@ mod tests {
     fn radix_key_orders_dead_untracked_then_edges_by_newest_write() {
         use crate::chains::RadixKey;
 
-        let chains = Chains::new(100, ChainPolicy::Radix, 2, None);
+        let chains = Chains::new(100, None);
         chains.apply(&[stored(None, &[1, 2], "STORAGE")]);
         std::thread::sleep(Duration::from_millis(5));
         chains.apply(&[stored(None, &[3, 4], "STORAGE")]);
@@ -550,7 +498,7 @@ mod tests {
     fn record_applies_a_batch_in_order_under_one_lock() {
         use crate::chains::Gone;
 
-        let chains = Chains::new(100, ChainPolicy::Radix, 2, None);
+        let chains = Chains::new(100, None);
         chains.apply(&[stored(None, &[1, 2, 3], "STORAGE")]);
         let before = Stats::get(&chains.stats.worker_lock.acquisitions);
         chains.record(&[
@@ -574,7 +522,7 @@ mod tests {
 
     #[test]
     fn one_worker_at_a_time_claims_an_edge() {
-        let chains = Chains::new(100, ChainPolicy::Radix, 2, None);
+        let chains = Chains::new(100, None);
         let first = chains.claim(h(7)).expect("free");
         assert!(chains.claim(h(7)).is_none(), "held by the first worker");
         assert!(chains.claim(h(8)).is_some(), "other edges are independent");

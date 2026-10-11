@@ -24,14 +24,11 @@ pub(crate) fn claim_edge(chains: &Chains, hash: BlockHash) -> Option<(LeafEdge, 
 impl Worker {
     /// Dead candidates take their whole subtree with them. Any other
     /// candidate maps to the radix leaf edge it belongs to (or, inside a
-    /// shared prefix, the oldest edge below it), deleted leaf first. Edges
-    /// with a block younger than the hot threshold wait; if the round still
-    /// falls short, the least recently written of them go anyway.
+    /// shared prefix, the oldest edge below it), deleted leaf first.
     /// Dead blocks first, then blocks the index does not know, then leaf
     /// edges by their newest write, oldest first. Edges written within the
     /// hot threshold are dropped from the pool so the sampler brings in
-    /// others, and only go when the pool has nothing else or usage is in the
-    /// emergency band.
+    /// others, and only go in the emergency band.
     pub(crate) fn evict_radix(&mut self, quota: usize, chains: &Chains) -> usize {
         let mut window: Vec<(RadixKey, Candidate)> = std::iter::from_fn(|| self.pool.pop_oldest())
             .take(quota.saturating_mul(CHAIN_WINDOW))
@@ -63,7 +60,7 @@ impl Worker {
                     };
                     let (files, candidate_gone) = self.delete_edge(&c, &edge, chains);
                     if files > 0 && self.young(newest) {
-                        Stats::add(&chains.stats.young_fallbacks, 1);
+                        Stats::add(&chains.stats.young_emergency, 1);
                     }
                     evicted += files;
                     if !candidate_gone {
@@ -91,7 +88,7 @@ impl Worker {
     }
 
     pub(crate) fn holds_back(&self, newest_store: Instant) -> bool {
-        self.young(newest_store) && !self.unpaced() && !self.pool.is_empty()
+        self.young(newest_store) && !self.unpaced()
     }
 
     /// Deletes `edge` leaf first in every rank dir of `c`'s model. Returns
@@ -169,10 +166,8 @@ mod tests {
     };
 
     fn radix_harness(cache: &Path, hot_minutes: &str) -> Harness {
-        use crate::config::ChainPolicy;
-
         // System prompt 1-2 shared by three one-block conversations 3, 4, 5.
-        let mut h = chain_harness(cache, ChainPolicy::Radix, &[1, 2, 3]);
+        let mut h = chain_harness(cache, &[1, 2, 3]);
         h.worker.ctx.config = Arc::new(config(
             cache,
             &[("FILE_ACCESS_TIME_THRESHOLD_MINUTES", hot_minutes)],
@@ -184,11 +179,9 @@ mod tests {
 
     #[test]
     fn radix_steps_over_a_leaf_whose_file_is_already_gone() {
-        use crate::config::ChainPolicy;
-
         // Block 4's file is gone though the index still has it on disk.
         let (_tmp, cache) = bucket(&[(1, Some(9000)), (2, Some(8999)), (3, Some(8998))]);
-        let mut h = chain_harness(&cache, ChainPolicy::Radix, &[1, 2, 3, 4]);
+        let mut h = chain_harness(&cache, &[1, 2, 3, 4]);
         h.worker.ctx.config = Arc::new(config(
             &cache,
             &[("FILE_ACCESS_TIME_THRESHOLD_MINUTES", "0")],
@@ -228,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn radix_falls_back_to_the_least_recently_written_young_edges() {
+    fn radix_never_deletes_a_young_edge_outside_the_emergency_band() {
         let (_tmp, cache) = bucket(&[
             (1, Some(9000)),
             (2, Some(8999)),
@@ -237,6 +230,28 @@ mod tests {
             (5, Some(8300)),
         ]);
         let mut h = radix_harness(&cache, "60");
+        run_rounds(&mut h, 4);
+        assert_eq!(
+            bins(&cache),
+            names(&[1, 2, 3, 4, 5]),
+            "every edge is young and the pool has nothing else"
+        );
+        let s = &chains(&h).stats;
+        assert!(Stats::get(&s.young_edges) >= 3);
+        assert_eq!(Stats::get(&s.young_emergency), 0);
+    }
+
+    #[test]
+    fn radix_deletes_young_edges_least_recently_written_first_in_emergency() {
+        let (_tmp, cache) = bucket(&[
+            (1, Some(9000)),
+            (2, Some(8999)),
+            (3, Some(8500)),
+            (4, Some(8400)),
+            (5, Some(8300)),
+        ]);
+        let mut h = radix_harness(&cache, "60");
+        h.shared.set_mode(Mode::Emergency);
         h.worker.round().expect("round");
         assert_eq!(
             bins(&cache),
@@ -244,12 +259,8 @@ mod tests {
             "all edges are young, so the least recently written go first"
         );
         let s = &chains(&h).stats;
-        assert_eq!(
-            Stats::get(&s.young_edges),
-            0,
-            "nothing else was sampled, so none is held back"
-        );
-        assert_eq!(Stats::get(&s.young_fallbacks), 2);
+        assert_eq!(Stats::get(&s.young_edges), 0);
+        assert_eq!(Stats::get(&s.young_emergency), 2);
     }
 
     #[test]

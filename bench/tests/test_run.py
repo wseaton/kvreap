@@ -66,9 +66,9 @@ needs_chart = pytest.mark.skipif(
 
 @needs_chart
 def test_evictor_gets_kv_events_endpoint_and_extra_env() -> None:
-    env = evictor_env(cfg(kv_events=True, evictor_env={"CHAIN_EVICTION": "observe"}))
+    env = evictor_env(cfg(kv_events=True, evictor_env={"DELETE_FANOUT": "4"}))
     assert env["KV_EVENTS_ENDPOINTS"] == "tcp://kvreap-bench-d-vllm:5557"
-    assert env["CHAIN_EVICTION"] == "observe"
+    assert env["DELETE_FANOUT"] == "4"
     assert env["KV_EVENTS_DISK_MEDIUM"] == "STORAGE"
 
 

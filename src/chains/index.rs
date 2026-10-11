@@ -1,7 +1,6 @@
 //! The `block -> parent` tree of blocks vLLM has announced, with which of them
 //! are on disk.
 
-use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,15 +20,6 @@ pub enum Position {
     Internal,
     /// Parent on disk and no children on disk.
     Leaf,
-}
-
-/// Eviction preference within the oldest pool candidates, best first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Rank {
-    Dead,
-    Childless,
-    Overdue,
-    Interior,
 }
 
 /// What the index knows about a block's file.
@@ -65,19 +55,6 @@ struct Node {
     digest: Option<Arc<[u8]>>,
     /// When the block was last marked on disk.
     stored_at: Option<Instant>,
-}
-
-/// Whether a subtree root's parent is still on disk; dead roots go first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Liveness {
-    Dead,
-    Live,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SubtreeKey {
-    liveness: Liveness,
-    per_leaf: Reverse<usize>,
 }
 
 /// A radix-tree leaf edge: the on-disk blocks from just below the last fork
@@ -229,42 +206,6 @@ impl ChainIndex {
             })
     }
 
-    /// `(blocks, leaves)` of the on-disk subtree rooted at `hash`, walking at
-    /// most `budget` blocks. A childless block is one block and one leaf.
-    pub fn shape(&self, hash: BlockHash, budget: usize) -> (usize, usize) {
-        let mut stack = vec![hash];
-        let (mut blocks, mut leaves) = (0, 0);
-        while let Some(h) = stack.pop() {
-            if blocks >= budget {
-                break;
-            }
-            blocks += 1;
-            let before = stack.len();
-            stack.extend(self.on_disk_children(h));
-            if stack.len() == before {
-                leaves += 1;
-            }
-        }
-        (blocks, leaves.max(1))
-    }
-
-    /// Subtree eviction order, smallest first: dead blocks, then the most
-    /// blocks freed per continuation lost (subtree blocks / leaves), so the
-    /// heads of unshared chains go before prefixes many requests extend.
-    pub fn subtree_key(&self, hash: BlockHash, budget: usize) -> SubtreeKey {
-        if self.rank(hash, 0, u32::MAX) == Rank::Dead {
-            return SubtreeKey {
-                liveness: Liveness::Dead,
-                per_leaf: Reverse(0),
-            };
-        }
-        let (blocks, leaves) = self.shape(hash, budget);
-        SubtreeKey {
-            liveness: Liveness::Live,
-            per_leaf: Reverse(blocks.saturating_mul(1000) / leaves),
-        }
-    }
-
     fn descendant(&self, hash: BlockHash) -> Descendant {
         let digest = self.nodes.get(&hash).and_then(|n| n.digest.clone());
         Descendant { hash, digest }
@@ -404,23 +345,15 @@ impl ChainIndex {
         }
     }
 
-    pub fn rank(&self, hash: BlockHash, deferrals: u32, max_deferrals: u32) -> Rank {
-        let Some(node) = self
-            .nodes
-            .get(&hash)
-            .filter(|n| n.residence == Residence::OnDisk)
-        else {
-            return Rank::Childless;
-        };
-        if node.parent.is_some_and(|p| self.gone(p)) {
-            Rank::Dead
-        } else if node.children_on_disk == 0 {
-            Rank::Childless
-        } else if deferrals >= max_deferrals {
-            Rank::Overdue
-        } else {
-            Rank::Interior
-        }
+    /// On disk with a parent kvreap saw on disk and then removed:
+    /// unreachable by a prefix lookup.
+    pub fn is_dead(&self, hash: BlockHash) -> bool {
+        self.on_disk(hash)
+            && self
+                .nodes
+                .get(&hash)
+                .and_then(|n| n.parent)
+                .is_some_and(|p| self.gone(p))
     }
 
     fn enforce_cap(&mut self) {
@@ -451,8 +384,13 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::chains::index::{ChainIndex, LeafEdge, Position, Rank, Store};
+    use crate::chains::index::{ChainIndex, LeafEdge, Position, Store};
     use crate::chains::testing::h;
+    use crate::layout::BlockHash;
+
+    fn children(ix: &ChainIndex, hash: BlockHash) -> u32 {
+        ix.nodes.get(&hash).map_or(0, |n| n.children_on_disk)
+    }
 
     #[test]
     fn chain_positions_follow_the_tree() {
@@ -481,7 +419,7 @@ mod tests {
         ix.store(None, &[h(1), h(2), h(3)], Store::OnDisk);
         assert_eq!(ix.remove(h(1)), Position::Root);
         assert_eq!(ix.position(h(2)), Position::Orphan);
-        assert_eq!(ix.rank(h(2), 0, 3), Rank::Dead);
+        assert!(ix.is_dead(h(2)));
         assert_eq!(ix.remove(h(2)), Position::Orphan);
         assert_eq!(ix.remove(h(3)), Position::Orphan);
         assert_eq!(
@@ -498,7 +436,7 @@ mod tests {
         ix.store(None, &[h(1), h(2)], Store::OnDisk);
         ix.store(Some(h(1)), &[h(2)], Store::OnDisk);
         assert_eq!(ix.remove(h(2)), Position::Leaf);
-        assert_eq!(ix.rank(h(1), 0, 3), Rank::Childless);
+        assert_eq!(children(&ix, h(1)), 0);
     }
 
     #[test]
@@ -507,13 +445,13 @@ mod tests {
         ix.store(None, &[h(1), h(2)], Store::OnDisk);
         ix.remove(h(2));
         ix.store(Some(h(1)), &[h(2)], Store::OnDisk);
-        assert_eq!(ix.rank(h(1), 0, 3), Rank::Interior);
+        assert_eq!(children(&ix, h(1)), 1);
         assert_eq!(ix.remove(h(1)), Position::Root);
         assert_eq!(ix.position(h(2)), Position::Orphan);
         ix.store(None, &[h(1)], Store::OnDisk);
         assert_eq!(ix.position(h(2)), Position::Leaf, "parent rewritten");
         assert_eq!(ix.position(h(1)), Position::Root);
-        assert_eq!(ix.rank(h(1), 0, 3), Rank::Interior);
+        assert_eq!(children(&ix, h(1)), 1);
     }
 
     #[test]
@@ -525,23 +463,7 @@ mod tests {
         ix.store(Some(h(1)), &[h(2)], Store::OnDisk);
         assert_eq!(ix.position(h(2)), Position::Leaf);
         assert_eq!(ix.position(h(1)), Position::Root);
-        assert_eq!(ix.rank(h(1), 0, 3), Rank::Interior);
-    }
-
-    #[test]
-    fn rank_orders_dead_childless_overdue_interior() {
-        let mut ix = ChainIndex::new(100);
-        ix.store(None, &[h(1), h(2), h(3)], Store::OnDisk);
-        assert_eq!(ix.rank(h(3), 0, 2), Rank::Childless);
-        assert_eq!(ix.rank(h(2), 0, 2), Rank::Interior);
-        assert_eq!(ix.rank(h(2), 1, 2), Rank::Interior);
-        assert_eq!(ix.rank(h(2), 2, 2), Rank::Overdue);
-        assert_eq!(ix.rank(h(77), 0, 2), Rank::Childless, "untracked");
-        ix.remove(h(1));
-        assert_eq!(ix.rank(h(2), 0, 2), Rank::Dead);
-        assert!(Rank::Dead < Rank::Childless);
-        assert!(Rank::Childless < Rank::Overdue);
-        assert!(Rank::Overdue < Rank::Interior);
+        assert_eq!(children(&ix, h(1)), 1);
     }
 
     #[test]
@@ -580,22 +502,18 @@ mod tests {
             Position::Root,
             "1 was never seen on disk: the known chain starts at 2"
         );
-        assert_eq!(ix.rank(h(2), 0, 3), Rank::Interior);
+        assert_eq!(children(&ix, h(2)), 1);
         assert_eq!(ix.position(h(3)), Position::Leaf);
         ix.store(None, &[h(1)], Store::OnDisk);
         assert_eq!(ix.position(h(2)), Position::Internal);
         assert_eq!(ix.position(h(1)), Position::Root);
         ix.remove(h(1));
         assert_eq!(ix.position(h(2)), Position::Orphan, "seen and then removed");
-        assert_eq!(ix.rank(h(2), 0, 3), Rank::Dead);
+        assert!(ix.is_dead(h(2)));
 
         let mut ix = ChainIndex::new(100);
         ix.store(Some(h(99)), &[h(10), h(11)], Store::OnDisk);
-        assert_eq!(
-            ix.rank(h(10), 0, 3),
-            Rank::Interior,
-            "parent unknown to kvreap"
-        );
+        assert!(!ix.is_dead(h(10)), "parent unknown to kvreap");
         assert_eq!(ix.position(h(10)), Position::Root);
     }
 
@@ -608,11 +526,11 @@ mod tests {
         ix.store(None, &[h(1), h(2)], Store::LinksOnly);
         assert_eq!(ix.position(h(2)), Position::Leaf);
         assert_eq!(ix.remove(h(2)), Position::Leaf);
-        assert_eq!(ix.rank(h(1), 0, 3), Rank::Childless);
+        assert_eq!(children(&ix, h(1)), 0);
     }
 
     #[test]
-    fn subtree_walks_on_disk_children_and_counts_leaves() {
+    fn descendants_walk_on_disk_children() {
         //   1 ── 2 ── 3
         //        └─── 4 ── 5
         //   6 (separate root)
@@ -623,14 +541,6 @@ mod tests {
         for n in [1, 2, 3, 4, 5] {
             ix.set_digest(h(n), &[0xab, u8::try_from(n).expect("small")]);
         }
-        assert_eq!(ix.shape(h(1), 100), (5, 2));
-        assert_eq!(ix.shape(h(4), 100), (2, 1));
-        assert_eq!(
-            ix.shape(h(6), 100),
-            (1, 1),
-            "a childless block is its own leaf"
-        );
-        assert_eq!(ix.shape(h(1), 2), (2, 1), "budget stops the walk");
         let mut below: Vec<_> = ix.descendants(h(1), 100);
         below.sort_by_key(|d| d.hash.0);
         assert_eq!(
@@ -642,7 +552,6 @@ mod tests {
         assert!(ix.descendants(h(6), 100).is_empty());
 
         ix.remove(h(5));
-        assert_eq!(ix.shape(h(1), 100), (4, 2), "4 is now a leaf");
         assert_eq!(ix.descendants(h(2), 100).len(), 2);
         ix.store(None, &[h(4)], Store::LinksOnly);
         assert_eq!(

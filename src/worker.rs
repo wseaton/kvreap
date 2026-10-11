@@ -15,7 +15,8 @@
 //! | `buckets` | listing and sampling the shard's buckets, reaping empty dirs |
 //! | `pool` | the oldest cold candidates |
 //! | `unlink` | unlinking one candidate or many in parallel |
-//! | `tail_first`, `subtree`, `radix` | the `CHAIN_EVICTION` policies that order eviction by the prefix-chain index |
+//! | `radix` | eviction by the prefix-chain index when KV events are configured |
+//! | `subtree` | deleting a dead block with everything below it |
 
 use std::io;
 use std::path::PathBuf;
@@ -26,7 +27,7 @@ use std::time::{Duration, SystemTime};
 use crate::budget::{Budget, OpKind};
 use crate::capacity::Samples;
 use crate::chains::Chains;
-use crate::config::{ChainPolicy, Config};
+use crate::config::Config;
 use crate::controller::{Mode, SharedState};
 use crate::fsops;
 use crate::layout::{BlockHash, Shard};
@@ -39,7 +40,6 @@ mod buckets;
 mod pool;
 mod radix;
 mod subtree;
-mod tail_first;
 #[cfg(test)]
 mod testing;
 mod unlink;
@@ -212,12 +212,8 @@ impl Worker {
     }
 
     fn evict(&mut self, quota: usize) -> usize {
-        if let Some(chains) = self.ordering_chains() {
-            return match chains.policy {
-                ChainPolicy::Subtree => self.evict_subtrees(quota, &chains),
-                ChainPolicy::Radix => self.evict_radix(quota, &chains),
-                _ => self.evict_tail_first(quota, &chains),
-            };
+        if let Some(chains) = self.ctx.chains.clone() {
+            return self.evict_radix(quota, &chains);
         }
         let mut evicted = 0;
         while evicted < quota && self.ctx.shared.should_delete() && !self.ctx.shutdown.is_set() {
@@ -229,20 +225,6 @@ impl Worker {
             }
         }
         evicted
-    }
-
-    /// The chain index when it should reorder eviction. Emergency mode
-    /// ignores chain order.
-    fn ordering_chains(&self) -> Option<Arc<Chains>> {
-        self.ctx
-            .chains
-            .as_ref()
-            .filter(|c| match c.policy {
-                ChainPolicy::Observe => false,
-                ChainPolicy::Radix => true,
-                ChainPolicy::TailFirst | ChainPolicy::Subtree => !self.unpaced(),
-            })
-            .cloned()
     }
 
     fn evicting(&self) -> bool {
@@ -264,9 +246,7 @@ mod tests {
 
     use crate::stats::Stats;
 
-    use crate::worker::testing::{
-        age, bins, bucket, chain_harness, chains, config, fixture, harness, names, run_rounds,
-    };
+    use crate::worker::testing::{age, bins, config, fixture, harness, run_rounds};
 
     use crate::worker::Removed;
 
@@ -398,41 +378,5 @@ mod tests {
         shutdown.trigger();
         handle.join().expect("join");
         assert!(start.elapsed() < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn observe_policy_evicts_oldest_first_and_counts_dead_tails() {
-        use crate::config::ChainPolicy;
-
-        let (_tmp, cache) = bucket(&[
-            (1, Some(9000)),
-            (2, Some(8999)),
-            (3, Some(8998)),
-            (4, Some(8997)),
-        ]);
-        let mut h = chain_harness(&cache, ChainPolicy::Observe, &[1, 2, 3, 4]);
-        h.shared.set_mode(Mode::Evicting);
-        h.worker.round().expect("round");
-        assert_eq!(bins(&cache), names(&[3, 4]), "plain oldest-first");
-        let s = &chains(&h).stats;
-        assert_eq!(Stats::get(&s.deleted_root), 1);
-        assert_eq!(Stats::get(&s.deleted_orphan), 1, "2 lost its parent first");
-        assert_eq!(Stats::get(&s.deferrals), 0);
-    }
-
-    #[test]
-    fn emergency_mode_ignores_chain_order() {
-        use crate::config::ChainPolicy;
-
-        let (_tmp, cache) = bucket(&[
-            (1, Some(9000)),
-            (2, Some(8999)),
-            (3, Some(8998)),
-            (4, Some(8997)),
-        ]);
-        let mut h = chain_harness(&cache, ChainPolicy::TailFirst, &[1, 2, 3, 4]);
-        h.shared.set_mode(Mode::Emergency);
-        h.worker.round().expect("round");
-        assert_eq!(bins(&cache), names(&[3, 4]));
     }
 }

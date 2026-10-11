@@ -155,7 +155,6 @@ impl Worker {
                     size: meta.size,
                     atime: meta.atime,
                     sampled_at: Instant::now(),
-                    deferrals: 0,
                 });
             }
         }

@@ -410,10 +410,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::chains::Chains;
-    use crate::chains::index::{Position, Rank};
+    use crate::chains::index::Position;
     use crate::chains::subscriber::subscribe;
     use crate::chains::testing::{GOLDEN_LEGACY, GOLDEN_V031, h, stored_batch, unhex};
-    use crate::config::ChainPolicy;
     use crate::shutdown::Shutdown;
     use crate::stats::Stats;
 
@@ -453,7 +452,7 @@ mod tests {
 
     #[test]
     fn subscriber_applies_batches_from_a_real_pub_socket() {
-        let chains = Arc::new(Chains::new(100, ChainPolicy::TailFirst, 2, None));
+        let chains = Arc::new(Chains::new(100, None));
         let shutdown = Arc::new(Shutdown::default());
         let endpoint = {
             let chains = Arc::clone(&chains);
@@ -477,8 +476,8 @@ mod tests {
         assert!(Stats::get(&chains.stats.batches) >= 1);
         assert!(Stats::get(&chains.stats.decode_errors) >= 1);
         assert_eq!(
-            chains.rank(h(0x12), 0),
-            Rank::Childless,
+            chains.index().position(h(0x12)),
+            Position::Leaf,
             "0x13 removed from STORAGE"
         );
         assert_eq!(chains.deleted(h(0x11)), Position::Root);
@@ -502,7 +501,7 @@ mod tests {
 
     #[test]
     fn subscriber_resolves_a_hostname_to_its_addresses() {
-        let chains = Arc::new(Chains::new(100, ChainPolicy::TailFirst, 2, None));
+        let chains = Arc::new(Chains::new(100, None));
         let shutdown = Arc::new(Shutdown::default());
         let endpoint = {
             let chains = Arc::clone(&chains);
@@ -531,7 +530,7 @@ mod tests {
             .and_then(|l| l.local_addr())
             .expect("free port")
             .port();
-        let chains = Arc::new(Chains::new(100, ChainPolicy::TailFirst, 2, None));
+        let chains = Arc::new(Chains::new(100, None));
         let shutdown = Arc::new(Shutdown::default());
         let handle = {
             let (chains, shutdown) = (Arc::clone(&chains), Arc::clone(&shutdown));
@@ -751,7 +750,7 @@ mod tests {
 
     #[test]
     fn subscriber_replays_what_the_sub_socket_missed() {
-        let chains = Arc::new(Chains::new(1000, ChainPolicy::Radix, 2, None));
+        let chains = Arc::new(Chains::new(1000, None));
         let shutdown = Arc::new(Shutdown::default());
         let recovered = {
             let chains = Arc::clone(&chains);
@@ -790,7 +789,7 @@ mod tests {
 
     #[test]
     fn subscriber_counts_losses_when_replay_is_down() {
-        let chains = Arc::new(Chains::new(1000, ChainPolicy::Radix, 2, None));
+        let chains = Arc::new(Chains::new(1000, None));
         let shutdown = Arc::new(Shutdown::default());
         let dead_port = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|l| l.local_addr())

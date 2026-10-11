@@ -11,7 +11,7 @@ use crate::budget::Budget;
 use crate::capacity::Samples;
 use crate::chains::Chains;
 use crate::chains::decode::KvEvent;
-use crate::config::{ChainPolicy, Config};
+use crate::config::Config;
 use crate::controller::SharedState;
 use crate::layout::{BlockHash, Shard};
 use crate::shutdown::Shutdown;
@@ -154,9 +154,9 @@ pub(crate) fn names(ns: &[u64]) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn chain_harness(cache: &Path, policy: ChainPolicy, chain: &[u64]) -> Harness {
+pub(crate) fn chain_harness(cache: &Path, chain: &[u64]) -> Harness {
     let mut h = harness(config(cache, &[]));
-    let chains = Arc::new(Chains::new(1000, policy, 2, None));
+    let chains = Arc::new(Chains::new(1000, None));
     chains.apply(&[stored(None, chain)]);
     h.worker.ctx.chains = Some(chains);
     h

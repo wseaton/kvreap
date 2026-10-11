@@ -16,7 +16,6 @@ pub(crate) struct Candidate {
     pub(crate) size: u64,
     pub(crate) atime: SystemTime,
     pub(crate) sampled_at: Instant,
-    pub(crate) deferrals: u32,
 }
 
 /// Cold files ordered by atime, capped at `cap` by evicting the youngest.
@@ -38,12 +37,10 @@ impl Pool {
         }
     }
 
-    /// Inserts or replaces `c`; a replaced entry's deferral count carries over.
-    pub(crate) fn insert(&mut self, mut c: Candidate) {
-        if let Some(old) = self.keys.remove(&c.path)
-            && let Some(prev) = self.by_age.remove(&old)
-        {
-            c.deferrals = c.deferrals.max(prev.deferrals);
+    /// Inserts or replaces `c`.
+    pub(crate) fn insert(&mut self, c: Candidate) {
+        if let Some(old) = self.keys.remove(&c.path) {
+            self.by_age.remove(&old);
         }
         self.seq += 1;
         let key = (c.atime, self.seq);
@@ -65,10 +62,6 @@ impl Pool {
     pub(crate) fn clear(&mut self) {
         self.by_age.clear();
         self.keys.clear();
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.by_age.is_empty()
     }
 }
 
@@ -96,7 +89,6 @@ mod tests {
             size: 1,
             atime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - age_secs),
             sampled_at: Instant::now(),
-            deferrals: 0,
         }
     }
 
@@ -129,15 +121,5 @@ mod tests {
         pool.insert(candidate("/a", 99));
         assert_eq!(pool.by_age.len(), 2);
         assert_eq!(pool.pop_oldest().map(|c| c.path), Some(PathBuf::from("/a")));
-    }
-
-    #[test]
-    fn pool_reinsert_keeps_the_higher_deferral_count() {
-        let mut pool = Pool::new(10);
-        let mut c = candidate("/a", 10);
-        c.deferrals = 3;
-        pool.insert(c);
-        pool.insert(candidate("/a", 10));
-        assert_eq!(pool.pop_oldest().map(|c| c.deferrals), Some(3));
     }
 }

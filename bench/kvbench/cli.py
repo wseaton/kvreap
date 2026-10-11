@@ -91,7 +91,7 @@ def main() -> int:
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help="extra env var on the evictor container, repeatable, e.g. CHAIN_EVICTION=observe",
+        help="extra env var on the evictor container, repeatable, e.g. DELETE_FANOUT=4",
     )
 
     a = sub.add_parser("analyze", help="summarize and compare run directories")

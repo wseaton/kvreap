@@ -20,8 +20,6 @@ pub enum ConfigError {
     TargetNotBelowCleanup { target: f64, cleanup: f64 },
     #[error("NUM_CRAWLER_PROCESSES must be a power of 2 from 1 to 16, got {0}")]
     InvalidWorkerCount(i64),
-    #[error("CHAIN_EVICTION must be tail-first, subtree, radix or observe, got {0:?}")]
-    InvalidChainPolicy(String),
     #[error("{var}={value:?} is not a host:port socket address")]
     NotAnAddress { var: &'static str, value: String },
 }
@@ -101,35 +99,6 @@ impl WorkerCount {
     }
 }
 
-/// What workers do with the prefix-chain index built from `KV_EVENTS_ENDPOINTS`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChainPolicy {
-    /// Among the oldest candidates, delete dead blocks, then childless ones,
-    /// then chain interiors (each deferred at most `CHAIN_MAX_DEFERRALS` times).
-    TailFirst,
-    /// Keep the index and count deletions by chain position, but evict oldest-first.
-    Observe,
-    /// Among the oldest candidates, delete dead blocks, then the block with
-    /// the fewest leaves below it, together with its whole on-disk subtree.
-    Subtree,
-    /// Delete dead subtrees first, then radix-tree leaf edges oldest first:
-    /// a sampled block maps to the unshared tail it belongs to, so prefixes
-    /// with more than one cached continuation are never deleted.
-    Radix,
-}
-
-impl ChainPolicy {
-    fn parse(raw: &str) -> Result<Self, ConfigError> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "tail-first" => Ok(Self::TailFirst),
-            "observe" => Ok(Self::Observe),
-            "subtree" => Ok(Self::Subtree),
-            "radix" => Ok(Self::Radix),
-            _ => Err(ConfigError::InvalidChainPolicy(raw.to_string())),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Debug,
@@ -191,8 +160,6 @@ pub struct Config {
     pub metrics_addr: Option<SocketAddr>,
     /// Port of each publisher's `replay_endpoint`, for fetching missed batches.
     pub kv_events_replay_port: Option<u16>,
-    pub chain_policy: ChainPolicy,
-    pub chain_max_deferrals: u32,
     /// Only `BlockStored` events of this medium mark blocks on disk (vLLM fs tier: `STORAGE`).
     pub kv_events_disk_medium: Option<String>,
 }
@@ -359,9 +326,6 @@ impl Config {
                         })
                 })
                 .transpose()?,
-            chain_policy: ChainPolicy::parse(&get("CHAIN_EVICTION", "tail-first"))?,
-            chain_max_deferrals: u32::try_from(int("CHAIN_MAX_DEFERRALS", "8")?.max(0))
-                .unwrap_or(u32::MAX),
             kv_events_disk_medium: optional("KV_EVENTS_DISK_MEDIUM"),
         })
     }
@@ -373,7 +337,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use crate::config::{ChainPolicy, Config, ConfigError, DeleteMode, LogLevel};
+    use crate::config::{Config, ConfigError, DeleteMode, LogLevel};
 
     fn cfg(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
         let env: HashMap<String, String> = pairs
@@ -408,8 +372,6 @@ mod tests {
         assert_eq!(c.capacity_bytes, None);
         assert!(c.kv_events_endpoints.is_empty());
         assert_eq!(c.kv_events_replay_port, None);
-        assert_eq!(c.chain_policy, ChainPolicy::TailFirst);
-        assert_eq!(c.chain_max_deferrals, 8);
         assert_eq!(c.kv_events_disk_medium, None);
         assert_eq!(
             cfg(&[("KV_EVENTS_DISK_MEDIUM", "STORAGE")])
@@ -495,43 +457,6 @@ mod tests {
                 "{bad}"
             );
         }
-    }
-
-    #[test]
-    fn chain_policy_and_deferrals_parse() {
-        let c = cfg(&[
-            ("CHAIN_EVICTION", " Observe "),
-            ("CHAIN_MAX_DEFERRALS", "0"),
-        ])
-        .expect("parse");
-        assert_eq!(c.chain_policy, ChainPolicy::Observe);
-        assert_eq!(
-            cfg(&[("CHAIN_EVICTION", "subtree")])
-                .expect("parse")
-                .chain_policy,
-            ChainPolicy::Subtree
-        );
-        assert_eq!(
-            cfg(&[("CHAIN_EVICTION", "radix")])
-                .expect("parse")
-                .chain_policy,
-            ChainPolicy::Radix
-        );
-        assert_eq!(c.chain_max_deferrals, 0);
-        assert_eq!(
-            cfg(&[("CHAIN_MAX_DEFERRALS", "-3")])
-                .expect("parse")
-                .chain_max_deferrals,
-            0
-        );
-        assert_eq!(
-            cfg(&[("CHAIN_EVICTION", "head-first")]).err(),
-            Some(ConfigError::InvalidChainPolicy("head-first".into()))
-        );
-        assert!(matches!(
-            cfg(&[("CHAIN_MAX_DEFERRALS", "lots")]),
-            Err(ConfigError::NotANumber { .. })
-        ));
     }
 
     #[test]

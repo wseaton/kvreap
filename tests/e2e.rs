@@ -577,11 +577,7 @@ fn block_stored_batch(chain: &[u64]) -> Vec<u8> {
 
 /// Runs kvreap over one 40-block chain in a single bucket, head oldest, with
 /// the chain announced over a real ZMQ PUB; returns the final `chains` status line.
-fn evict_announced_chain(policy: &str) -> String {
-    evict_announced_chain_with(policy, &[])
-}
-
-fn evict_announced_chain_with(policy: &str, extra: &[(&'static str, &str)]) -> String {
+fn evict_announced_chain(extra: &[(&'static str, &str)]) -> String {
     const LEN: u64 = 40;
     let tmp = tempfile::tempdir().expect("tempdir");
     let cache = Cache::new(tmp.path());
@@ -602,8 +598,6 @@ fn evict_announced_chain_with(policy: &str, extra: &[(&'static str, &str)]) -> S
     let publisher = KvEventsPublisher::bind();
     let mut env = always_evicting();
     env.push(("KV_EVENTS_ENDPOINTS", publisher.endpoint.clone()));
-    env.push(("CHAIN_EVICTION", policy.into()));
-    env.push(("CHAIN_MAX_DEFERRALS", "1000".into()));
     env.push(("NUM_CRAWLER_PROCESSES", "1".into()));
     env.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
     let mut ev = Evictor::start(tmp.path(), &env);
@@ -638,29 +632,9 @@ fn counter(line: &str, name: &str) -> u64 {
 }
 
 #[test]
-fn tail_first_eviction_deletes_announced_chain_from_the_leaf() {
-    let line = evict_announced_chain("tail-first");
-    assert!(counter(&line, "event_batches") > 0, "{line}");
-    assert_eq!(counter(&line, "decode_errors"), 0, "{line}");
-    assert_eq!(counter(&line, "deleted_leaf"), 39, "{line}");
-    assert_eq!(counter(&line, "deleted_root"), 1, "{line}");
-    assert_eq!(counter(&line, "deleted_orphan"), 0, "{line}");
-    assert_eq!(counter(&line, "deleted_untracked"), 0, "{line}");
-}
-
-#[test]
-fn observe_eviction_deletes_announced_chain_head_first() {
-    let line = evict_announced_chain("observe");
-    assert_eq!(counter(&line, "deleted_root"), 1, "{line}");
-    assert_eq!(counter(&line, "deleted_orphan"), 39, "{line}");
-    assert_eq!(counter(&line, "deleted_leaf"), 0, "{line}");
-    assert_eq!(counter(&line, "deferrals"), 0, "{line}");
-}
-
-#[test]
 fn radix_eviction_deletes_the_announced_chain_as_one_edge_from_the_leaf() {
     // The chain was announced moments ago; a zero hot window lets its edge go.
-    let line = evict_announced_chain_with("radix", &[("FILE_ACCESS_TIME_THRESHOLD_MINUTES", "0")]);
+    let line = evict_announced_chain(&[("FILE_ACCESS_TIME_THRESHOLD_MINUTES", "0")]);
     assert_eq!(counter(&line, "deleted_leaf"), 39, "{line}");
     assert_eq!(counter(&line, "deleted_root"), 1, "{line}");
     assert_eq!(counter(&line, "deleted_orphan"), 0, "{line}");
@@ -696,7 +670,6 @@ fn radix_eviction_takes_the_least_recently_written_edge_first_whatever_the_atime
     let publisher = KvEventsPublisher::bind();
     let mut env = always_evicting();
     env.push(("KV_EVENTS_ENDPOINTS", publisher.endpoint.clone()));
-    env.push(("CHAIN_EVICTION", "radix".into()));
     env.push(("FILE_ACCESS_TIME_THRESHOLD_MINUTES", "0".into()));
     env.push(("NUM_CRAWLER_PROCESSES", "1".into()));
     env.push(("DELETION_MAX_FILES_PER_SECOND", "10".into()));
@@ -779,7 +752,6 @@ fn radix_eviction_keeps_its_order_in_the_emergency_band() {
         ("TARGET_THRESHOLD", "60".into()),
         ("DIR_CLEANUP_TTL_SECONDS", "0".into()),
         ("KV_EVENTS_ENDPOINTS", publisher.endpoint.clone()),
-        ("CHAIN_EVICTION", "radix".into()),
         ("NUM_CRAWLER_PROCESSES", "1".into()),
     ];
     let mut ev = Evictor::start(tmp.path(), &env);
@@ -816,15 +788,6 @@ fn radix_eviction_keeps_its_order_in_the_emergency_band() {
         .unwrap_or_else(|| panic!("no chains status line\n{log}"));
     assert_eq!(counter(&line, "deleted_internal"), 0, "{line}");
     assert_eq!(counter(&line, "deleted_orphan"), 0, "{line}");
-}
-
-#[test]
-fn subtree_eviction_deletes_the_announced_chain_from_its_root() {
-    let line = evict_announced_chain("subtree");
-    assert_eq!(counter(&line, "deleted_root"), 1, "{line}");
-    assert_eq!(counter(&line, "cascaded"), 39, "{line}");
-    assert_eq!(counter(&line, "deleted_orphan"), 39, "{line}");
-    assert_eq!(counter(&line, "deleted_leaf"), 0, "{line}");
 }
 
 #[test]

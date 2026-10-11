@@ -341,15 +341,9 @@ fn encode_chains(enc: &mut DescriptorEncoder, chains: &Chains) -> Result<(), std
     )?;
     counter(
         enc,
-        "kvreap_chain_young_fallbacks",
-        "Recently written edges deleted because nothing older was left.",
-        Stats::get(&c.young_fallbacks),
-    )?;
-    counter(
-        enc,
-        "kvreap_chain_deferrals",
-        "Chain interiors deferred by tail-first eviction.",
-        Stats::get(&c.deferrals),
+        "kvreap_chain_young_emergency",
+        "Recently written edges deleted in the emergency band.",
+        Stats::get(&c.young_emergency),
     )?;
     counter(
         enc,
@@ -441,7 +435,6 @@ mod tests {
     use crate::budget::{Budget, OpKind};
     use crate::chains::Chains;
     use crate::chains::testing::{h, stored};
-    use crate::config::ChainPolicy;
     use crate::controller::{Mode, SharedState};
     use crate::metrics::{Sources, render, request_target, serve};
     use crate::shutdown::Shutdown;
@@ -511,7 +504,7 @@ mod tests {
 
     #[test]
     fn scrape_reports_chain_metrics_when_events_are_followed() {
-        let chains = Arc::new(Chains::new(100, ChainPolicy::Radix, 2, None));
+        let chains = Arc::new(Chains::new(100, None));
         chains.apply(&[stored(None, &[1, 2, 3], "STORAGE")]);
         chains.deleted(h(3));
         chains.deleted(h(1));

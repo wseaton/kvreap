@@ -268,14 +268,10 @@ fn start_chains(config: &Config, shutdown: &Arc<Shutdown>) -> anyhow::Result<Cha
     }
     let chains = Arc::new(chains::Chains::new(
         chains::INDEX_CAP,
-        config.chain_policy,
-        config.chain_max_deferrals,
         config.kv_events_disk_medium.clone(),
     ));
     tracing::info!(
         endpoints = config.kv_events_endpoints.join(","),
-        policy = ?config.chain_policy,
-        max_deferrals = config.chain_max_deferrals,
         disk_medium = config.kv_events_disk_medium.as_deref().unwrap_or("any"),
         replay_port = ?config.kv_events_replay_port,
         "building prefix-chain index from KV cache events"
