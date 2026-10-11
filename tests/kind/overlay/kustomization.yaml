@@ -10,6 +10,7 @@ resources:
 components:
   - ../../../deploy/kserve/kvreap
   - ../../../deploy/kserve/kv-events-policy
+  - ../../../deploy/kserve/kvreap-metrics-rbac
 images:
   - name: quay.io/wseaton/kvreap
     newName: kvreap

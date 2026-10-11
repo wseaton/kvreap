@@ -22,11 +22,17 @@ docker build --progress=plain --load -t kvreap:e2e . >"$build_log" 2>&1 || { tai
 docker build -q --load -t fake-vllm:e2e tests/kind/fake-vllm
 docker pull -q ghcr.io/shopify/toxiproxy:2.12.0
 kind load docker-image --name "$CLUSTER" kvreap:e2e fake-vllm:e2e ghcr.io/shopify/toxiproxy:2.12.0
-kubectl --context "kind-$CLUSTER" delete namespace kvreap-e2e --ignore-not-found --wait=true
+kubectl --context "kind-$CLUSTER" delete namespace kvreap-e2e openshift-monitoring --ignore-not-found --wait=true
+kubectl --context "kind-$CLUSTER" apply --server-side -f \
+  https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.80.0/example/prometheus-operator-crd/monitoring.coreos.com_podmonitors.yaml
 kubectl --context "kind-$CLUSTER" delete pv kvreap-e2e-kv-cache --ignore-not-found --wait=true
 docker exec "$CLUSTER-control-plane" sh -c \
   'mkdir -p /kv-e2e && { mountpoint -q /kv-e2e || mount -t tmpfs -o size=1g,mode=1777 tmpfs /kv-e2e; } && rm -rf /kv-e2e/*'
 kubectl --context "kind-$CLUSTER" apply -k tests/kind/overlay
+tls=$(mktemp -d)
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=e2e-model-kvreap-metrics \
+  -keyout "$tls/tls.key" -out "$tls/tls.crt" 2>/dev/null
+k create secret tls e2e-model-kvreap-metrics-tls --cert="$tls/tls.crt" --key="$tls/tls.key"
 k scale deployment/e2e-model-kvreap --replicas=0
 k wait --for=delete pod -l app.kubernetes.io/component=kvreap --timeout=60s
 k apply -f tests/kind/overlay/fake-vllm.yaml
@@ -35,7 +41,7 @@ sleep 5
 k scale deployment/e2e-model-kvreap --replicas=1
 k rollout status deployment/e2e-model-kvreap --timeout=120s
 
-log() { k logs deployment/e2e-model-kvreap 2>/dev/null || true; }
+log() { k logs deployment/e2e-model-kvreap -c kvreap 2>/dev/null || true; }
 toxiproxy() { k exec fake-vllm -c toxiproxy -- /toxiproxy-cli "$@" >/dev/null; }
 cut=0
 deadline=$((SECONDS + TIMEOUT))
@@ -83,8 +89,39 @@ deleted=$(( $(counter deleted_root) + $(counter deleted_orphan) + $(counter dele
   || { echo "FAIL: more than 5% of $deleted deletions cut a chain" >&2; fail=1; }
 printf '%s\n' "$logs" | grep DELETION_END | sed 's/.*DELETION_END/DELETION_END/'
 
-scraped=$(k exec deployment/e2e-model-kvreap -- python3 -c \
-  'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:9090/metrics").read().decode())')
+# Scrapes through kube-rbac-proxy from the namespace the metrics NetworkPolicy
+# admits, as the PodMonitor does: the scraper token gets 200, no token 401, a
+# token without the /metrics grant 403, and a pod in kvreap-e2e no connection.
+url=https://e2e-model-kvreap-metrics.kvreap-e2e.svc:8443/metrics
+scrape='import ssl, sys, urllib.request, urllib.error
+req = urllib.request.Request(sys.argv[1])
+if len(sys.argv) > 2:
+    req.add_header("Authorization", "Bearer " + sys.argv[2])
+try:
+    body = urllib.request.urlopen(req, context=ssl._create_unverified_context(), timeout=5).read().decode()
+    print(200); print(body)
+except urllib.error.HTTPError as e:
+    print(e.code)
+except OSError as e:
+    print("unreachable", e)'
+mon() { kubectl --context "kind-$CLUSTER" -n openshift-monitoring "$@"; }
+kubectl --context "kind-$CLUSTER" create namespace openshift-monitoring
+mon run scraper --image=fake-vllm:e2e --image-pull-policy=Never --command -- sleep 3600 >/dev/null
+mon wait --for=condition=Ready pod/scraper --timeout=60s >/dev/null
+token=$(k get secret e2e-model-kvreap-scraper-token -o jsonpath='{.data.token}' | base64 -d)
+stranger=$(k create token default)
+scraped=$(mon exec scraper -- python3 -c "$scrape" "$url" "$token")
+status() { printf '%s\n' "$1" | head -1; }
+[ "$(status "$scraped")" = 200 ] || { echo "FAIL: scraper token got $(status "$scraped")" >&2; fail=1; }
+got=$(status "$(mon exec scraper -- python3 -c "$scrape" "$url")")
+[ "$got" = 401 ] || { echo "FAIL: no token got $got, want 401" >&2; fail=1; }
+got=$(status "$(mon exec scraper -- python3 -c "$scrape" "$url" "$stranger")")
+[ "$got" = 403 ] || { echo "FAIL: unprivileged token got $got, want 403" >&2; fail=1; }
+got=$(status "$(k exec fake-vllm -c main -- python3 -c "$scrape" "$url" "$token")")
+case "$got" in
+  unreachable*) ;;
+  *) echo "FAIL: a pod outside the monitoring namespaces got $got" >&2; fail=1 ;;
+esac
 series() { printf '%s\n' "$scraped" | awk -v s="$1" '$1 == s {print $2}'; }
 for s in kvreap_files_deleted_total 'kvreap_chain_deletions_total{position="leaf"}' kvreap_kv_event_replays_total kvreap_prune_seconds_count; do
   v=$(series "$s")

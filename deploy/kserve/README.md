@@ -11,6 +11,7 @@ conversation tails instead of cutting prefix chains in the middle; see
 | `kvreap/` | kustomize Component: headless Service over the workload pods and the kvreap Deployment on the PVC |
 | `kv-events-policy/` | optional kustomize Component, not for OpenDataHub/RHOAI: a NetworkPolicy limiting 5557/5558 to kvreap and the EPP |
 | `kvreap-monitoring/` | optional kustomize Component: a PodMonitor for kvreap's metrics and a NetworkPolicy for its port |
+| `kvreap-metrics-rbac/` | optional kustomize Component, instead of `kvreap-monitoring`: the same over TLS with token auth through kube-rbac-proxy |
 | `example/` | an overlay that includes the preset and the kvreap Component for a service named `qwen3-32b` |
 
 ```bash
@@ -70,8 +71,23 @@ component for a PodMonitor and a NetworkPolicy that admits the same
 monitoring namespaces OpenDataHub admits for vLLM (`openshift-monitoring`,
 `openshift-user-workload-monitoring`, `redhat-ods-monitoring`); it needs the
 Prometheus Operator CRDs.
-For a TLS scrape, set `METRICS_ADDR=127.0.0.1:9090` and put kube-rbac-proxy
-in front of it.
+For a TLS scrape with token auth, include `kvreap-metrics-rbac` instead. It
+binds kvreap to loopback and adds the kube-rbac-proxy sidecar OpenDataHub
+uses for InferenceService pods, serving HTTPS on 8443 and admitting only
+tokens allowed to get the `/metrics` non-resource URL. It brings:
+
+- a ServiceAccount for kvreap bound to `system:auth-delegator`, so the proxy
+  can run TokenReviews and SubjectAccessReviews;
+- a scraper ServiceAccount with a token Secret, bound to the
+  `kvreap-metrics-reader` ClusterRole, which the PodMonitor presents;
+- a Service whose `serving-cert-secret-name` annotation has the OpenShift
+  service CA issue `<llmisvc>-kvreap-metrics-tls`. Elsewhere create that TLS
+  Secret yourself (cert-manager, or `kubectl create secret tls`).
+
+The two ClusterRoleBindings are cluster-scoped, so installing the component
+needs cluster-admin; their names carry the LLMInferenceService name, so two
+services of the same name in different namespaces collide. On RHOAI, swap the
+proxy image for `registry.redhat.io/openshift4/ose-kube-rbac-proxy-rhel9`.
 
 ## Security
 

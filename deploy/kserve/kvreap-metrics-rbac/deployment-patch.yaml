@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: LLMISVC_NAME-kvreap
+spec:
+  template:
+    spec:
+      serviceAccountName: LLMISVC_NAME-kvreap
+      containers:
+        - name: kvreap
+          env:
+            - name: METRICS_ADDR
+              value: 127.0.0.1:9090
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+              $patch: delete
+        - name: kube-rbac-proxy
+          image: quay.io/brancz/kube-rbac-proxy:v0.18.0
+          args:
+            - --secure-listen-address=0.0.0.0:8443
+            - --upstream=http://127.0.0.1:9090/
+            - --tls-cert-file=/etc/tls/private/tls.crt
+            - --tls-private-key-file=/etc/tls/private/tls.key
+            - --allow-paths=/metrics
+          ports:
+            - name: https-metrics
+              containerPort: 8443
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: metrics-tls
+              mountPath: /etc/tls/private
+              readOnly: true
+      volumes:
+        - name: metrics-tls
+          secret:
+            secretName: LLMISVC_NAME-kvreap-metrics-tls

@@ -1,0 +1,84 @@
+# Opt-in TLS and token auth for kvreap's metrics, in place of
+# kvreap-monitoring. Include it after ../kvreap in an overlay that sets a
+# namespace and provides the kvreap-target ConfigMap.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - metrics-rbac.yaml
+patches:
+  - path: deployment-patch.yaml
+    target:
+      kind: Deployment
+      labelSelector: app.kubernetes.io/component=kvreap
+replacements:
+  - source:
+      kind: ConfigMap
+      name: kvreap-target
+      fieldPath: data.llmisvc
+    targets:
+      - select:
+          kind: ServiceAccount
+        fieldPaths:
+          - metadata.name
+          - metadata.labels.[app.kubernetes.io/name]
+        options:
+          delimiter: "-"
+          index: 0
+      - select:
+          kind: ClusterRoleBinding
+        fieldPaths:
+          - metadata.name
+          - metadata.labels.[app.kubernetes.io/name]
+          - subjects.0.name
+        options:
+          delimiter: "-"
+          index: 0
+      - select:
+          kind: Secret
+          name: LLMISVC_NAME-kvreap-scraper-token
+        fieldPaths:
+          - metadata.name
+          - metadata.labels.[app.kubernetes.io/name]
+          - metadata.annotations.[kubernetes.io/service-account.name]
+        options:
+          delimiter: "-"
+          index: 0
+      - select:
+          kind: Service
+          name: LLMISVC_NAME-kvreap-metrics
+        fieldPaths:
+          - metadata.name
+          - metadata.labels.[app.kubernetes.io/name]
+          - metadata.annotations.[service.beta.openshift.io/serving-cert-secret-name]
+          - spec.selector.[app.kubernetes.io/name]
+        options:
+          delimiter: "-"
+          index: 0
+      - select:
+          kind: PodMonitor
+        fieldPaths:
+          - metadata.name
+          - metadata.labels.[app.kubernetes.io/name]
+          - spec.selector.matchLabels.[app.kubernetes.io/name]
+          - spec.podMetricsEndpoints.0.authorization.credentials.name
+        options:
+          delimiter: "-"
+          index: 0
+      - select:
+          kind: NetworkPolicy
+          name: LLMISVC_NAME-kvreap-metrics
+        fieldPaths:
+          - metadata.name
+          - metadata.labels.[app.kubernetes.io/name]
+          - spec.podSelector.matchLabels.[app.kubernetes.io/name]
+        options:
+          delimiter: "-"
+          index: 0
+      - select:
+          kind: Deployment
+        fieldPaths:
+          - spec.template.spec.serviceAccountName
+          - spec.template.spec.volumes.[name=metrics-tls].secret.secretName
+        options:
+          delimiter: "-"
+          index: 0

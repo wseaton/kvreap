@@ -1,0 +1,146 @@
+# kvreap's metrics behind kube-rbac-proxy: kvreap binds loopback, the proxy
+# terminates TLS on 8443 and lets through only bearer tokens allowed to get
+# the /metrics non-resource URL. On OpenShift the service CA issues the
+# serving certificate; elsewhere create the LLMISVC_NAME-kvreap-metrics-tls
+# Secret (tls.crt, tls.key) yourself, e.g. with cert-manager.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: LLMISVC_NAME-kvreap
+  labels:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+---
+# kube-rbac-proxy checks callers with TokenReview and SubjectAccessReview.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: LLMISVC_NAME-kvreap-auth-delegator
+  labels:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: LLMISVC_NAME-kvreap
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kvreap-metrics-reader
+  labels:
+    app.kubernetes.io/component: kvreap
+rules:
+  - nonResourceURLs: [/metrics]
+    verbs: [get]
+---
+# The identity the PodMonitor scrapes with.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: LLMISVC_NAME-kvreap-scraper
+  labels:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+---
+apiVersion: v1
+kind: Secret
+type: kubernetes.io/service-account-token
+metadata:
+  name: LLMISVC_NAME-kvreap-scraper-token
+  labels:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+  annotations:
+    kubernetes.io/service-account.name: LLMISVC_NAME-kvreap-scraper
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: LLMISVC_NAME-kvreap-metrics-reader
+  labels:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kvreap-metrics-reader
+subjects:
+  - kind: ServiceAccount
+    name: LLMISVC_NAME-kvreap-scraper
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: LLMISVC_NAME-kvreap-metrics
+  labels:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: LLMISVC_NAME-kvreap-metrics-tls
+spec:
+  selector:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+  ports:
+    - name: https-metrics
+      port: 8443
+      targetPort: https-metrics
+      protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: LLMISVC_NAME-kvreap
+  labels:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: LLMISVC_NAME
+      app.kubernetes.io/component: kvreap
+  podMetricsEndpoints:
+    - port: https-metrics
+      path: /metrics
+      scheme: https
+      interval: 30s
+      # Pod IPs are not in the certificate; OpenDataHub scrapes vLLM the same way.
+      tlsConfig:
+        insecureSkipVerify: true
+      authorization:
+        type: Bearer
+        credentials:
+          name: LLMISVC_NAME-kvreap-scraper-token
+          key: token
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: LLMISVC_NAME-kvreap-metrics
+  labels:
+    app.kubernetes.io/name: LLMISVC_NAME
+    app.kubernetes.io/component: kvreap
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: LLMISVC_NAME
+      app.kubernetes.io/component: kvreap
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-monitoring
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-user-workload-monitoring
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: redhat-ods-monitoring
+      ports:
+        - port: 8443
+          protocol: TCP
