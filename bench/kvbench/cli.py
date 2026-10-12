@@ -69,9 +69,9 @@ def main() -> int:
     r.add_argument("--weka-image", default=AIPERF_IMAGE, help="weka: AIPerf image with the corpus and tokenizer")
     r.add_argument("--weka-dataset", default=WEKA_DATASET, help="weka: AIPerf --public-dataset")
     r.add_argument("--weka-traces", type=int, default=96, help="weka: traces loaded, replayed in dataset order")
-    r.add_argument("--weka-concurrency", type=int, default=8, help="weka: sessions (traces) replayed at once")
+    r.add_argument("--weka-concurrency", type=int, default=6, help="weka: sessions (traces) replayed at once")
     r.add_argument(
-        "--weka-max-isl", type=int, default=126000, help="weka: drop requests with more input tokens than this"
+        "--weka-max-isl", type=int, default=120000, help="weka: drop requests with more input tokens than this"
     )
     r.add_argument("--weka-max-osl", type=int, default=1024, help="weka: cap on root-session output tokens")
     r.add_argument("--weka-think-cap", type=float, default=60.0, help="weka: cap on recorded think time (s)")

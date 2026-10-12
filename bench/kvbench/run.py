@@ -125,8 +125,8 @@ class RunConfig:
     weka_image: str = AIPERF_IMAGE
     weka_dataset: str = WEKA_DATASET
     weka_traces: int = 96
-    weka_concurrency: int = 8
-    weka_max_isl: int = 126000
+    weka_concurrency: int = 6
+    weka_max_isl: int = 120000
     weka_max_osl: int = 1024
     weka_think_cap_s: float = 60.0
     weka_seed: int = 42
