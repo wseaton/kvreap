@@ -1,28 +1,69 @@
 # Radix eviction for shared KV cache tiers
 
-Evicting a vLLM filesystem KV tier by prefix-tree leaf edge, aged by each session's last write, instead of by file age. On agentic workloads with long shared-prefix sessions, it keeps live sessions whole and cuts tail latency.
+Evicting a vLLM filesystem KV tier by prefix-tree leaf edge, aged by each session's last use, instead of by file age. On replayed Claude Code sessions it completes 14-18% more requests than the llm-d Python evictor and serves twice the prompt tokens from disk; on a synthetic agent load the gain was +63%.
 
 Will Eaton, October 2026. vLLM 0.31.0, llm-d, KServe LLMInferenceService. Branch [`claude/spike-chain-aware-eviction-e74b90`](https://github.com/wseaton/kvreap/tree/claude/spike-chain-aware-eviction-e74b90).
 
 ## Summary
 
-| result   | what                                                 |
-|----------|------------------------------------------------------|
-| **+63%** | requests vs the Python pvc_evictor, 72B TP=4 on VAST |
-| **8.3×** | lower returning-turn TTFT p99 (18.1 s → 2.2 s)       |
-| **2.1×** | prefix tokens served from disk (35.5M → 74.6M)       |
-| **−67%** | KV rewritten to storage (2.19 TB → 0.72 TB)          |
+Replayed Claude Code sessions (SemiAnalysis Weka traces, AIPerf), Qwen2.5-72B TP=4, shared VAST PVC:
+
+| result | what |
+|----|----|
+| **+14% / +18%** | requests vs the Python pvc_evictor, 160 / 320 GiB cache |
+| **2.2-2.5×** | prompt tokens served from disk |
+| **−42%** | later-turn TTFT p50 at 160 GiB (7.0 s → 4.0 s) |
+| **5-36× fewer** | evictor NFS metadata ops |
 
 - **Plain eviction does not delete chains from the head.** On the first benchmark, 43% of kvreap's deletions cut a prefix chain in the middle and 40% removed tails an earlier cut had already made useless. vLLM's prefix lookup stops at the first missing block, so a mid-chain cut wastes everything below it.
-- **Chain-aware eviction** deletes only radix-tree leaf edges: the unshared tail of one cached prefix, ordered by its newest write, so finished sessions go first and a prefix shared by two continuations is never deleted. This is the RadixAttention leaf-first LRU policy [24] moved from GPU memory to a filesystem tier, driven by vLLM's KV events. It turns on whenever kvreap is given vLLM's events endpoint.
+- **Chain-aware eviction** deletes only radix-tree leaf edges: the unshared tail of one cached prefix, ordered by its last use (written to the tier, or loaded or computed again), so finished sessions go first and a prefix shared by two continuations is never deleted. This is the RadixAttention leaf-first LRU policy [24] moved from GPU memory to a filesystem tier, driven by vLLM's KV events. It turns on whenever kvreap is given vLLM's events endpoint.
 - **vLLM 0.31's fs tier read path had to be fixed first.** It reads each promotion on one thread (about 0.57 GB/s on a VAST mount that serves 16 GB/s). Until that changes, a disk hit is no faster than recompute and no eviction policy helps TTFT. An out-of-tree striped tier fixes it today; vllm#58404 [6] fixes it upstream.
-- **Against the llm-d Python evictor** on a shared VAST PVC (Qwen2.5-72B, TP=4, 40 min), the release candidate completes 63% more requests, serves twice the prefix tokens from disk, cuts returning-turn TTFT p99 from 18.1 s to 2.2 s and rewrites 67% less KV, at a fifth of the metadata load, with no load failures or quota rejections. kvreap's own plain LRU ties the Python evictor on throughput, so the gain is the eviction choice, not the implementation language.
-- **On node-local NVMe** (single-node deployments), it beats plain LRU by 30% requests and cuts p99 2.3× while holding usage to 91.4% of its budget. The Python evictor cannot run there at all: it sizes the disk with statvfs, which reports the whole node.
-- **Hardening found five real bugs** after the first final numbers, including one that deleted live sessions; [all are fixed](#hardening) and the code is about a thousand lines smaller.
+- **On real agent traces the gain is real but modest.** Against the llm-d Python evictor kvreap completes 14% (160 GiB) to 18% (320 GiB) more requests and serves 2.2-2.5× the prompt tokens from disk, at a fraction of the metadata load. The GPU prefix cache serves about half of all prompt tokens on these long sessions, and tail TTFT is set by vLLM's request queue for every evictor, so tails do not improve. kvreap's own plain LRU ties the Python evictor, so the gain is the eviction choice.
+- **Cache size matters.** When the cache cannot hold the live sessions (160 GiB), chain-aware eviction cuts the least recently used ones and fails 3× more reads than the Python evictor. With room for finished sessions (320 GiB) it deletes those and failed reads fall to 8 against 413.
+- **On a synthetic agent load**, where finished sessions are always available, the gain was +63% requests and an 8× lower p99 ([synthetic results](#synthetic-agent-load)).
+- **On node-local NVMe** the Python evictor cannot run at all (statvfs reports the whole node); kvreap's chain-aware mode beats its plain LRU by 15% requests there.
+- **Hardening found eight real bugs** across the runs, including one that deleted live sessions and one that aged sessions by write instead of use; [all are fixed](#hardening-for-tech-preview) and the code is about a thousand lines smaller.
 
-**Release candidate:** Headline numbers come from [the final runs](#final) on image `r-db6a55b`. Earlier sections keep the runs that led there.
+**Release candidate:** image `r-75c1b4a`. [Final results](#final-results) are on the Claude Code replay; earlier sections keep the runs that led there.
 
 ## Final results
+
+Replayed Claude Code sessions: the SemiAnalysis Weka corpus (`cc-traces-weka-062126-256k`, 393 sessions with their subagents), replayed with NVIDIA AIPerf 0.13.0. Each trace records per-request input and output lengths, think time and 64-token KV block hashes; AIPerf rebuilds the prompts from the hashes, so prefix sharing within a session and with its subagents is reproduced exactly. Qwen2.5-72B-Instruct, TP=4, fp8 KV, YaRN to 131,072 tokens (requests over 120k input are dropped, 36% of the corpus), 6 sessions at a time, think time capped at 60 s, 40 minutes per run, cleanup 85%, target 70%. Details in [benchmarks/final-vast.md](https://github.com/wseaton/kvreap/blob/claude/spike-chain-aware-eviction-e74b90/benchmarks/final-vast.md).
+
+### Shared VAST PVC, 160 and 320 GiB
+
+| | Python 160 | plain 160 | chain 160 | Python 320 | chain 320 |
+|----|----|----|----|----|----|
+| requests in 40 min | 618 | 632 | 704 | 699 | 827 |
+| prompt tokens served from the fs tier | 2.9M | 2.7M | 7.4M | 7.0M | 15.2M |
+| later main-agent TTFT p50 | 7.0 s | 6.4 s | 4.0 s | 4.1 s | 4.0 s |
+| later main-agent TTFT p90 / p99 | 37 / 75 s | 39 / 83 s | 37 / 111 s | 31 / 70 s | 39 / 92 s |
+| failed fs reads | 302 | 145 | 908 | 413 | 8 |
+| deletions that cut a live chain | | | 556 | | 135 |
+| KV written to VAST | 3.47 TB | 3.43 TB | 3.38 TB | 3.44 TB | 3.07 TB |
+| evictor NFS metadata ops/s | 10,225 | 1,687 | 2,081 | 14,397 | 398 |
+
+*n = 1 each, back to back on one H200 node with identical settings. Python `pvc-evictor:a-f62b9a7`; plain LRU `r-37c777a`; chain-aware `r-75c1b4a`.*
+
+![PVC usage on the Claude Code replay](../benchmarks/final-vast/charts/usage.svg)
+
+### Node-local NVMe, 160 GiB budget
+
+| | plain LRU | chain-aware |
+|----|----|----|
+| requests in 40 min | 643 | 742 (+15%) |
+| prompt tokens served from the fs tier | 4.4M | 9.9M |
+| later main-agent TTFT p50 / p99 | 4.7 / 71 s | 3.6 / 90 s |
+| failed fs reads | 218 | 1,648 |
+| max usage of the budget | 85.2% | 95.0% |
+
+*[benchmarks/final-nvme.md](https://github.com/wseaton/kvreap/blob/claude/spike-chain-aware-eviction-e74b90/benchmarks/final-nvme.md).*
+
+### Tiered NVMe + VAST
+
+vLLM 0.31 writes every block to all secondary tiers and loads from the first tier in list order that has it, with no demotion between tiers [22]. Each fs tier sets `locality` (`LOCAL`/`REMOTE`), and its STORAGE events carry it [20]. kvreap runs one instance per tier with `KV_EVENTS_LOCALITY`; the node-local instance is a sidecar in the vLLM pod and treats the shared tier's copy as backing when deciding whether a chain is cut. On the Claude Code replay an 80 GiB NVMe tier turns over in about a minute and kvreap ran it to 99.5% of its budget (155% before shortening its hot threshold), so tiered stays experimental.
+
+## Synthetic agent load
 
 Qwen2.5-72B-Instruct, TP=4, fp8 KV, 4× H200 per run, striped fs tier. The nyann-bench agent load:
 
@@ -52,11 +93,11 @@ This sizing keeps live sessions near the target while finished sessions push usa
 
 All three keep usage below VAST's quota, so the Python evictor does work on VAST. It deletes whatever its crawl reaches first, plain LRU deletes oldest-written first, and both cut live sessions at their first-turn blocks, so every later turn of a cut session recomputes and rewrites from the cut. Chain-aware eviction deletes finished sessions whole and keeps live ones intact. It runs usage higher (peak 96.6%, 12.9% of the run above cleanup against 6.6%): below a pressure line at 91% it holds back sessions written in the last 2 minutes while the sampler looks for finished ones.
 
-![PVC usage over the 40-minute run for the Python evictor (pa), kvreap plain LRU (gw) and kvreap chain-aware (vr7): all saw-tooth between the 70% target and the 85% cleanup threshold; vr7 peaks higher](../benchmarks/final-vast/charts/usage.svg)
+![PVC usage over the 40-minute run for the Python evictor (pa), kvreap plain LRU (gw) and kvreap chain-aware (vr7): all saw-tooth between the 70% target and the 85% cleanup threshold; vr7 peaks higher](../benchmarks/agent-pool-vast/charts/usage.svg)
 
 *PVC usage. **pa**: Python pvc_evictor. **gw**: kvreap plain LRU. **vr7**: kvreap chain-aware, release candidate.*
 
-![Evictor NFS metadata ops per second over the run: the Python evictor crawls at thousands of ops/s throughout; kvreap stays low except while pruning](../benchmarks/final-vast/charts/evictor-ops.svg)
+![Evictor NFS metadata ops per second over the run: the Python evictor crawls at thousands of ops/s throughout; kvreap stays low except while pruning](../benchmarks/agent-pool-vast/charts/evictor-ops.svg)
 
 *Evictor NFS metadata ops/s in 5 s windows.*
 
@@ -86,10 +127,6 @@ For single-node deployments the cache can live on the node's own NVMe: CoreWeave
     == after writing 20G into a cache budgeted at 16 GiB (125%)
       pvc_evictor sees: usage=28.56% of 27.9 TiB -> cleanup at 85% never triggers; 15.8 TiB more writes before it would
 
-### Tiered NVMe + VAST
-
-vLLM 0.31 writes every block to all secondary tiers and loads from the first tier in list order that has it, with no demotion between tiers [22]. Each fs tier can set `locality` (`LOCAL`/`REMOTE`), and its STORAGE `BlockStored` events carry it [20]. The plan is one kvreap per tier, each filtering events by locality, with the tighter budget on NVMe, since a block evicted there is still a VAST hit. Not built yet.
-
 ## Hardening for tech preview
 
 Rerunning the 72B benchmarks on each change, after the first final numbers, found the following. Each fix has a regression test.
@@ -101,6 +138,9 @@ Rerunning the 72B benchmarks on each change, after the first final numbers, foun
 | 72B VAST, pressure line | A pass that held young edges back evicted nothing, so workers backed off up to 30 s and slept through usage crossing the line: 977 quota rejections. | Backoff wakes as soon as usage crosses the line (`db6a55b`). |
 | 72B NVMe | The `CAPACITY_BYTES` estimate trailed the disk: buckets were listed every 60 s and sampled once a second. The true footprint reached 110.9% of the budget. | List every 5 s, sample ten a second: peak 91.4% (`14a28a2`). |
 | flaky unit test | Parallel unlink lanes checked the byte grant and subtracted after the unlink, overshooting by up to `DELETE_FANOUT` − 1 files. | Each lane reserves its bytes with one compare-and-swap first (`140bca0`). |
+| Claude Code replay | Radix aged edges by their newest write. A long session's prefix is read back from disk every turn but rarely rewritten, so sessions in active use looked stale and were deleted mid-use: 5× the Python evictor's failed reads. | A GPU or CPU `BlockStored` for a block already on disk counts as a use; vLLM publishes one whenever it loads a block back (`75c1b4a`). Failed reads fell from 1,540 to 908 at 160 GiB and to 8 at 320 GiB. |
+| flaky e2e | Within one edge, parallel lanes reserved grant bytes in schedule order, so a fresh grant could let lanes past a refused one delete blocks behind a kept one: a cut chain. | Reserve an edge's bytes in order before the parallel unlinks (`acd5036`). |
+| tiered kind e2e | On a small node-local tier the sampled `CAPACITY_BYTES` estimate swung 20-30 points; a spike switched radix to plain LRU and cut a live session. | With KV events, usage counts the index's on-disk blocks and samples only files the index does not know (`37c777a`). |
 | code review | Index nodes remembered every child ever linked, so a shared system prompt's list grew with every past conversation and each edge walk rescanned it. | Nodes keep only on-disk children (`a2dc0e1`). |
 
 **Simplification.** The losing policies (`tail-first`, `subtree`, `observe`) and `CHAIN_EVICTION` are gone: chain-aware eviction is on whenever `KV_EVENTS_ENDPOINTS` is set, plain sampled LRU otherwise. The `BlockRemoved` publisher and its libzmq build went too, since nothing consumes those events with vLLM 0.31; with it went the second ZMQ stack. So did the lock instrumentation and a dozen counters. About a thousand lines left the crate.
@@ -323,27 +363,28 @@ The old Python evictor published `BlockStored` with the parent hard-coded to 0. 
 
 ## Caveats and open work
 
-- **n = 1 per configuration** for every benchmark. The release-candidate runs ran a day after the Python and plain-LRU baselines, on the same cluster with identical settings; single-run swings in p99 and internal deletions are of the order of the differences between neighbouring builds.
-- **Usage runs higher on VAST** than with the Python evictor (96.6% peak). Lower `CLEANUP_THRESHOLD` where the quota is hard.
-- **Holding young sessions costs sampling:** 2,801 metadata ops/s against 704 for a build that deleted them more readily. Picking edges straight from the chain index by newest write, instead of from a sampled pool, would remove both this cost and the pressure line.
-- **The chain index is in memory only:** about 750k blocks after 40 minutes, capped at 4M. After a restart kvreap rebuilds it from replay and falls back to atime order for blocks it does not know.
+- **n = 1 per configuration** for every benchmark, back to back on one node; a second node had a full root disk.
+- **Victims come from a sampled pool.** When the cache cannot hold the live sessions, kvreap can cut a live session while a finished one sits unsampled, which is where the 160 GiB failed reads come from. Choosing edges from the chain index's global last-use order is the next change, and would also remove the young-edge hold and its extra sampling.
+- **Tail TTFT** is set by vLLM's queue on the Claude Code replay; no evictor improves it.
+- **Tiered** NVMe + VAST is experimental: the NVMe tier ran to 99.5% of its budget.
+- **Usage runs higher on VAST** than with the Python evictor. Lower `CLEANUP_THRESHOLD` where the quota is hard; the shared-tier component prunes from 80%.
+- **The chain index is in memory only:** after a restart kvreap rebuilds it from replay and falls back to atime order for blocks it does not know.
 - **Data parallelism:** kvreap assumes DP rank 0's ports.
 - **OpenShift validation:** the metrics component has not yet run on a cluster with the service CA, the restricted-v2 SCC and user-workload monitoring.
 - **The KServe `kvEvents` field** is on a fork branch: no upstream PR yet, and envtest not run.
-- **vllm#58404 data:** the striped-tier measurements could support it. Commenting there is the author's call.
 
 ## Where everything is
 
 | what | where |
 |----|----|
-| Code, branch | [wseaton/kvreap @ claude/spike-chain-aware-eviction-e74b90](https://github.com/wseaton/kvreap/tree/claude/spike-chain-aware-eviction-e74b90) (head `f6736b0`) |
-| Final results | [benchmarks/final-vast.md](https://github.com/wseaton/kvreap/blob/claude/spike-chain-aware-eviction-e74b90/benchmarks/final-vast.md), [benchmarks/final-nvme.md](https://github.com/wseaton/kvreap/blob/claude/spike-chain-aware-eviction-e74b90/benchmarks/final-nvme.md), [benchmarks/hostpath-proof/](https://github.com/wseaton/kvreap/tree/claude/spike-chain-aware-eviction-e74b90/benchmarks/hostpath-proof) |
+| Code, branch | [wseaton/kvreap @ claude/spike-chain-aware-eviction-e74b90](https://github.com/wseaton/kvreap/tree/claude/spike-chain-aware-eviction-e74b90) |
+| Final results | [benchmarks/final-vast.md](https://github.com/wseaton/kvreap/blob/claude/spike-chain-aware-eviction-e74b90/benchmarks/final-vast.md), [benchmarks/final-nvme.md](https://github.com/wseaton/kvreap/blob/claude/spike-chain-aware-eviction-e74b90/benchmarks/final-nvme.md) (Claude Code replay), [agent-pool-vast.md](https://github.com/wseaton/kvreap/blob/claude/spike-chain-aware-eviction-e74b90/benchmarks/agent-pool-vast.md) (synthetic), [benchmarks/hostpath-proof/](https://github.com/wseaton/kvreap/tree/claude/spike-chain-aware-eviction-e74b90/benchmarks/hostpath-proof) |
 | 0.6B policy comparison | [benchmarks/chain-spike.md](https://github.com/wseaton/kvreap/blob/claude/spike-chain-aware-eviction-e74b90/benchmarks/chain-spike.md) |
 | 32B agentic + read path | [benchmarks/chain-spike-agent.md](https://github.com/wseaton/kvreap/blob/claude/spike-chain-aware-eviction-e74b90/benchmarks/chain-spike-agent.md) |
 | 72B TP=4 | [benchmarks/chain-spike-72b.md](https://github.com/wseaton/kvreap/blob/claude/spike-chain-aware-eviction-e74b90/benchmarks/chain-spike-72b.md) |
 | KServe overlay | [deploy/kserve/](https://github.com/wseaton/kvreap/tree/claude/spike-chain-aware-eviction-e74b90/deploy/kserve); API field [wseaton/kserve @ llmisvc-fs-tier-kv-events](https://github.com/wseaton/kserve/tree/llmisvc-fs-tier-kv-events) |
-| Benchmark harness | [bench/](https://github.com/wseaton/kvreap/tree/claude/spike-chain-aware-eviction-e74b90/bench) (kvbench; `--workload agent`, `--kv-events`, striped tier plugin) |
-| Images | `quay.io/wseaton/kvreap:r-db6a55b` (release candidate), `r-0668381` (first final runs), `r-962281f`, `r-b5a0097` (72B pair), `r-c209808` (32B pair), `quay.io/wseaton/nyann-bench:kvbench-edd5f54` |
+| Benchmark harness | [bench/](https://github.com/wseaton/kvreap/tree/claude/spike-chain-aware-eviction-e74b90/bench) (kvbench; `--workload weka` and `agent`, `--kv-events`, tiered mode, striped tier plugin) |
+| Images | `quay.io/wseaton/kvreap:r-75c1b4a` (release candidate), `r-db6a55b` (synthetic final runs), `r-0668381`, `r-962281f`, `r-b5a0097` (72B pair), `r-c209808` (32B pair), `quay.io/wseaton/nyann-bench:kvbench-edd5f54` |
 
 ## References
 
