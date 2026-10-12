@@ -63,9 +63,11 @@ tree. While usage is below `CLEANUP_THRESHOLD` kvreap only calls `statvfs`
 block, so deleting block *k* of a conversation makes every later block
 useless, and the next turn recomputes and rewrites all of it. With
 `KV_EVENTS_ENDPOINTS` set, kvreap subscribes to vLLM's `BlockStored` /
-`BlockRemoved` events and keeps the `block -> parent` tree in memory. A
-sampled block then stands for the radix-tree leaf edge it belongs to: the
-unshared tail from the last fork down to a leaf.
+`BlockRemoved` events and keeps the `block -> parent` tree in memory, with
+every radix-tree leaf edge (the unshared tail from the last fork down to a
+leaf) ordered by its last use. Workers take victims from that order, not
+from their samples, and sample only for files the index does not know and
+for the usage estimate.
 
 ```text
   system ── s1 ──┬── a1 ── a2 ── a3      session A, last written 20 min ago
@@ -80,18 +82,18 @@ used when it is written to the tier and whenever vLLM loads or computes it
 again (its GPU and CPU `BlockStored` events), so a session whose prefix is
 read back from disk on every turn stays fresh even though its files are
 old.
-Edges written within the hot threshold wait while usage is below the pressure
-line, halfway from `CLEANUP_THRESHOLD` to the emergency band (91% with the
-defaults), so the sampler looks for finished sessions first; above it,
-eviction is plain LRU over edges.
+When even the least recently used edge was used within the hot threshold,
+every session on disk is live: workers wait while usage is below the
+pressure line, halfway from `CLEANUP_THRESHOLD` to the emergency band (91%
+with the defaults), and above it keep deleting in LRU order.
 Blocks whose parent is already gone
 are unreachable and go first, with everything below them. The subscriber
 follows the llm-d router's protocol: it replays from vLLM's `replay_endpoint`
 on connect, on a sequence gap and on a publisher restart, so a dropped
 connection does not leave the index stale. Batches that fall out of vLLM's
 replay buffer are counted (`kvreap_kv_events_lost`). Block files the index
-does not know (written before kvreap started, or in a lost batch) are evicted
-before any known edge.
+does not know (written before kvreap started, or in a lost batch) are found
+by sampling and go by atime among the edges.
 
 **Pacing.** Every `readdir`, `statx` and `unlink` of sampling and deletion
 goes through one budget:
@@ -176,9 +178,9 @@ live chain). The same counters go to the log every status interval.
   disk either way.
 - Chain-aware eviction runs usage higher than the Python evictor on VAST
   (96.6% peak, 12.9% of the run above the cleanup threshold against 6.6%):
-  below the pressure line it holds back recently used sessions while the
-  sampler looks for finished ones. Lower `CLEANUP_THRESHOLD` if the volume's
-  quota is hard.
+  below the pressure line it holds back recently used sessions when no
+  finished one is left. Lower `CLEANUP_THRESHOLD` if the volume's quota is
+  hard.
 - kvreap does not publish `BlockRemoved` events for the files it deletes.
   The Python evictor's events go to the `SHARED_STORAGE` topic, which only
   the old `llmd_fs_backend` (<= 0.23) used; vLLM 0.31's fs tier publishes
@@ -188,10 +190,6 @@ live chain). The same counters go to the log every status interval.
   ([deploy/kserve/](deploy/kserve/README.md) has the KServe shape). This is
   experimental: on the Claude Code replay an 80 GiB NVMe tier turns over in
   about a minute and kvreap ran it to 99.5% of its budget.
-- Victims come from a sampled pool, so when the cache cannot hold the live
-  sessions kvreap can cut a live session while a finished one sits
-  unsampled. Choosing edges from the chain index's global last-use order is
-  the next change.
 
 ## Development
 

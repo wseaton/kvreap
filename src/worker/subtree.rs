@@ -1,60 +1,20 @@
 //! Deleting a dead block (its parent is gone, so no prefix lookup reaches
 //! it) together with every on-disk block below it.
 
-use std::sync::Arc;
-
-use crate::chains::{Chains, Gone};
+use crate::chains::Chains;
+use crate::chains::index::Descendant;
 use crate::layout::BlockHash;
-use crate::stats::Stats;
 use crate::worker::Worker;
-use crate::worker::pool::Candidate;
-use crate::worker::unlink::leaf_group;
 
 impl Worker {
-    /// Deletes `root` and every on-disk block below it, in every rank dir of
-    /// its model. Returns files removed.
-    pub(crate) fn delete_subtree(&mut self, root: Candidate, chains: &Chains) -> usize {
-        let (hash, size, rank) = (root.hash, root.size, Arc::clone(&root.rank));
-        let Some(_claim) = chains.claim(hash) else {
-            return 0;
-        };
-        let group = leaf_group(&root.path);
-        let name = root
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_owned);
-        if !self.evict_one(root) {
-            return 0;
-        }
-        let (Some(group), Some(name)) = (group, name) else {
-            return 1;
-        };
-        let siblings = self.sibling_ranks(&rank);
-        let mut removed = 1 + self
-            .unlink_blocks(&siblings, &group, size, &[(hash, name)])
-            .iter()
-            .map(|(_, named)| named.deleted)
-            .sum::<usize>();
-        let all_ranks = [std::slice::from_ref(&rank), siblings.as_slice()].concat();
-        let below: Vec<(BlockHash, String)> = chains
-            .descendants(hash)
-            .into_iter()
-            .filter_map(|d| Some((d.hash, d.file_name()?)))
+    /// Deletes `root` and every named on-disk block below it, root first, in
+    /// every rank dir of its model. `None` when no block changed.
+    pub(crate) fn delete_subtree(&mut self, root: &Descendant, chains: &Chains) -> Option<usize> {
+        let below = chains.descendants(root.hash);
+        let blocks: Vec<(BlockHash, String)> = std::iter::once((root.hash, root.file_name()?))
+            .chain(below.iter().filter_map(|d| Some((d.hash, d.file_name()?))))
             .collect();
-        let mut gone = Vec::new();
-        for (h, named) in self.unlink_blocks(&all_ranks, &group, size, &below) {
-            removed += named.deleted;
-            let Some(what) = named.gone() else {
-                continue;
-            };
-            if what == Gone::Deleted {
-                Stats::add(&chains.stats.cascaded, 1);
-            }
-            gone.push((h, what));
-        }
-        chains.record(&gone);
-        removed
+        self.delete_blocks(&blocks, chains)
     }
 }
 
@@ -97,6 +57,32 @@ mod tests {
         assert_eq!(Stats::get(&s.deleted_orphan), 3);
         assert_eq!(Stats::get(&s.cascaded), 2);
         assert_eq!(Stats::get(&h.stats.files_deleted), 3);
+    }
+
+    #[test]
+    fn dead_blocks_go_before_older_edges_and_a_missing_root_passes_them_on() {
+        let (_tmp, cache) = bucket(&[
+            (2, Some(8999)),
+            (3, Some(8998)),
+            (10, Some(8000)),
+            (11, Some(7999)),
+        ]);
+        let mut h = chain_harness(&cache, &[10, 11]);
+        chains(&h).apply(&[stored(None, &[0, 1, 2, 3])]);
+        chains(&h).deleted(hash(0));
+        h.shared.set_mode(Mode::Evicting);
+        h.shared.set_usage(95.0);
+        h.shared.set_to_free(2);
+        h.worker.round().expect("round");
+        assert_eq!(
+            bins(&cache),
+            names(&[10, 11]),
+            "1 had no file: its subtree went after it"
+        );
+        let s = &chains(&h).stats;
+        assert_eq!(Stats::get(&s.vanished), 1);
+        assert_eq!(Stats::get(&s.deleted_orphan), 2);
+        assert_eq!(Stats::get(&s.cascaded), 1);
     }
 
     #[test]

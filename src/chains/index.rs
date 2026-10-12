@@ -1,11 +1,14 @@
 //! The `block -> parent` tree of blocks vLLM has announced, with which of them
 //! are on disk.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::layout::BlockHash;
+
+/// Blocks walked per leaf edge or subtree.
+pub const WALK_BUDGET: usize = 4096;
 
 /// Where a block sat in its chain when it was deleted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +71,8 @@ struct Node {
     digest: Option<Arc<[u8]>>,
     /// When the block was last written to disk or used from any tier.
     used_at: Option<SystemTime>,
+    /// Its key in `ChainIndex::leaves` while it is a named on-disk leaf.
+    leaf_key: Option<SystemTime>,
 }
 
 /// A radix-tree leaf edge: the on-disk blocks from just below the last fork
@@ -105,6 +110,19 @@ impl Descendant {
 
 /// Bounded `block -> parent` map with on-disk child counts. When over `cap`,
 /// the oldest-inserted blocks are forgotten first.
+///
+/// `leaves` orders every named on-disk leaf by a key that is never later than
+/// the newest use on its leaf edge: a leaf enters at its own last use, a use
+/// of the leaf raises the key, a use further up the edge is found when the
+/// leaf reaches the front ([`ChainIndex::oldest_leaf`]), and a fork or a
+/// removal that cuts the edge drops the key back to the leaf's own last use.
+///
+/// ```text
+///   leaves: (t1, a3) (t4, b2) (t9, c1)        t = key, oldest first
+///   s0 ── s1 ──┬── a1 ── a2 ── a3            edge [a1 a2 a3], newest use t1
+///              └── b1 ── b2                  edge [b1 b2],    newest use t4
+///   c1                                       edge [c1],       newest use t9
+/// ```
 #[derive(Debug)]
 pub struct ChainIndex {
     cap: usize,
@@ -112,6 +130,20 @@ pub struct ChainIndex {
     order: VecDeque<(BlockHash, u64)>,
     next_generation: u64,
     on_disk: usize,
+    leaves: BTreeSet<(SystemTime, BlockHash)>,
+    /// Edge cuts so far: a raise found before a cut may be stale.
+    cuts: u64,
+    /// On-disk blocks whose parent went unreachable; checked when taken.
+    dead: BTreeSet<BlockHash>,
+}
+
+/// The leaf whose edge was used least recently, and the leaves whose keys
+/// trailed their edge's newest use, with that use, as of `cuts`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Oldest {
+    pub leaf: Option<(BlockHash, SystemTime)>,
+    pub behind: Vec<(BlockHash, SystemTime)>,
+    pub cuts: u64,
 }
 
 impl ChainIndex {
@@ -122,6 +154,9 @@ impl ChainIndex {
             order: VecDeque::new(),
             next_generation: 0,
             on_disk: 0,
+            leaves: BTreeSet::new(),
+            cuts: 0,
+            dead: BTreeSet::new(),
         }
     }
 
@@ -149,13 +184,74 @@ impl ChainIndex {
             generation,
             digest: None,
             used_at: None,
+            leaf_key: None,
         })
+    }
+
+    /// Removes `hash` from the map and from the leaf and dead sets.
+    fn forget(&mut self, hash: BlockHash) -> Option<Node> {
+        let node = self.nodes.remove(&hash)?;
+        if let Some(key) = node.leaf_key {
+            self.leaves.remove(&(key, hash));
+        }
+        self.dead.remove(&hash);
+        Some(node)
+    }
+
+    /// Puts `hash` in `leaves` while it is a named on-disk block with no
+    /// on-disk child, and out of it otherwise.
+    fn sync_leaf(&mut self, hash: BlockHash) {
+        let Some(n) = self.nodes.get_mut(&hash) else {
+            return;
+        };
+        let leaf = n.residence == Residence::OnDisk && n.children.is_empty() && n.digest.is_some();
+        let key = leaf.then(|| n.used_at.max(n.leaf_key).unwrap_or(SystemTime::UNIX_EPOCH));
+        if key == n.leaf_key {
+            return;
+        }
+        if let Some(old) = n.leaf_key {
+            self.leaves.remove(&(old, hash));
+        }
+        if let Some(new) = key {
+            self.leaves.insert((new, hash));
+        }
+        n.leaf_key = key;
     }
 
     fn child_stored(&mut self, parent: BlockHash, child: BlockHash) {
         let children = &mut self.node_mut(parent).children;
-        if !children.contains(&child) {
-            children.push(child);
+        if children.contains(&child) {
+            return;
+        }
+        children.push(child);
+        if let [first, _] = children.as_slice() {
+            let first = *first;
+            self.cut_above(first);
+        }
+    }
+
+    /// The leaf edge through `hash` just lost the blocks above `hash`: drops
+    /// a key raised by a use up there back to the leaf's own last use.
+    fn cut_above(&mut self, hash: BlockHash) {
+        self.cuts += 1;
+        let mut leaf = hash;
+        for _ in 0..WALK_BUDGET {
+            match self.nodes.get(&leaf).map(|n| n.children.as_slice()) {
+                Some([only]) => leaf = *only,
+                Some([]) => break,
+                _ => return,
+            }
+        }
+        let Some(n) = self.nodes.get_mut(&leaf) else {
+            return;
+        };
+        let (Some(key), Some(own)) = (n.leaf_key, n.used_at) else {
+            return;
+        };
+        if key > own {
+            self.leaves.remove(&(key, leaf));
+            self.leaves.insert((own, leaf));
+            n.leaf_key = Some(own);
         }
     }
 
@@ -163,25 +259,43 @@ impl ChainIndex {
         let Some(p) = parent else {
             return;
         };
-        if let Some(n) = self.nodes.get_mut(&p) {
-            n.children.retain(|c| *c != child);
-            if n.residence != Residence::OnDisk && n.children.is_empty() && n.parent.is_none() {
-                self.nodes.remove(&p);
-            }
+        let Some(n) = self.nodes.get_mut(&p) else {
+            return;
+        };
+        n.children.retain(|c| *c != child);
+        if n.residence != Residence::OnDisk && n.children.is_empty() && n.parent.is_none() {
+            self.forget(p);
+        } else {
+            self.sync_leaf(p);
         }
     }
 
     /// Records `hashes` as a chain hanging off `parent`.
     pub fn store(&mut self, parent: Option<BlockHash>, hashes: &[BlockHash], store: Store) {
+        let mut linked = Vec::new();
         let mut parent = parent;
         for &hash in hashes {
-            self.store_one(hash, parent, store);
+            linked.extend(self.store_one(hash, parent, store));
             parent = Some(hash);
+        }
+        for &hash in hashes.iter().chain(&linked) {
+            self.sync_leaf(hash);
+        }
+        for &hash in hashes {
+            if self.position(hash) == Position::Orphan {
+                self.dead.insert(hash);
+            }
         }
         self.enforce_cap();
     }
 
-    fn store_one(&mut self, hash: BlockHash, parent: Option<BlockHash>, store: Store) {
+    /// Returns the parent `hash` was linked under as an on-disk child.
+    fn store_one(
+        &mut self,
+        hash: BlockHash,
+        parent: Option<BlockHash>,
+        store: Store,
+    ) -> Option<BlockHash> {
         let n = self.node_mut(hash);
         let parent = n.parent.or(parent);
         n.parent = parent;
@@ -201,9 +315,11 @@ impl ChainIndex {
         if newly_on_disk {
             self.on_disk += 1;
         }
-        if let (Residence::OnDisk, Some(p)) = (residence, parent) {
-            self.child_stored(p, hash);
-        }
+        let (Residence::OnDisk, Some(p)) = (residence, parent) else {
+            return None;
+        };
+        self.child_stored(p, hash);
+        Some(p)
     }
 
     /// Records the full hash that names `hash`'s file.
@@ -212,6 +328,7 @@ impl ChainIndex {
             && n.digest.is_none()
         {
             n.digest = Some(digest.into());
+            self.sync_leaf(hash);
         }
     }
 
@@ -315,6 +432,99 @@ impl ChainIndex {
         out
     }
 
+    /// Scans `leaves` oldest key first for the leaf edge whose newest use is
+    /// oldest, skipping leaves `skip` rejects. A leaf's key never runs ahead
+    /// of its edge, so the scan stops at the first key past the best edge
+    /// found, or after walking `scan` edges.
+    pub fn oldest_leaf(
+        &self,
+        budget: usize,
+        scan: usize,
+        skip: impl Fn(BlockHash) -> bool,
+    ) -> Oldest {
+        let mut out = Oldest {
+            cuts: self.cuts,
+            ..Oldest::default()
+        };
+        let mut walked = 0;
+        for &(key, leaf) in &self.leaves {
+            if walked >= scan || out.leaf.is_some_and(|(_, best)| key >= best) {
+                break;
+            }
+            if skip(leaf) {
+                continue;
+            }
+            walked += 1;
+            let Some(newest) = self.edge_newest(leaf, budget) else {
+                continue;
+            };
+            if newest > key {
+                out.behind.push((leaf, newest));
+            }
+            if out.leaf.is_none_or(|(_, best)| newest < best) {
+                out.leaf = Some((leaf, newest));
+            }
+        }
+        out
+    }
+
+    /// Moves the leaves of `oldest.behind` up to the uses found on their
+    /// edges, unless an edge was cut since.
+    pub fn raise(&mut self, oldest: &Oldest) {
+        if oldest.cuts != self.cuts {
+            return;
+        }
+        for &(leaf, newest) in &oldest.behind {
+            self.raise_one(leaf, newest);
+        }
+    }
+
+    fn raise_one(&mut self, leaf: BlockHash, newest: SystemTime) {
+        let Some(n) = self.nodes.get_mut(&leaf) else {
+            return;
+        };
+        let Some(key) = n.leaf_key.filter(|k| *k < newest) else {
+            return;
+        };
+        self.leaves.remove(&(key, leaf));
+        self.leaves.insert((newest, leaf));
+        n.leaf_key = Some(newest);
+    }
+
+    /// The first named dead block (on disk, parent unreachable) that `claim`
+    /// accepts, with its claim. Drops entries that are no longer dead.
+    pub fn take_dead<C>(
+        &mut self,
+        mut claim: impl FnMut(BlockHash) -> Option<C>,
+    ) -> Option<(Descendant, C)> {
+        let mut stale = Vec::new();
+        let mut found = None;
+        for &hash in &self.dead {
+            let named = self.nodes.get(&hash).is_some_and(|n| n.digest.is_some());
+            if !named || self.position(hash) != Position::Orphan {
+                stale.push(hash);
+            } else if let Some(c) = claim(hash) {
+                found = Some((self.descendant(hash), c));
+                break;
+            }
+        }
+        for hash in stale {
+            self.dead.remove(&hash);
+        }
+        found
+    }
+
+    pub fn has_dead(&self) -> bool {
+        !self.dead.is_empty()
+    }
+
+    /// Whether `hash` is on disk with a name, so the leaf order covers it.
+    pub fn named_on_disk(&self, hash: BlockHash) -> bool {
+        self.nodes
+            .get(&hash)
+            .is_some_and(|n| n.residence == Residence::OnDisk && n.digest.is_some())
+    }
+
     /// Marks `hash` gone from disk and returns where it sat in its chain.
     pub fn remove(&mut self, hash: BlockHash) -> Position {
         let position = self.position(hash);
@@ -327,8 +537,17 @@ impl ChainIndex {
         node.residence = Residence::Gone;
         self.on_disk = self.on_disk.saturating_sub(1);
         let parent = node.parent;
-        if node.children.is_empty() {
-            self.nodes.remove(&hash);
+        let children = node.children.clone();
+        if node.backup == Backup::Missing {
+            self.dead.extend(children.iter().copied());
+        }
+        if children.is_empty() {
+            self.forget(hash);
+        } else {
+            self.dead.remove(&hash);
+        }
+        for child in children {
+            self.cut_above(child);
         }
         self.child_removed(parent, hash);
         position
@@ -348,6 +567,9 @@ impl ChainIndex {
     pub fn unback(&mut self, hash: BlockHash) {
         if let Some(n) = self.nodes.get_mut(&hash) {
             n.backup = Backup::Missing;
+            if n.residence == Residence::Gone {
+                self.dead.extend(n.children.iter().copied());
+            }
         }
     }
 
@@ -384,7 +606,7 @@ impl ChainIndex {
                 .nodes
                 .get(&hash)
                 .is_some_and(|n| n.generation == generation);
-            if let Some(node) = current.then(|| self.nodes.remove(&hash)).flatten()
+            if let Some(node) = current.then(|| self.forget(hash)).flatten()
                 && node.residence == Residence::OnDisk
             {
                 self.on_disk = self.on_disk.saturating_sub(1);
@@ -401,15 +623,76 @@ impl ChainIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
-    use crate::chains::index::{ChainIndex, LeafEdge, Position, Store};
+    use crate::chains::index::{ChainIndex, LeafEdge, Position, Residence, Store, WALK_BUDGET};
     use crate::chains::testing::h;
     use crate::layout::BlockHash;
 
     fn children(ix: &ChainIndex, hash: BlockHash) -> usize {
         ix.nodes.get(&hash).map_or(0, |n| n.children.len())
+    }
+
+    /// Stores `chain` on disk under `parent` with a digest for every block.
+    fn named(ix: &mut ChainIndex, parent: Option<u64>, chain: &[u64]) {
+        let hashes: Vec<BlockHash> = chain.iter().copied().map(h).collect();
+        ix.store(parent.map(h), &hashes, Store::OnDisk);
+        for &n in chain {
+            ix.set_digest(h(n), &n.to_be_bytes());
+        }
+    }
+
+    fn used(ix: &mut ChainIndex, n: u64) {
+        tick();
+        ix.store(None, &[h(n)], Store::Used);
+    }
+
+    fn tick() {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    /// Leaves oldest key first.
+    fn leaves(ix: &ChainIndex) -> Vec<u64> {
+        ix.leaves.iter().map(|(_, l)| l.0).collect()
+    }
+
+    fn oldest(ix: &ChainIndex) -> Option<u64> {
+        ix.oldest_leaf(WALK_BUDGET, usize::MAX, |_| false)
+            .leaf
+            .map(|(l, _)| l.0)
+    }
+
+    fn key(ix: &ChainIndex, n: u64) -> Option<SystemTime> {
+        ix.nodes.get(&h(n)).and_then(|node| node.leaf_key)
+    }
+
+    /// `leaves` holds exactly the named on-disk blocks with no on-disk
+    /// child, each under the key its node records, and no key is later than
+    /// its edge's newest use.
+    fn check_leaves(ix: &ChainIndex) {
+        let want: BTreeSet<BlockHash> = ix
+            .nodes
+            .iter()
+            .filter(|(_, n)| {
+                n.residence == Residence::OnDisk && n.children.is_empty() && n.digest.is_some()
+            })
+            .map(|(hash, _)| *hash)
+            .collect();
+        let have: BTreeSet<BlockHash> = ix.leaves.iter().map(|(_, l)| *l).collect();
+        assert_eq!(have, want);
+        assert_eq!(ix.leaves.len(), want.len(), "one entry per leaf");
+        for &(key, leaf) in &ix.leaves {
+            assert_eq!(ix.nodes.get(&leaf).and_then(|n| n.leaf_key), Some(key));
+            let newest = ix.edge_newest(leaf, WALK_BUDGET).expect("on disk");
+            assert!(key <= newest, "leaf {leaf:?} keyed past its edge");
+        }
+        for (hash, n) in &ix.nodes {
+            if !want.contains(hash) {
+                assert_eq!(n.leaf_key, None, "{hash:?} is not a leaf");
+            }
+        }
     }
 
     #[test]
@@ -721,5 +1004,269 @@ mod tests {
             digest: Some(Arc::from(full.as_slice())),
         };
         assert_eq!(d.file_name(), Some(name));
+    }
+
+    #[test]
+    fn leaves_follow_stores_extensions_forks_and_removals() {
+        //   1 ── 2 ──┬── 3 ── 4
+        //            └── 5
+        let mut ix = ChainIndex::new(100);
+        named(&mut ix, None, &[1, 2, 3]);
+        assert_eq!(leaves(&ix), vec![3]);
+        ix.store(None, &[h(9)], Store::OnDisk);
+        assert_eq!(
+            leaves(&ix),
+            vec![3],
+            "a block without a name has no file to delete"
+        );
+        ix.set_digest(h(9), &[9]);
+        assert_eq!(leaves(&ix), vec![3, 9]);
+        tick();
+        named(&mut ix, Some(3), &[4]);
+        assert_eq!(
+            leaves(&ix),
+            vec![9, 4],
+            "4 extends the chain and replaces 3"
+        );
+        tick();
+        named(&mut ix, Some(2), &[5]);
+        assert_eq!(leaves(&ix), vec![9, 4, 5], "a fork adds a leaf");
+        check_leaves(&ix);
+        ix.remove(h(4));
+        assert_eq!(
+            leaves(&ix),
+            vec![3, 9, 5],
+            "3 is a leaf again at its own last use"
+        );
+        ix.remove(h(5));
+        ix.remove(h(9));
+        assert_eq!(leaves(&ix), vec![3]);
+        ix.store(None, &[h(1), h(2), h(3)], Store::LinksOnly);
+        assert_eq!(leaves(&ix), vec![3], "links add no leaf");
+        for n in [3, 2, 1] {
+            ix.remove(h(n));
+            check_leaves(&ix);
+        }
+        assert!(ix.leaves.is_empty());
+        assert_eq!(ix.len(), 0);
+    }
+
+    #[test]
+    fn a_use_of_the_leaf_moves_it_back_at_once() {
+        let mut ix = ChainIndex::new(100);
+        named(&mut ix, None, &[1, 2]);
+        tick();
+        named(&mut ix, None, &[3, 4]);
+        assert_eq!(leaves(&ix), vec![2, 4]);
+        used(&mut ix, 2);
+        assert_eq!(leaves(&ix), vec![4, 2]);
+        let scan = ix.oldest_leaf(WALK_BUDGET, usize::MAX, |_| false);
+        assert_eq!(scan.leaf.map(|(l, _)| l), Some(h(4)));
+        assert!(scan.behind.is_empty(), "both keys are current");
+        check_leaves(&ix);
+    }
+
+    #[test]
+    fn a_use_up_the_edge_is_found_when_its_leaf_reaches_the_front() {
+        let mut ix = ChainIndex::new(100);
+        named(&mut ix, None, &[1, 2]);
+        tick();
+        named(&mut ix, None, &[3, 4]);
+        used(&mut ix, 1);
+        assert_eq!(leaves(&ix), vec![2, 4], "the key of 2 trails its edge");
+        let scan = ix.oldest_leaf(WALK_BUDGET, usize::MAX, |_| false);
+        assert_eq!(
+            scan.leaf.map(|(l, _)| l),
+            Some(h(4)),
+            "1-2 was used after 3-4 was written"
+        );
+        assert_eq!(scan.behind.len(), 1);
+        assert_eq!(scan.behind[0].0, h(2));
+        ix.raise(&scan);
+        assert_eq!(leaves(&ix), vec![4, 2]);
+        check_leaves(&ix);
+        used(&mut ix, 3);
+        assert_eq!(
+            ix.oldest_leaf(WALK_BUDGET, 1, |_| false)
+                .leaf
+                .map(|(l, _)| l),
+            Some(h(4)),
+            "a scan of one edge takes the front leaf"
+        );
+        assert_eq!(oldest(&ix), Some(2));
+        assert_eq!(
+            ix.oldest_leaf(WALK_BUDGET, usize::MAX, |l| l == h(2))
+                .leaf
+                .map(|(l, _)| l),
+            Some(h(4)),
+            "skipped leaves are not taken"
+        );
+    }
+
+    #[test]
+    fn a_fork_or_a_removal_drops_a_raised_key_to_its_leaf() {
+        //   1 ── 2 ── 3 ── 4        1 used last, then 9 forks off 2 and cuts
+        //        └── 9              [3 4] off the use of 1
+        let mut ix = ChainIndex::new(100);
+        named(&mut ix, None, &[1, 2, 3, 4]);
+        tick();
+        named(&mut ix, None, &[7]);
+        used(&mut ix, 1);
+        let scan = ix.oldest_leaf(WALK_BUDGET, usize::MAX, |_| false);
+        ix.raise(&scan);
+        assert_eq!(leaves(&ix), vec![7, 4]);
+        tick();
+        named(&mut ix, Some(2), &[9]);
+        assert_eq!(
+            leaves(&ix),
+            vec![4, 7, 9],
+            "[3 4] was last used when written"
+        );
+        assert_eq!(oldest(&ix), Some(4));
+        check_leaves(&ix);
+
+        let mut ix = ChainIndex::new(100);
+        named(&mut ix, None, &[1, 2, 3, 4]);
+        tick();
+        named(&mut ix, None, &[7]);
+        used(&mut ix, 1);
+        let scan = ix.oldest_leaf(WALK_BUDGET, usize::MAX, |_| false);
+        ix.raise(&scan);
+        ix.remove(h(2));
+        assert_eq!(
+            leaves(&ix),
+            vec![4, 7, 1],
+            "the use of 1 no longer reaches [3 4]"
+        );
+        check_leaves(&ix);
+    }
+
+    #[test]
+    fn a_raise_found_before_a_cut_is_dropped() {
+        let mut ix = ChainIndex::new(100);
+        named(&mut ix, None, &[1, 2, 3]);
+        tick();
+        named(&mut ix, None, &[7]);
+        used(&mut ix, 1);
+        let scan = ix.oldest_leaf(WALK_BUDGET, usize::MAX, |_| false);
+        assert_eq!(scan.behind.len(), 1);
+        named(&mut ix, Some(1), &[8]);
+        ix.raise(&scan);
+        assert_eq!(key(&ix, 3), ix.nodes.get(&h(3)).and_then(|n| n.used_at));
+        check_leaves(&ix);
+    }
+
+    #[test]
+    fn cap_eviction_keeps_the_leaf_set_consistent() {
+        let mut ix = ChainIndex::new(5);
+        for c in 0..20u64 {
+            named(&mut ix, None, &[c * 10, c * 10 + 1, c * 10 + 2]);
+            check_leaves(&ix);
+        }
+        assert!(ix.len() <= 5);
+        assert!(ix.leaves.len() <= 2);
+        assert_eq!(leaves(&ix).last(), Some(&192), "the newest chain is kept");
+    }
+
+    #[test]
+    fn dead_blocks_come_from_lost_parents_and_leave_when_found_again() {
+        fn take(ix: &mut ChainIndex) -> Option<u64> {
+            ix.take_dead(|_| Some(())).map(|(d, ())| d.hash.0)
+        }
+
+        let mut ix = ChainIndex::new(100);
+        named(&mut ix, None, &[1, 2, 3]);
+        assert!(!ix.has_dead());
+        ix.remove(h(1));
+        assert_eq!(take(&mut ix), Some(2));
+        assert!(
+            ix.take_dead(|_| None::<()>).is_none(),
+            "another worker holds it"
+        );
+        named(&mut ix, Some(1), &[5]);
+        assert_eq!(take(&mut ix), Some(2), "2 first, then 5 under gone 1");
+        ix.remove(h(2));
+        assert_eq!(
+            take(&mut ix),
+            Some(3),
+            "a dead block's removal passes it on"
+        );
+        named(&mut ix, None, &[1]);
+        assert_eq!(take(&mut ix), Some(3), "2 is still gone");
+        ix.remove(h(3));
+        assert_eq!(take(&mut ix), None, "1 is back: 5 is reachable");
+        assert!(
+            !ix.has_dead(),
+            "stale entries are dropped as they are found"
+        );
+
+        let mut ix = ChainIndex::new(100);
+        named(&mut ix, None, &[1, 2]);
+        ix.store(None, &[h(1)], Store::Backing);
+        ix.remove(h(1));
+        assert_eq!(take(&mut ix), None, "the backing tier still serves 1");
+        ix.unback(h(1));
+        assert_eq!(take(&mut ix), Some(2));
+    }
+
+    #[test]
+    fn random_operations_keep_the_order_exact() {
+        let mut rng = fastrand::Rng::with_seed(7);
+        let mut ix = ChainIndex::new(10_000);
+        for step in 0..3000 {
+            let n = rng.u64(0..80);
+            match rng.u8(0..10) {
+                0..=3 => {
+                    let parent = rng.bool().then(|| rng.u64(0..80));
+                    let len = rng.u64(1..5);
+                    let chain: Vec<u64> = (0..len).map(|i| (n + i * 7) % 80).collect();
+                    if chain.iter().any(|c| Some(*c) == parent) {
+                        continue;
+                    }
+                    let hashes: Vec<BlockHash> = chain.iter().copied().map(h).collect();
+                    ix.store(parent.map(h), &hashes, Store::OnDisk);
+                    for &c in &chain {
+                        if c % 13 != 0 {
+                            ix.set_digest(h(c), &c.to_be_bytes());
+                        }
+                    }
+                }
+                4..=5 => ix.store(None, &[h(n)], Store::Used),
+                6..=7 => {
+                    ix.remove(h(n));
+                }
+                8 => {
+                    let scan = ix.oldest_leaf(WALK_BUDGET, usize::MAX, |_| false);
+                    ix.raise(&scan);
+                }
+                _ => {
+                    if rng.bool() {
+                        ix.store(None, &[h(n)], Store::Backing);
+                    } else {
+                        ix.unback(h(n));
+                    }
+                }
+            }
+            check_leaves(&ix);
+            let brute = ix
+                .leaves
+                .iter()
+                .filter_map(|(_, l)| ix.edge_newest(*l, WALK_BUDGET))
+                .min();
+            let found = ix
+                .oldest_leaf(WALK_BUDGET, usize::MAX, |_| false)
+                .leaf
+                .map(|(_, t)| t);
+            assert_eq!(found, brute, "step {step}");
+            let orphans: Vec<BlockHash> = ix
+                .nodes
+                .keys()
+                .copied()
+                .filter(|&b| ix.position(b) == Position::Orphan)
+                .collect();
+            for b in orphans {
+                assert!(ix.dead.contains(&b), "step {step}: dead {b:?} not queued");
+            }
+        }
     }
 }

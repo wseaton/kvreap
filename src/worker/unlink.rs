@@ -67,10 +67,17 @@ pub(crate) struct Target {
     pub(crate) size: u64,
 }
 
-/// `g0` from `.../<hh>_g0/<hash>.bin`.
-pub(crate) fn leaf_group(block: &Path) -> Option<String> {
-    let leaf = block.parent()?.file_name()?.to_str()?;
-    leaf.rsplit_once("_g").map(|(_, g)| g.to_owned())
+/// `0` from the leaf dir name `<hh>_g0`.
+pub(crate) fn group_of(leaf_dir: &str) -> Option<&str> {
+    leaf_dir.rsplit_once("_g").map(|(_, g)| g)
+}
+
+/// Where a block's files are: one file per rank dir of a model, in one group.
+#[derive(Debug, Clone)]
+pub(crate) struct Place {
+    pub(crate) ranks: Vec<Arc<RankDir>>,
+    pub(crate) group: String,
+    pub(crate) size: u64,
 }
 
 /// `<rank>/<hhh>/<hh>_g<group>/<name>` for a block file `name`.
@@ -205,13 +212,12 @@ impl Context {
 }
 
 impl Worker {
-    /// Unlinks each block's file `name` in every one of `ranks`, in order with
-    /// up to `DELETE_FANOUT` in flight, and returns what became of each block.
+    /// Unlinks each block's file `name` in every rank dir of every place, in
+    /// order with up to `DELETE_FANOUT` in flight, and returns what became of
+    /// each block.
     pub(crate) fn unlink_blocks(
         &self,
-        ranks: &[Arc<RankDir>],
-        group: &str,
-        size: u64,
+        places: &[Place],
         blocks: &[(BlockHash, String)],
     ) -> Vec<(BlockHash, Named)> {
         let bucket_len = self.ctx.config.hex_bucket_len;
@@ -219,12 +225,14 @@ impl Worker {
         let mut spans = Vec::new();
         for (hash, name) in blocks {
             let start = targets.len();
-            targets.extend(ranks.iter().filter_map(|r| {
-                Some(Target {
-                    path: block_path(&r.path, name, bucket_len, group)?,
-                    size,
-                })
-            }));
+            for place in places {
+                targets.extend(place.ranks.iter().filter_map(|r| {
+                    Some(Target {
+                        path: block_path(&r.path, name, bucket_len, &place.group)?,
+                        size: place.size,
+                    })
+                }));
+            }
             spans.push((*hash, start..targets.len()));
         }
         let results = self.ctx.unlink_all(&targets);
@@ -287,11 +295,11 @@ mod tests {
     fn block_path_rebuilds_the_fs_tier_layout() {
         use std::path::Path;
 
-        use crate::worker::unlink::{block_path, leaf_group};
+        use crate::worker::unlink::{block_path, group_of};
 
-        let block = Path::new("/c/m_abc_r0/abc/de_g3/abcdef.bin");
-        assert_eq!(leaf_group(block).as_deref(), Some("3"));
-        assert_eq!(leaf_group(Path::new("/c/m/abc/de/x.bin")), None);
+        assert_eq!(group_of("de_g3"), Some("3"));
+        assert_eq!(group_of("de_g12"), Some("12"));
+        assert_eq!(group_of("de"), None);
         assert_eq!(
             block_path(Path::new("/c/m_abc_r0"), "0123ff.bin", 3, "3"),
             Some(Path::new("/c/m_abc_r0/012/3f_g3/0123ff.bin").to_path_buf())

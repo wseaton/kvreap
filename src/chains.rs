@@ -15,10 +15,9 @@
 use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::SystemTime;
 
 use crate::chains::decode::{KvEvent, Locality};
-use crate::chains::index::{ChainIndex, Descendant, LeafEdge, Position, Store};
+use crate::chains::index::{ChainIndex, Descendant, LeafEdge, Position, Store, WALK_BUDGET};
 use crate::layout::BlockHash;
 use crate::stats::Stats;
 
@@ -29,18 +28,9 @@ pub mod subscriber;
 pub mod testing;
 
 pub const INDEX_CAP: usize = 4 << 20;
-const WALK_BUDGET: usize = 4096;
+/// Leaf edges walked per search for the least recently used one.
+const SCAN_EDGES: usize = 32;
 const MEDIUM_STORAGE: &str = "STORAGE";
-
-/// Where radix eviction ranks a block, first to go first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RadixKey {
-    Dead,
-    /// Not on disk in the index, or its edge is longer than the walk budget.
-    Untracked,
-    /// On a leaf edge whose newest block was marked on disk at this instant.
-    Edge(SystemTime),
-}
 
 /// A block one worker is deleting from; released on drop.
 #[derive(Debug)]
@@ -188,10 +178,6 @@ impl Chains {
         self.index().descendants(hash, WALK_BUDGET)
     }
 
-    pub fn leaf_edge(&self, hash: BlockHash) -> Option<LeafEdge> {
-        self.index().leaf_edge(hash, WALK_BUDGET)
-    }
-
     /// Reserves `hash` for one worker until the claim drops; `None` while
     /// another worker holds it.
     pub fn claim(&self, hash: BlockHash) -> Option<Claim<'_>> {
@@ -204,15 +190,42 @@ impl Chains {
         }
     }
 
-    pub fn radix_key(&self, hash: BlockHash) -> RadixKey {
-        let index = self.index();
-        if index.position(hash) == Position::Orphan {
-            return RadixKey::Dead;
+    fn claimed(&self, hash: BlockHash) -> bool {
+        self.claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&hash)
+    }
+
+    /// Whether the index orders `hash` for eviction: on disk here and named.
+    pub fn orders(&self, hash: BlockHash) -> bool {
+        self.index().named_on_disk(hash)
+    }
+
+    /// A dead block (on disk, parent unreachable) no other worker is deleting.
+    pub fn dead_root(&self) -> Option<(Descendant, Claim<'_>)> {
+        if !self.index().has_dead() {
+            return None;
         }
-        match index.edge_newest(hash, WALK_BUDGET) {
-            Some(newest) => RadixKey::Edge(newest),
-            None => RadixKey::Untracked,
+        self.write().take_dead(|hash| self.claim(hash))
+    }
+
+    /// The leaf edge no other worker holds whose newest use is the oldest.
+    /// Leaves found to be keyed behind their edge's newest use are moved up.
+    pub fn oldest_edge(&self) -> Option<(LeafEdge, Claim<'_>)> {
+        let (picked, oldest) = {
+            let index = self.index();
+            let oldest = index.oldest_leaf(WALK_BUDGET, SCAN_EDGES, |h| self.claimed(h));
+            let picked = oldest.leaf.and_then(|(leaf, _)| {
+                let claim = self.claim(leaf)?;
+                Some((index.leaf_edge(leaf, WALK_BUDGET)?, claim))
+            });
+            (picked, oldest)
+        };
+        if !oldest.behind.is_empty() {
+            self.write().raise(&oldest);
         }
+        picked
     }
 
     /// Drops a block whose file is gone although kvreap did not delete it.
@@ -333,9 +346,20 @@ mod tests {
 
     use crate::chains::decode::Locality;
     use crate::chains::index::Position;
-    use crate::chains::testing::{at, h, removed, stored};
-    use crate::chains::{Chains, RadixKey, Tier};
+    use crate::chains::testing::{at, h, removed, stored, with_digests};
+    use crate::chains::{Chains, Tier};
+    use crate::layout::BlockHash;
     use crate::stats::Stats;
+
+    fn oldest_leaf(chains: &Chains) -> Option<BlockHash> {
+        chains
+            .oldest_edge()
+            .and_then(|(edge, _)| edge.blocks.last().map(|b| b.hash))
+    }
+
+    fn dead_root(chains: &Chains) -> Option<BlockHash> {
+        chains.dead_root().map(|(root, _)| root.hash)
+    }
 
     fn storage(locality: Option<Locality>) -> Tier {
         Tier {
@@ -394,62 +418,64 @@ mod tests {
 
     #[test]
     fn loading_a_block_back_counts_as_a_use_of_its_edge() {
-        use std::time::Duration;
-
         let chains = Chains::new(100, storage(Some(Locality::Local)));
-        chains.apply(&[
-            at(stored(None, &[1, 2], "STORAGE"), Locality::Local),
-            at(stored(None, &[3, 4], "STORAGE"), Locality::Local),
-        ]);
-        let (first, second) = (chains.radix_key(h(1)), chains.radix_key(h(3)));
-        assert!(first <= second);
+        chains.apply(&[with_digests(at(
+            stored(None, &[1, 2], "STORAGE"),
+            Locality::Local,
+        ))]);
         std::thread::sleep(Duration::from_millis(5));
-        chains.apply(&[stored(None, &[1, 2], "GPU")]);
-        assert!(
-            chains.radix_key(h(1)) > second,
-            "1-2 was read back after 3-4 was written"
-        );
-        let before = chains.radix_key(h(3));
+        chains.apply(&[with_digests(at(
+            stored(None, &[3, 4], "STORAGE"),
+            Locality::Local,
+        ))]);
+        assert_eq!(oldest_leaf(&chains), Some(h(2)));
         std::thread::sleep(Duration::from_millis(5));
-        chains.apply(&[at(stored(None, &[3, 4], "STORAGE"), Locality::Remote)]);
+        chains.apply(&[stored(None, &[1], "GPU")]);
         assert_eq!(
-            chains.radix_key(h(3)),
-            before,
+            oldest_leaf(&chains),
+            Some(h(4)),
+            "1 was read back after 3-4 was written"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        chains.apply(&[with_digests(at(
+            stored(None, &[3, 4], "STORAGE"),
+            Locality::Remote,
+        ))]);
+        assert_eq!(
+            oldest_leaf(&chains),
+            Some(h(4)),
             "the shared tier's copy is not a use of this tier's files"
         );
-        chains.apply(&[stored(None, &[5], "GPU")]);
-        assert_eq!(
-            chains.radix_key(h(5)),
-            RadixKey::Untracked,
-            "not on disk here"
-        );
+        chains.apply(&[with_digests(stored(None, &[5], "GPU"))]);
+        assert!(!chains.orders(h(5)), "not on disk here");
+        assert!(chains.orders(h(3)));
     }
 
     #[test]
     fn a_local_tier_counts_the_shared_tier_as_backing() {
         let local = Chains::new(100, storage(Some(Locality::Local)));
         local.apply(&[
-            at(stored(None, &[1, 2, 3], "STORAGE"), Locality::Local),
+            with_digests(at(stored(None, &[1, 2, 3], "STORAGE"), Locality::Local)),
             at(stored(None, &[1, 2, 3], "STORAGE"), Locality::Remote),
         ]);
         local.deleted(h(2));
-        assert_ne!(
-            local.radix_key(h(3)),
-            RadixKey::Dead,
+        assert_eq!(
+            dead_root(&local),
+            None,
             "a lookup that misses 2 here loads it from the shared tier"
         );
         local.apply(&[at(removed(&[2], "STORAGE"), Locality::Remote)]);
-        assert_eq!(local.radix_key(h(3)), RadixKey::Dead);
+        assert_eq!(dead_root(&local), Some(h(3)));
 
         let remote = Chains::new(100, storage(Some(Locality::Remote)));
         remote.apply(&[
             at(stored(None, &[1, 2, 3], "STORAGE"), Locality::Local),
-            at(stored(None, &[1, 2, 3], "STORAGE"), Locality::Remote),
+            with_digests(at(stored(None, &[1, 2, 3], "STORAGE"), Locality::Remote)),
         ]);
         remote.deleted(h(2));
         assert_eq!(
-            remote.radix_key(h(3)),
-            RadixKey::Dead,
+            dead_root(&remote),
+            Some(h(3)),
             "node-local copies are not a backing for the shared tier"
         );
     }
@@ -503,20 +529,30 @@ mod tests {
     }
 
     #[test]
-    fn radix_key_orders_dead_untracked_then_edges_by_newest_write() {
-        use crate::chains::RadixKey;
-
+    fn workers_take_edges_oldest_first_and_dead_roots_one_at_a_time() {
         let chains = Chains::new(100, Tier::default());
-        chains.apply(&[stored(None, &[1, 2], "STORAGE")]);
+        chains.apply(&[with_digests(stored(None, &[1, 2], "STORAGE"))]);
         std::thread::sleep(Duration::from_millis(5));
-        chains.apply(&[stored(None, &[3, 4], "STORAGE")]);
-        let (old, new) = (chains.radix_key(h(1)), chains.radix_key(h(3)));
-        assert!(matches!(old, RadixKey::Edge(_)));
-        assert!(old < new, "the edge written first goes first");
-        assert_eq!(chains.radix_key(h(99)), RadixKey::Untracked);
+        chains.apply(&[with_digests(stored(None, &[3, 4], "STORAGE"))]);
+        let (edge, claim) = chains.oldest_edge().expect("edge");
+        assert_eq!(
+            edge.blocks.iter().map(|b| b.hash).collect::<Vec<_>>(),
+            vec![h(1), h(2)]
+        );
+        assert_eq!(oldest_leaf(&chains), Some(h(4)), "another worker holds 1-2");
+        drop(claim);
+        assert_eq!(oldest_leaf(&chains), Some(h(2)));
+
+        assert_eq!(dead_root(&chains), None);
         chains.deleted(h(1));
-        assert_eq!(chains.radix_key(h(2)), RadixKey::Dead);
-        assert!(RadixKey::Dead < RadixKey::Untracked && RadixKey::Untracked < old);
+        let (root, held) = chains.dead_root().expect("dead");
+        assert_eq!(root.hash, h(2));
+        assert_eq!(dead_root(&chains), None, "held by another worker");
+        drop(held);
+        assert_eq!(dead_root(&chains), Some(h(2)));
+        chains.deleted(h(2));
+        assert_eq!(dead_root(&chains), None);
+        assert!(!chains.orders(h(99)));
     }
 
     #[test]

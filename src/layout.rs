@@ -14,7 +14,7 @@ use crate::fsops::{Entry, EntryKind};
 
 const HEX_MODULO_BASE: u8 = 16;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockHash(pub u64);
 
 impl BlockHash {

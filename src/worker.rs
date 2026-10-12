@@ -15,9 +15,13 @@
 //! | `buckets` | listing and sampling the shard's buckets, reaping empty dirs |
 //! | `pool` | the oldest cold candidates |
 //! | `unlink` | unlinking one candidate or many in parallel |
-//! | `radix` | eviction by the prefix-chain index when KV events are configured |
+//! | `radix` | eviction in the prefix-chain index's order when KV events are configured |
 //! | `subtree` | deleting a dead block with everything below it |
+//!
+//! With the chain index, the pool holds only files the index does not order,
+//! and the index picks every other victim.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -52,7 +56,6 @@ const IDLE_POLL: Duration = Duration::from_millis(250);
 const EMPTY_INDEX_RETRY: Duration = Duration::from_secs(5);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
-const CHAIN_WINDOW: usize = 8;
 
 pub struct Context {
     pub config: Arc<Config>,
@@ -70,6 +73,8 @@ pub struct Worker {
     ctx: Context,
     pool: Pool,
     index: BucketIndex,
+    /// The `_g<group>` suffixes of the leaf dirs sampled so far.
+    groups: BTreeSet<String>,
     /// Files evicted so far in the current pass over the buckets.
     pass_evicted: usize,
     backoff: Duration,
@@ -81,6 +86,18 @@ pub struct Worker {
 struct RoundResult {
     sampled: usize,
     evicted: usize,
+    stop: Stop,
+}
+
+/// Why eviction stopped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Stop {
+    /// The quota or the grant ran out, or no candidate was left.
+    #[default]
+    Done,
+    /// The least recently used edge was used within the hot threshold and
+    /// usage is below the pressure line.
+    YoungEdge,
 }
 
 impl Worker {
@@ -91,6 +108,7 @@ impl Worker {
             ctx,
             pool: Pool::new(POOL_CAP),
             index: BucketIndex::default(),
+            groups: BTreeSet::new(),
             pass_evicted: 0,
             backoff: BACKOFF_MIN,
             evict_carry: 0,
@@ -137,12 +155,15 @@ impl Worker {
     }
 
     /// Updates backoff state; returns how long to back off, if at all. A
-    /// worker backs off only after a whole pass over its buckets evicted
-    /// nothing.
+    /// worker backs off after a round held a young edge back, or after a
+    /// whole pass over its buckets evicted nothing.
     fn after_round(&mut self, r: &RoundResult) -> Option<Duration> {
         self.pass_evicted += r.evicted;
         if r.evicted > 0 {
             self.backoff = BACKOFF_MIN;
+        }
+        if r.stop == Stop::YoungEdge {
+            return Some(self.next_backoff());
         }
         if !self.index.pass_done() {
             return None;
@@ -152,9 +173,13 @@ impl Worker {
             return None;
         }
         self.index.refreshed_at = None;
+        Some(self.next_backoff())
+    }
+
+    fn next_backoff(&mut self) -> Duration {
         let wait = self.backoff;
         self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
-        Some(wait)
+        wait
     }
 
     /// Usage is past the pressure line, where radix also takes young edges.
@@ -163,7 +188,7 @@ impl Worker {
     }
 
     /// Sleeps `wait`, or less if usage crosses the pressure line meanwhile:
-    /// a pass that held young edges back is no reason to sleep through it.
+    /// a round that held young edges back is no reason to sleep through it.
     fn back_off(&self, wait: Duration) {
         let pressed = self.pressed();
         let deadline = Instant::now() + wait;
@@ -210,11 +235,15 @@ impl Worker {
         };
         let owed = self.evict_carry + sampled;
         self.evict_carry = owed % SAMPLED_PER_EVICTION;
-        let evicted = self.evict(owed / SAMPLED_PER_EVICTION);
-        Ok(Some(RoundResult { sampled, evicted }))
+        let (evicted, stop) = self.evict(owed / SAMPLED_PER_EVICTION);
+        Ok(Some(RoundResult {
+            sampled,
+            evicted,
+            stop,
+        }))
     }
 
-    fn evict(&mut self, quota: usize) -> usize {
+    fn evict(&mut self, quota: usize) -> (usize, Stop) {
         if let Some(chains) = self.ctx.chains.clone() {
             return self.evict_radix(quota, &chains);
         }
@@ -227,7 +256,7 @@ impl Worker {
                 evicted += 1;
             }
         }
-        evicted
+        (evicted, Stop::Done)
     }
 
     fn evicting(&self) -> bool {
@@ -244,6 +273,7 @@ mod tests {
     use crate::controller::Mode;
     use crate::stats::Stats;
     use crate::worker::testing::{age, bins, config, fixture, harness, run_rounds};
+    use crate::worker::{BACKOFF_MIN, RoundResult, Stop};
 
     #[test]
     fn evicts_cold_files_oldest_first_and_spares_hot_ones() {
@@ -322,7 +352,7 @@ mod tests {
         h.worker.round().expect("round");
         let after_first = bins(&fx.cache).len();
         h.shared.set_mode(Mode::Idle);
-        assert_eq!(h.worker.evict(100), 0);
+        assert_eq!(h.worker.evict(100), (0, Stop::Done));
         assert_eq!(bins(&fx.cache).len(), after_first);
     }
 
@@ -360,6 +390,30 @@ mod tests {
         assert!(
             start.elapsed() >= Duration::from_millis(600),
             "already past the line: sleeps the whole wait"
+        );
+    }
+
+    #[test]
+    fn a_round_that_held_a_young_edge_backs_off_at_once() {
+        let fx = fixture(4, 0);
+        let mut h = harness(config(&fx.cache, &[]));
+        let held = RoundResult {
+            sampled: 4,
+            evicted: 0,
+            stop: Stop::YoungEdge,
+        };
+        assert_eq!(h.worker.after_round(&held), Some(BACKOFF_MIN));
+        assert_eq!(h.worker.after_round(&held), Some(BACKOFF_MIN * 2));
+        let done = RoundResult {
+            sampled: 4,
+            evicted: 2,
+            stop: Stop::Done,
+        };
+        assert_eq!(h.worker.after_round(&done), None);
+        assert_eq!(
+            h.worker.after_round(&held),
+            Some(BACKOFF_MIN),
+            "an eviction resets the backoff"
         );
     }
 

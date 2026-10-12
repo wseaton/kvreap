@@ -14,6 +14,7 @@ use crate::layout::{block_files, discover_rank_dirs, model_base_dir};
 use crate::stats::Stats;
 use crate::worker::Worker;
 use crate::worker::pool::Candidate;
+use crate::worker::unlink::group_of;
 
 #[derive(Debug)]
 pub(crate) struct RankDir {
@@ -26,8 +27,10 @@ pub(crate) struct RankDir {
 #[derive(Debug, Default)]
 pub(crate) struct BucketIndex {
     pub(crate) buckets: Vec<(Arc<RankDir>, CString)>,
-    /// Every rank dir found, including ones with no bucket in this shard.
-    pub(crate) ranks: Vec<Arc<RankDir>>,
+    /// Every rank dir found, including ones with no bucket in this shard,
+    /// grouped by model: tensor-parallel ranks each hold a shard of every
+    /// block, and a block is useless once any shard is gone.
+    pub(crate) models: Vec<Vec<Arc<RankDir>>>,
     pub(crate) refreshed_at: Option<Instant>,
     /// Indices into `buckets` for the current pass, and how many are visited.
     pub(crate) pass: Vec<usize>,
@@ -56,13 +59,20 @@ impl Worker {
         let cache = self.ctx.config.cache_path();
         let bucket_len = self.ctx.config.hex_bucket_len;
         let mut buckets = Vec::new();
-        let mut ranks = Vec::new();
+        let mut models: Vec<Vec<Arc<RankDir>>> = Vec::new();
         for path in discover_rank_dirs(&cache) {
             let rank = Arc::new(RankDir {
                 model_base: model_base_dir(&path),
                 path,
             });
-            ranks.push(Arc::clone(&rank));
+            let model = models.iter_mut().find(|m| {
+                m.first()
+                    .is_some_and(|r| r.model_base.is_some() && r.model_base == rank.model_base)
+            });
+            match model {
+                Some(m) => m.push(Arc::clone(&rank)),
+                None => models.push(vec![Arc::clone(&rank)]),
+            }
             let listed = fsops::open_dir(&rank.path)
                 .and_then(|fd| self.timed(OpKind::Readdir, || fsops::list(&fd)));
             let Ok(entries) = listed else {
@@ -85,7 +95,7 @@ impl Worker {
         );
         self.index = BucketIndex {
             buckets,
-            ranks,
+            models,
             refreshed_at: Some(Instant::now()),
             ..BucketIndex::default()
         };
@@ -113,6 +123,11 @@ impl Worker {
         for leaf in leaves.iter().filter(|e| e.kind == EntryKind::Dir) {
             if self.ctx.shutdown.is_set() {
                 return Ok(0);
+            }
+            if let Some(g) = leaf.name.to_str().ok().and_then(group_of)
+                && !self.groups.contains(g)
+            {
+                self.groups.insert(g.to_owned());
             }
             let leaf_path = bucket_path.join(leaf.name.to_string_lossy().as_ref());
             let Ok(leaf_fd) = fsops::open_dir_at(&bucket_fd, &leaf.name) else {
@@ -147,32 +162,20 @@ impl Worker {
                     Stats::add(&self.ctx.stats.files_skipped_hot, 1);
                     continue;
                 }
+                if self.ctx.chains.as_ref().is_some_and(|c| c.orders(hash)) {
+                    continue;
+                }
                 self.pool.insert(Candidate {
                     path: leaf_path.join(name.to_string_lossy().as_ref()),
-                    rank: Arc::clone(rank),
                     hash,
                     size: meta.size,
-                    last_used: self.last_used(hash, meta.atime),
+                    atime: meta.atime,
                     sampled_at: Instant::now(),
                 });
             }
         }
         self.ctx.samples.record(sample);
         Ok(usize::try_from(sample.files).unwrap_or(usize::MAX))
-    }
-
-    /// Other rank dirs of `rank`'s model. Tensor-parallel ranks each hold a
-    /// shard of every block, and a block is useless once any shard is gone.
-    pub(crate) fn sibling_ranks(&self, rank: &RankDir) -> Vec<Arc<RankDir>> {
-        let Some(base) = &rank.model_base else {
-            return Vec::new();
-        };
-        self.index
-            .ranks
-            .iter()
-            .filter(|r| r.model_base.as_ref() == Some(base) && r.path != rank.path)
-            .cloned()
-            .collect()
     }
 
     /// Removes `dir` if it is empty and unchanged for `DIR_CLEANUP_TTL_SECONDS`.

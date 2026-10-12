@@ -2,25 +2,21 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use crate::layout::BlockHash;
-use crate::worker::buckets::RankDir;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Candidate {
     pub(crate) path: PathBuf,
-    pub(crate) rank: Arc<RankDir>,
     pub(crate) hash: BlockHash,
     pub(crate) size: u64,
-    /// When the block was last useful: its atime, or with the chain index
-    /// the newest write or use on its leaf edge. The pool evicts the earliest first.
-    pub(crate) last_used: SystemTime,
+    /// The pool evicts the earliest first.
+    pub(crate) atime: SystemTime,
     pub(crate) sampled_at: Instant,
 }
 
-/// Candidates ordered by `last_used`, capped at `cap` by dropping the latest.
+/// Candidates ordered by `atime`, capped at `cap` by dropping the latest.
 #[derive(Debug)]
 pub(crate) struct Pool {
     pub(crate) cap: usize,
@@ -45,7 +41,7 @@ impl Pool {
             self.by_age.remove(&old);
         }
         self.seq += 1;
-        let key = (c.last_used, self.seq);
+        let key = (c.atime, self.seq);
         self.keys.insert(c.path.clone(), key);
         self.by_age.insert(key, c);
         while self.by_age.len() > self.cap {
@@ -53,6 +49,10 @@ impl Pool {
                 self.keys.remove(&youngest.path);
             }
         }
+    }
+
+    pub(crate) fn oldest(&self) -> Option<SystemTime> {
+        self.by_age.first_key_value().map(|((atime, _), _)| *atime)
     }
 
     pub(crate) fn pop_oldest(&mut self) -> Option<Candidate> {
@@ -70,23 +70,17 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
 
     use crate::layout::BlockHash;
-    use crate::worker::buckets::RankDir;
     use crate::worker::pool::{Candidate, Pool};
 
     fn candidate(path: &str, age_secs: u64) -> Candidate {
         Candidate {
             path: PathBuf::from(path),
-            rank: Arc::new(RankDir {
-                path: PathBuf::from("/r"),
-                model_base: None,
-            }),
             hash: BlockHash(0),
             size: 1,
-            last_used: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - age_secs),
+            atime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - age_secs),
             sampled_at: Instant::now(),
         }
     }
@@ -99,6 +93,7 @@ mod tests {
         pool.insert(candidate("/c", 30));
         pool.insert(candidate("/d", 40));
         assert_eq!(pool.by_age.len(), 3);
+        assert_eq!(pool.oldest(), Some(candidate("/b", 50).atime));
         let order: Vec<_> = std::iter::from_fn(|| pool.pop_oldest())
             .map(|c| c.path)
             .collect();
@@ -110,6 +105,7 @@ mod tests {
                 PathBuf::from("/c")
             ]
         );
+        assert_eq!(pool.oldest(), None);
     }
 
     #[test]
