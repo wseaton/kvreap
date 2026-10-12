@@ -82,10 +82,8 @@ used when it is written to the tier and whenever vLLM loads or computes it
 again (its GPU and CPU `BlockStored` events), so a session whose prefix is
 read back from disk on every turn stays fresh even though its files are
 old.
-When even the least recently used edge was used within the hot threshold,
-every session on disk is live: workers wait while usage is below the
-pressure line, halfway from `CLEANUP_THRESHOLD` to the emergency band (91%
-with the defaults), and above it keep deleting in LRU order.
+Recently used edges are not held back: when every session on disk is
+live, the least recently used one goes, as in plain LRU.
 Blocks whose parent is already gone
 are unreachable and go first, with everything below them. The subscriber
 follows the llm-d router's protocol: it replays from vLLM's `replay_endpoint`
@@ -176,11 +174,6 @@ live chain). The same counters go to the log every status interval.
   files per bucket it swings by tens of points. With KV events, blocks the
   index knows are counted instead. Leave headroom between the budget and the
   disk either way.
-- Chain-aware eviction runs usage higher than the Python evictor on VAST
-  (96.6% peak, 12.9% of the run above the cleanup threshold against 6.6%):
-  below the pressure line it holds back recently used sessions when no
-  finished one is left. Lower `CLEANUP_THRESHOLD` if the volume's quota is
-  hard.
 - kvreap does not publish `BlockRemoved` events for the files it deletes.
   The Python evictor's events go to the `SHARED_STORAGE` topic, which only
   the old `llmd_fs_backend` (<= 0.23) used; vLLM 0.31's fs tier publishes

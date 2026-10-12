@@ -344,12 +344,6 @@ fn encode_chains(enc: &mut DescriptorEncoder, chains: &Chains) -> Result<(), std
         "kvreap_chain_claim_conflicts",
         "Edges skipped because another worker was deleting them.",
         Stats::get(&c.claim_conflicts),
-    )?;
-    counter(
-        enc,
-        "kvreap_chain_young_edges",
-        "Eviction rounds that stopped at a recently used edge below the pressure line.",
-        Stats::get(&c.young_edges),
     )
 }
 

@@ -3,7 +3,7 @@
 //! that still has two continuations on disk. Dead subtrees go first; sampled
 //! files the index does not order go by atime among the edges.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use crate::budget::OpKind;
 use crate::chains::index::LeafEdge;
@@ -11,8 +11,8 @@ use crate::chains::{Chains, Gone};
 use crate::fsops;
 use crate::layout::BlockHash;
 use crate::stats::Stats;
+use crate::worker::Worker;
 use crate::worker::unlink::{Place, block_path};
-use crate::worker::{Stop, Worker};
 
 /// Files a radix round may delete before the worker samples its next bucket.
 const ROUND_FILES: usize = 1024;
@@ -34,10 +34,8 @@ impl Worker {
     /// Evicts dead subtrees first, then the least recently used leaf edge or
     /// the oldest pooled file the index does not order, whichever was last
     /// used earlier, until the grant is spent or `ROUND_FILES` are gone.
-    /// Pooled files count against `quota`. Below the pressure line, an edge
-    /// used within the hot threshold ends the round: every edge on disk is
-    /// that young.
-    pub(crate) fn evict_radix(&mut self, quota: usize, chains: &Chains) -> (usize, Stop) {
+    /// Pooled files count against `quota`.
+    pub(crate) fn evict_radix(&mut self, quota: usize, chains: &Chains) -> usize {
         let (mut evicted, mut unordered) = (0, 0);
         while evicted < ROUND_FILES && self.evicting() {
             if let Some((root, _claim)) = chains.dead_root() {
@@ -67,22 +65,12 @@ impl Worker {
             let Some((edge, _claim)) = edge else {
                 break;
             };
-            if self.young(edge.newest_use) && !self.pressed() {
-                Stats::add(&chains.stats.young_edges, 1);
-                return (evicted, Stop::YoungEdge);
-            }
             match self.delete_edge(&edge, chains) {
                 Some(files) => evicted += files,
                 None => break,
             }
         }
-        (evicted, Stop::Done)
-    }
-
-    fn young(&self, newest_use: SystemTime) -> bool {
-        SystemTime::now()
-            .duration_since(newest_use)
-            .map_or(true, |age| age < self.ctx.config.hot_threshold)
+        evicted
     }
 
     /// Deletes `edge` leaf first, as far as its blocks are named. `None` when
@@ -196,7 +184,6 @@ mod tests {
     use crate::controller::{Mode, UNGRANTED};
     use crate::layout::{BlockHash, Shard};
     use crate::stats::Stats;
-    use crate::worker::Stop;
     use crate::worker::radix::Located;
     use crate::worker::testing::{
         Harness, age, bins, bucket, chain_harness, chains, config, names, run_rounds, stored,
@@ -305,13 +292,12 @@ mod tests {
             (5, Some(8900)),
         ]);
         let mut h = radix_harness(&cache, "60");
-        h.shared.set_usage(95.0);
         h.shared.set_to_free(2);
         h.worker.round().expect("round");
         assert_eq!(
             bins(&cache),
             names(&[1, 2, 5]),
-            "above the pressure line the conversations stored first go first, young or not"
+            "the conversations stored first go first, young or not"
         );
         std::thread::sleep(Duration::from_millis(5));
         chains(&h).apply(&[stored(None, &[1])]);
@@ -321,24 +307,6 @@ mod tests {
             bins(&cache),
             names(&[1, 2]),
             "a use of the prompt is a use of its one remaining conversation"
-        );
-    }
-
-    #[test]
-    fn young_edges_wait_below_the_pressure_line() {
-        let (_tmp, cache) = conversations();
-        let mut h = radix_harness(&cache, "60");
-        h.shared.set_usage(88.0);
-        run_rounds(&mut h, 4);
-        assert_eq!(bins(&cache), names(&[1, 2, 3, 4, 5]));
-        assert!(Stats::get(&chains(&h).stats.young_edges) >= 1);
-        h.shared.set_usage(91.0);
-        h.shared.set_to_free(2);
-        h.worker.round().expect("round");
-        assert_eq!(
-            bins(&cache),
-            names(&[1, 2, 5]),
-            "91% is the line for cleanup at 85%"
         );
     }
 
@@ -359,7 +327,6 @@ mod tests {
         chains(&h).apply(&[stored(None, &[1, 2, 3])]);
         h.worker.shard = Shard::split(16)[0xabc % 16];
         h.shared.set_mode(Mode::Evicting);
-        h.shared.set_usage(95.0);
         h.shared.set_to_free(2);
         h.worker.round().expect("round");
         assert!(
@@ -417,7 +384,6 @@ mod tests {
         hot_minutes(&mut h, &cache, "60");
         chains(&h).apply(&[raw_stored(None, &chain)]);
         h.shared.set_mode(Mode::Evicting);
-        h.shared.set_usage(95.0);
         run_rounds(&mut h, 3);
         assert_eq!(bins(&cache), vec!["1234500000000000.bin"]);
         assert!(other.exists());
@@ -446,7 +412,7 @@ mod tests {
             .refreshed_at
             .and_then(|t| t.checked_sub(Duration::from_secs(60)));
         h.shared.set_to_free(UNGRANTED);
-        assert_eq!(h.worker.evict(100), (0, Stop::Done));
+        assert_eq!(h.worker.evict(100), 0);
         assert_eq!(Stats::get(&chains(&h).stats.vanished), 0);
         assert!(
             h.worker.index.refreshed_at.is_none(),
@@ -462,7 +428,7 @@ mod tests {
         let (_tmp, cache) = conversations();
         let mut h = radix_harness(&cache, "0");
         assert!(matches!(h.worker.locate(&names(&[3])[0]), Located::Unknown));
-        assert_eq!(h.worker.evict(100), (0, Stop::Done));
+        assert_eq!(h.worker.evict(100), 0);
         assert_eq!(bins(&cache).len(), 5);
         assert_eq!(Stats::get(&chains(&h).stats.vanished), 0);
         h.worker.round().expect("round");

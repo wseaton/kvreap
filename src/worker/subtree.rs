@@ -51,6 +51,7 @@ mod tests {
         ]);
         let mut h = dead_chain(&cache, &[1, 2, 3]);
         chains(&h).apply(&[stored(None, &[10, 11])]);
+        h.shared.set_to_free(3);
         h.worker.round().expect("round");
         assert_eq!(bins(&cache), names(&[10, 11]));
         let s = &chains(&h).stats;
@@ -71,7 +72,6 @@ mod tests {
         chains(&h).apply(&[stored(None, &[0, 1, 2, 3])]);
         chains(&h).deleted(hash(0));
         h.shared.set_mode(Mode::Evicting);
-        h.shared.set_usage(95.0);
         h.shared.set_to_free(2);
         h.worker.round().expect("round");
         assert_eq!(

@@ -118,12 +118,6 @@ pub struct Hysteresis {
     emergency: f64,
 }
 
-/// Usage above which chain-aware eviction also takes recently used edges:
-/// halfway from the cleanup threshold to the emergency band.
-pub fn pressure_line(cleanup: Percent) -> f64 {
-    (cleanup.get() + cleanup.get().max(EMERGENCY_FLOOR)) / 2.0
-}
-
 impl Hysteresis {
     pub fn new(cleanup: Percent, target: Percent) -> Self {
         Self {
@@ -415,18 +409,6 @@ mod tests {
             grant(evicting, 0, 0, 0),
             0,
             "at or below target: nothing to grant, margin or not"
-        );
-    }
-
-    #[test]
-    fn pressure_line_is_halfway_to_the_emergency_band() {
-        use crate::controller::pressure_line;
-        let pct = |v| Percent::new("CLEANUP_THRESHOLD", v).expect("percent");
-        assert_eq!(pressure_line(pct(85.0)), 91.0);
-        assert_eq!(
-            pressure_line(pct(99.0)),
-            99.0,
-            "cleanup above the floor is the emergency band"
         );
     }
 
