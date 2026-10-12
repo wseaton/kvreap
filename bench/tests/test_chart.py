@@ -51,6 +51,7 @@ def test_weka_runs_chart_later_request_ttft_and_show_weka_setup(run_dir: Path, t
     text = render([run_dir], tmp_path, "w").read_text()
     assert "| concurrent sessions | 8 |" in text
     assert "hot prefixes" not in text
+    assert "shared tier PVC size" not in text, "unset settings stay out of the table"
     ttft = (tmp_path / "charts" / "ttft.svg").read_text()
     assert "Weka root-session later-request TTFT" in ttft
     assert "9,000" not in ttft and "9000" not in ttft, "first requests stay out of the ECDF"

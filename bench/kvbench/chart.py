@@ -477,7 +477,7 @@ def setup_table(dirs: list[Path]) -> list[str]:
         keys += WORKLOAD_SETUP_KEYS.get(w, ())
     lines = ["| setting | value |", "|---|---|"]
     for key, label in keys:
-        values = {str(m.get(key)) for m in metas if key in m}
+        values = {str(m[key]) for m in metas if m.get(key) not in (None, {})}
         if values:
             lines.append(f"| {label} | {' / '.join(sorted(values))} |")
     return lines
