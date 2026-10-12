@@ -26,29 +26,33 @@ YaRN to 131k tokens, 40 minutes per run, fs tier at 85% / 70% thresholds.
 Full reports: [VAST](benchmarks/final-vast.md),
 [node-local NVMe](benchmarks/final-nvme.md).
 
-| shared VAST PVC | Python `pvc_evictor` | kvreap, chain-aware |
+| shared VAST PVC, 160 GiB / 320 GiB cache | Python `pvc_evictor` | kvreap, chain-aware |
 |---|---|---|
-| requests completed, 160 GiB / 320 GiB cache | 618 / 699 | **704 / 827** (+14% / +18%) |
-| prompt tokens served from the fs tier | 2.9M / 7.0M | **7.4M / 15.2M** (2.2-2.5×) |
-| later-turn TTFT p50 | 7.0 s / 4.1 s | **4.0 s / 4.0 s** |
-| failed fs reads (deleted before vLLM read them) | 302 / 413 | 908 / **8** |
-| evictor NFS metadata ops/s | 10,225 / 14,397 | **2,081 / 398** |
+| requests completed | 618 / 699 | **709 / 851** (+15% / +22%) |
+| prompt tokens served from the fs tier | 2.9M / 7.0M | **8.0M / 17.3M** (2.7× / 2.5×) |
+| KV written | 3.47 / 3.44 TB | 3.36 / **3.02 TB** |
+| later-turn TTFT p50 / p99 at 320 GiB | 4.1 s / 70.4 s | 4.9 s / 72.7 s |
+| failed fs reads (deleted before vLLM read them) | 302 / 413 | 1,841 / **0** |
+| evictor NFS metadata ops/s | 10,225 / 14,397 | **975 / 420** |
 
-Tail TTFT is set by vLLM's request queue in every run and is not better with
-kvreap, which completes more requests and keeps the queue as long. When the
-cache cannot hold the live sessions (160 GiB here), every evictor has to cut
-some, and chain-aware eviction cuts the least recently used: sessions coming
-back from think time, which shows up as failed reads. With room for finished
-sessions (320 GiB) it deletes those instead. On a synthetic agent load, where
-finished sessions are always available, the gain was larger: +63% requests
-and an 8× lower p99 ([agent-pool-vast.md](benchmarks/agent-pool-vast.md)).
+**Size the cache to hold the active sessions.** With room for finished
+sessions beside the live ones (320 GiB here), chain-aware eviction deletes
+the finished ones, fails no reads and cuts no chain. When the live sessions
+do not fit (160 GiB), every evictor deletes live data, and exact last-use
+order deletes the session idle longest, often the next to come back: it still
+completes more requests, but fails 6× more reads than the Python evictor.
+Tail TTFT is set by vLLM's request queue in every run. On a synthetic agent
+load, where finished sessions are always available, the gain was larger:
++63% requests and an 8× lower p99
+([agent-pool-vast.md](benchmarks/agent-pool-vast.md)).
 
 On node-local NVMe through a hostPath the Python evictor never runs at all:
 `statvfs` reports the whole node disk, so usage never reaches the threshold
 ([proof](benchmarks/hostpath-proof/)). kvreap sizes the budget from
-`CAPACITY_BYTES`; there, on the same Claude Code replay, chain-aware eviction
-completes 15% more requests than kvreap's own plain LRU, serves 2.3× the
-tokens from disk, and keeps usage within the budget (95.0% peak).
+`CAPACITY_BYTES`; there, on the same Claude Code replay at 160 GiB,
+chain-aware eviction completes 17% more requests than kvreap's own plain LRU,
+serves 2.4× the tokens from disk, and keeps usage within the budget (86.1%
+peak).
 
 ## How it works
 
@@ -183,6 +187,11 @@ live chain). The same counters go to the log every status interval.
   ([deploy/kserve/](deploy/kserve/README.md) has the KServe shape). This is
   experimental: on the Claude Code replay an 80 GiB NVMe tier turns over in
   about a minute and kvreap ran it to 99.5% of its budget.
+- Eviction is exact LRU over leaf edges. When the cache cannot hold the live
+  sessions it thrashes like any LRU: on the Claude Code replay at 160 GiB it
+  failed 1,841 vLLM reads against the Python evictor's 302. Size the cache to
+  hold the active sessions; a frequency-aware order would handle undersized
+  caches better.
 
 ## Development
 

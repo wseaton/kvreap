@@ -3,32 +3,33 @@
 | run | evictor image |
 |---|---|
 | wnp | `quay.io/wseaton/kvreap:r-37c777a` |
-| wnr2 | `quay.io/wseaton/kvreap:r-75c1b4a` |
+| wnn | `quay.io/wseaton/kvreap:r-e0e67c9` |
 
 The same replayed Claude Code sessions as [final-vast.md](final-vast.md) with the fs tier on the node's own NVMe (CoreWeave `/mnt/local`, an encrypted 8-drive RAID10) through a hostPath, budget 160 GiB via `CAPACITY_BYTES`, for single-node deployments. kvreap runs on vLLM's node.
 
 | run | evictor | load start (UTC) |
 |---|---|---|
 | wnp | kvreap plain LRU (`KV_EVENTS_ENDPOINTS` empty), `r-37c777a` | 2026-10-12 03:15 |
-| wnr2 | kvreap chain-aware, `r-75c1b4a` | 2026-10-12 06:38 |
+| wnn | kvreap chain-aware, `r-e0e67c9` | 2026-10-12 20:25 |
 
 The Python `pvc_evictor` cannot run here: it sizes the disk with statvfs, which reports the whole node RAID, so it never reaches its threshold (`hostpath-proof/`).
 
 ## Findings
 
-| | wnp: plain LRU | wnr2: chain-aware | wnr2 vs wnp |
+| | wnp: plain LRU | wnn: chain-aware | wnn vs wnp |
 |---|---|---|---|
-| requests completed in 40 min | 643 | **742** | +15% |
-| prompt tokens served from the fs tier | 4.4M of 17.0M | **9.9M of 20.7M** | 2.3× |
-| later main-agent TTFT p50 | 4.7 s | **3.6 s** | −23% |
-| later main-agent TTFT p90 / p99 | **30.5 / 71.1 s** | 45.2 / 89.8 s | worse |
-| failed fs reads | **218** | 1,648 | |
-| deletions that cut a live chain (internal) | not tracked | 503 | |
+| requests completed in 40 min | 643 | **754** | +17% |
+| prompt tokens served from the fs tier | 4.4M of 17.0M | **10.6M of 21.2M** | 2.4× |
+| later main-agent TTFT p50 | 4.7 s | **3.4 s** | −27% |
+| later main-agent TTFT p90 / p99 | **30.5 / 71.1 s** | 40.1 / 87.7 s | worse |
+| failed fs reads | **218** | 2,639 | |
+| deletions that cut a live chain (internal) | not tracked | **0** | |
 | KV written to NVMe | 3.41 TB | **3.14 TB** | −8% |
-| max usage of the budget | 85.2% | 95.0% | |
+| max usage of the budget | 85.2% | 86.1% | |
 
-- **Same shape as VAST at 160 GiB.** More requests and twice the prefix tokens from disk, a lower median, worse tails from a longer queue, and more failed reads because the live sessions do not fit in 160 GiB and chain-aware cuts the least recently used ones.
-- **Usage runs higher.** Chain-aware holds back recently used sessions below the 91% line while the sampler looks for finished ones, and peaked at 95.0% of the budget; `CAPACITY_BYTES` is counted from the chain index, so the budget held.
+- **Same shape as VAST at 160 GiB**, where the live sessions do not fit: more requests, more than twice the prefix tokens from disk, a lower median, worse tails from a longer queue, and many failed reads because exact last-use order deletes the session idle longest, often the next to come back. Size the cache to hold the active sessions (see final-vast.md at 320 GiB).
+- **The budget holds.** `CAPACITY_BYTES` usage is counted from the chain index, and peaked at 86.1% of the budget.
+- The previous release candidate (`r-75c1b4a`, victims from a sampled pool) got 742 requests with 503 chain cuts and a 95.0% peak.
 
 ## Workload (as final-vast.md)
 
@@ -109,9 +110,9 @@ Time axes are seconds since the load generator started.
 
 ## All metrics
 
-| metric | wnp | wnr2 |
+| metric | wnp | wnn |
 |---|---|---|
-| load duration (s) | 2,436 | 2,438 |
+| load duration (s) | 2,436 | 2,436 |
 | **evictor metadata ops/s (mean)** | 0.0 | 0.0 |
 | evictor metadata ops (total) | 0 | 0 |
 | vLLM LOOKUP RTT ms (all) | - | - |
@@ -132,72 +133,72 @@ Time axes are seconds since the load generator started.
 | vLLM RENAME client queue ms | - | - |
 | vLLM WRITE client queue ms | - | - |
 | vLLM READ client queue ms | - | - |
-| vLLM FS read s/GiB | 10.78 | 11.49 |
-| vLLM FS write s/GiB | 2.30 | 3.52 |
+| vLLM FS read s/GiB | 10.78 | 11.60 |
+| vLLM FS write s/GiB | 2.30 | 3.72 |
 | vLLM metadata ops/s | 0 | 0 |
-| prune cycles | 33 | 17 |
-| prune seconds (median) | 18.0 | 28.5 |
-| max usage % | 85.2 | 95.0 |
-| % time >= cleanup threshold | 0.8 | 16.0 |
+| prune cycles | 33 | 44 |
+| prune seconds (median) | 18.0 | 3.5 |
+| max usage % | 85.2 | 86.1 |
+| % time >= cleanup threshold | 0.8 | 0.8 |
 | hot ttft p50 ms | - | - |
 | hot ttft p90 ms | - | - |
 | hot ttft p99 ms | - | - |
-| weka requests | 643 | 742 |
+| weka requests | 643 | 754 |
 | weka failed | 21 | 39 |
 | weka cancelled | 0 | 0 |
 | weka sessions | 19 | 21 |
-| weka ttft p50 ms | 3,578.3 | 4,152.6 |
-| weka ttft p90 ms | 47,839.5 | 61,336.5 |
-| weka ttft p99 ms | 88,503.8 | 90,677.1 |
-| weka first ttft p50 ms | 3,948.4 | 3,983.2 |
-| weka first ttft p90 ms | 19,451.4 | 40,514.9 |
-| weka later ttft p50 ms | 4,731.1 | 3,647.6 |
-| weka later ttft p90 ms | 30,505.7 | 45,191.5 |
-| weka later ttft p99 ms | 71,126.1 | 89,824.8 |
-| weka subagent ttft p50 ms | 2,948.5 | 4,291.2 |
-| weka subagent ttft p90 ms | 52,331.9 | 65,569.6 |
-| weka subagent ttft p99 ms | 92,451.9 | 90,698.3 |
-| weka prompt tok per s | 15,349.0 | 17,559.0 |
-| weka output tok per s | 138.8 | 159.1 |
+| weka ttft p50 ms | 3,578.3 | 3,777.8 |
+| weka ttft p90 ms | 47,839.5 | 65,077.3 |
+| weka ttft p99 ms | 88,503.8 | 93,697.8 |
+| weka first ttft p50 ms | 3,948.4 | 3,814.9 |
+| weka first ttft p90 ms | 19,451.4 | 28,302.4 |
+| weka later ttft p50 ms | 4,731.1 | 3,445.8 |
+| weka later ttft p90 ms | 30,505.7 | 40,128.6 |
+| weka later ttft p99 ms | 71,126.1 | 87,715.0 |
+| weka subagent ttft p50 ms | 2,948.5 | 4,166.8 |
+| weka subagent ttft p90 ms | 52,331.9 | 70,439.8 |
+| weka subagent ttft p99 ms | 92,451.9 | 95,112.7 |
+| weka prompt tok per s | 15,349.0 | 17,908.9 |
+| weka output tok per s | 138.8 | 162.6 |
 | hot requests (failed) | - (-) | - (-) |
 | churn input tok/s | - | - |
 | vLLM log: quota_exceeded | 0 | 0 |
 | vLLM log: store_failed | 0 | 0 |
-| vLLM log: load_failed | 218 | 1,648 |
+| vLLM log: load_failed | 218 | 2,639 |
 | chain deletions: heads (root + orphan) | - | - |
-| chain deletions: root | - | 27 |
-| chain deletions: orphan (parent gone) | - | 180,085 |
-| chain deletions: internal | - | 503 |
-| chain deletions: leaf | - | 359,041 |
-| chain deletions: untracked | - | 471 |
+| chain deletions: root | - | 13 |
+| chain deletions: orphan (parent gone) | - | 0 |
+| chain deletions: internal | - | 0 |
+| chain deletions: leaf | - | 581,433 |
+| chain deletions: untracked | - | 0 |
 | chain deferrals | - | - |
-| chain deletions: cascaded below a deleted root | - | 539,018 |
+| chain deletions: cascaded below a deleted root | - | 581,130 |
 | blocks announced without a digest | - | 0 |
-| leaf edges skipped as too young | - | 177,653 |
+| leaf edges skipped as too young | - | - |
 | young leaf edges deleted under pressure | - | - |
 | young leaf edges deleted in the emergency band | - | - |
-| KV event batches received | - | 22,188 |
+| KV event batches received | - | 22,011 |
 | KV event decode errors | - | 0 |
-| `vllm:external_prefix_cache_hits_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 4,353,472 | 9,871,344 |
-| `vllm:external_prefix_cache_queries_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 17,030,284 | 20,685,194 |
-| `vllm:kv_offload_allocation_failure_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 77 | 189 |
-| `vllm:kv_offload_load_bytes_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 719,399,157,760 | 1,651,499,335,680 |
-| `vllm:kv_offload_load_time_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 22 | 53 |
-| `vllm:kv_offload_store_bytes_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 3,406,320,107,520 | 3,135,577,784,320 |
-| `vllm:kv_offload_store_time_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 153 | 179 |
-| `vllm:kv_offload_tiering_chunk_hits_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="0:primary"}` Δ | 155,068 | 139,002 |
-| `vllm:kv_offload_tiering_chunk_hits_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="1:StripedFileSystemTierManager"}` Δ | 219,249 | 623,066 |
-| `vllm:kv_offload_tiering_chunk_queries_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="0:primary"}` Δ | 1,108,696 | 1,362,888 |
-| `vllm:kv_offload_tiering_chunk_queries_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="1:StripedFileSystemTierManager"}` Δ | 220,479 | 623,877 |
-| `vllm:kv_offload_tiering_promotion_allocation_failures_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 5 | 557 |
-| `vllm:kv_offload_tiering_promotion_job_failures_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="1:StripedFileSystemTierManager"}` Δ | 21 | 39 |
-| `vllm:kv_offload_tiering_read_bytes_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="1:StripedFileSystemTierManager"}` Δ | 575,267,143,680 | 1,928,373,207,040 |
-| `vllm:kv_offload_tiering_read_time_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="1:StripedFileSystemTierManager"}` Δ | 5,774 | 20,631 |
-| `vllm:kv_offload_tiering_write_bytes_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="1:StripedFileSystemTierManager"}` Δ | 3,409,001,840,640 | 3,138,259,517,440 |
-| `vllm:kv_offload_tiering_write_time_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="1:StripedFileSystemTierManager"}` Δ | 7,313 | 10,300 |
-| `vllm:kv_offload_total_bytes_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",transfer_type="CPU_to_GPU"}` Δ | 719,399,157,760 | 1,651,499,335,680 |
-| `vllm:kv_offload_total_bytes_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",transfer_type="GPU_to_CPU"}` Δ | 3,406,320,107,520 | 3,135,577,784,320 |
-| `vllm:kv_offload_total_time_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",transfer_type="CPU_to_GPU"}` Δ | 22 | 53 |
-| `vllm:kv_offload_total_time_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",transfer_type="GPU_to_CPU"}` Δ | 153 | 179 |
-| `vllm:prefix_cache_hits_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 20,844,160 | 22,504,736 |
-| `vllm:prefix_cache_queries_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 37,874,444 | 43,189,930 |
+| `vllm:external_prefix_cache_hits_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 4,353,472 | 10,593,904 |
+| `vllm:external_prefix_cache_queries_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 17,030,284 | 21,163,864 |
+| `vllm:kv_offload_allocation_failure_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 77 | 170 |
+| `vllm:kv_offload_load_bytes_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 719,399,157,760 | 1,751,446,978,560 |
+| `vllm:kv_offload_load_time_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 22 | 56 |
+| `vllm:kv_offload_store_bytes_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 3,406,320,107,520 | 3,139,727,523,840 |
+| `vllm:kv_offload_store_time_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 153 | 170 |
+| `vllm:kv_offload_tiering_chunk_hits_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="0:primary"}` Δ | 155,068 | 141,516 |
+| `vllm:kv_offload_tiering_chunk_hits_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="1:StripedFileSystemTierManager"}` Δ | 219,249 | 676,434 |
+| `vllm:kv_offload_tiering_chunk_queries_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="0:primary"}` Δ | 1,108,696 | 1,398,637 |
+| `vllm:kv_offload_tiering_chunk_queries_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="1:StripedFileSystemTierManager"}` Δ | 220,479 | 677,192 |
+| `vllm:kv_offload_tiering_promotion_allocation_failures_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 5 | 1,331 |
+| `vllm:kv_offload_tiering_promotion_job_failures_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="1:StripedFileSystemTierManager"}` Δ | 21 | 54 |
+| `vllm:kv_offload_tiering_read_bytes_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="1:StripedFileSystemTierManager"}` Δ | 575,267,143,680 | 2,518,223,421,440 |
+| `vllm:kv_offload_tiering_read_time_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="1:StripedFileSystemTierManager"}` Δ | 5,774 | 27,198 |
+| `vllm:kv_offload_tiering_write_bytes_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="1:StripedFileSystemTierManager"}` Δ | 3,409,001,840,640 | 3,142,409,256,960 |
+| `vllm:kv_offload_tiering_write_time_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",tier="1:StripedFileSystemTierManager"}` Δ | 7,313 | 10,887 |
+| `vllm:kv_offload_total_bytes_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",transfer_type="CPU_to_GPU"}` Δ | 719,399,157,760 | 1,751,446,978,560 |
+| `vllm:kv_offload_total_bytes_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",transfer_type="GPU_to_CPU"}` Δ | 3,406,320,107,520 | 3,139,727,523,840 |
+| `vllm:kv_offload_total_time_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",transfer_type="CPU_to_GPU"}` Δ | 22 | 56 |
+| `vllm:kv_offload_total_time_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct",transfer_type="GPU_to_CPU"}` Δ | 153 | 170 |
+| `vllm:prefix_cache_hits_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 20,844,160 | 22,936,336 |
+| `vllm:prefix_cache_queries_total{engine="0",model_name="Qwen/Qwen2.5-72B-Instruct"}` Δ | 37,874,444 | 44,100,200 |
