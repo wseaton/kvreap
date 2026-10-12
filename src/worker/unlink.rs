@@ -114,18 +114,25 @@ impl Context {
         out
     }
 
-    /// Unlinks one block file and counts it as freed and as a removal event.
+    /// Unlinks one block file against the delete grant and counts it as freed.
     pub(crate) fn unlink(&self, t: &Target) -> Unlink {
+        if !self.shared.reserve(t.size) {
+            return Unlink::Skipped;
+        }
+        self.unlink_reserved(t)
+    }
+
+    /// Unlinks a file whose bytes are already reserved against the grant,
+    /// and returns them when nothing was deleted.
+    fn unlink_reserved(&self, t: &Target) -> Unlink {
         if self.config.delete_mode == DeleteMode::DryRun {
-            if !self.shared.reserve(t.size) {
-                return Unlink::Skipped;
-            }
             tracing::debug!(path = %t.path.display(), "[DRY RUN] would delete");
             Stats::add(&self.stats.files_deleted, 1);
             self.shared.freed(t.size);
             return Unlink::Deleted;
         }
-        if !self.acquire() || !self.shared.reserve(t.size) {
+        if !self.acquire() {
+            self.shared.release(t.size);
             return Unlink::Skipped;
         }
         match self.timed(OpKind::Unlink, || fsops::unlink_path(&t.path)) {
@@ -147,11 +154,17 @@ impl Context {
         Unlink::Deleted
     }
 
-    /// Unlinks `targets` in order with up to `DELETE_FANOUT` in flight, and
-    /// issues no new unlink once one is skipped. Unissued targets come back
-    /// `Skipped`.
+    /// Reserves `targets`' bytes in order until the grant runs out, then
+    /// unlinks the reserved ones with up to `DELETE_FANOUT` in flight, issuing
+    /// no new unlink once one is skipped. So a chain passed leaf first loses
+    /// a leaf-side run of blocks, never blocks behind one it kept. Targets
+    /// not unlinked come back `Skipped`.
     pub(crate) fn unlink_all(&self, targets: &[Target]) -> Vec<Unlink> {
-        let lanes = self.config.delete_fanout.get().min(targets.len());
+        let reserved = targets
+            .iter()
+            .take_while(|t| self.shared.reserve(t.size))
+            .count();
+        let lanes = self.config.delete_fanout.get().min(reserved);
         let next = AtomicUsize::new(0);
         let stop = AtomicBool::new(false);
         let results: Vec<OnceLock<Unlink>> = targets.iter().map(|_| OnceLock::new()).collect();
@@ -163,7 +176,10 @@ impl Context {
                         let (Some(t), Some(slot)) = (targets.get(i), results.get(i)) else {
                             break;
                         };
-                        let r = self.unlink(t);
+                        if i >= reserved {
+                            break;
+                        }
+                        let r = self.unlink_reserved(t);
                         if r == Unlink::Skipped {
                             stop.store(true, Ordering::Relaxed);
                         }
@@ -172,9 +188,18 @@ impl Context {
                 });
             }
         });
-        results
-            .into_iter()
-            .map(|r| r.into_inner().unwrap_or(Unlink::Skipped))
+        targets
+            .iter()
+            .zip(results)
+            .enumerate()
+            .map(|(i, (t, r))| {
+                r.into_inner().unwrap_or_else(|| {
+                    if i < reserved {
+                        self.shared.release(t.size);
+                    }
+                    Unlink::Skipped
+                })
+            })
             .collect()
     }
 }
@@ -306,25 +331,30 @@ mod tests {
     }
 
     #[test]
-    fn unlink_all_stops_issuing_once_the_grant_is_spent() {
-        for (fanout, extra) in [("1", 0), ("4", 3)] {
+    fn unlink_all_deletes_exactly_the_leading_targets_the_grant_covers() {
+        for fanout in ["1", "4", "16"] {
             let tmp = tempfile::tempdir().expect("tempdir");
             let h = harness(config(tmp.path(), &[("DELETE_FANOUT", fanout)]));
             h.shared.set_mode(Mode::Evicting);
             h.shared.set_to_free(300);
-            let targets = fanout_targets(tmp.path(), 40, &[]);
+            let targets = fanout_targets(tmp.path(), 40, &[1]);
             let results = h.worker.ctx.unlink_all(&targets);
-            let deleted = results.iter().filter(|r| **r == Unlink::Deleted).count();
-            assert!(
-                (3..=3 + extra).contains(&deleted),
-                "fanout {fanout}: {deleted} deleted for a 3-file grant"
+            assert_eq!(
+                &results[..3],
+                &[Unlink::Deleted, Unlink::Missing, Unlink::Deleted],
+                "fanout {fanout}"
             );
-            if fanout == "1" {
-                assert_eq!(&results[..3], &[Unlink::Deleted; 3]);
-                assert!(results[3..].iter().all(|r| *r == Unlink::Skipped));
-            }
+            assert!(
+                results[3..].iter().all(|r| *r == Unlink::Skipped),
+                "fanout {fanout}: no block behind the grant's end goes: {results:?}"
+            );
+            assert_eq!(
+                h.shared.to_free(),
+                100,
+                "fanout {fanout}: the missing file's bytes go back to the grant"
+            );
             let left = targets.iter().filter(|t| t.path.exists()).count();
-            assert_eq!(left, 40 - deleted, "fanout {fanout}");
+            assert_eq!(left, 37, "fanout {fanout}");
         }
     }
 }
