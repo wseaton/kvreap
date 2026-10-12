@@ -15,7 +15,7 @@ pub(crate) struct Candidate {
     pub(crate) hash: BlockHash,
     pub(crate) size: u64,
     /// When the block was last useful: its atime, or with the chain index
-    /// the newest write on its leaf edge. The pool evicts the earliest first.
+    /// the newest write or use on its leaf edge. The pool evicts the earliest first.
     pub(crate) last_used: SystemTime,
     pub(crate) sampled_at: Instant,
 }

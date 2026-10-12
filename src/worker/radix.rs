@@ -1,5 +1,5 @@
 //! Chain-aware eviction: delete whole radix-tree leaf edges (unshared tails),
-//! least recently written first, never a prefix that still has two
+//! least recently used first, never a prefix that still has two
 //! continuations on disk.
 
 use std::time::SystemTime;
@@ -23,7 +23,7 @@ pub(crate) fn claim_edge(chains: &Chains, hash: BlockHash) -> Option<(LeafEdge, 
 
 impl Worker {
     /// When `hash` was last useful, for ordering the pool: never for a dead
-    /// block, the newest write on its leaf edge for one the index knows, and
+    /// block, the newest write or use on its leaf edge for one the index knows, and
     /// `atime` otherwise. Without the chain index, `atime`.
     pub(crate) fn last_used(&self, hash: BlockHash, atime: SystemTime) -> SystemTime {
         match self.ctx.chains.as_ref().map(|c| c.radix_key(hash)) {
@@ -85,9 +85,9 @@ impl Worker {
         evicted
     }
 
-    fn young(&self, newest_store: SystemTime) -> bool {
+    fn young(&self, newest_use: SystemTime) -> bool {
         SystemTime::now()
-            .duration_since(newest_store)
+            .duration_since(newest_use)
             .map_or(true, |age| age < self.ctx.config.hot_threshold)
     }
 

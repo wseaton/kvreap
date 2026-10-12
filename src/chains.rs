@@ -93,7 +93,7 @@ pub struct ChainStats {
     pub vanished: AtomicU64,
     /// Edges or subtrees skipped because another worker was deleting them.
     pub claim_conflicts: AtomicU64,
-    /// Rounds that stopped at a recently written edge below the pressure line.
+    /// Rounds that stopped at a recently used edge below the pressure line.
     pub young_edges: AtomicU64,
 }
 
@@ -144,8 +144,10 @@ impl Tier {
             Store::OnDisk
         } else if self.backing(medium, locality) {
             Store::Backing
-        } else {
+        } else if medium == Some(MEDIUM_STORAGE) {
             Store::LinksOnly
+        } else {
+            Store::Used
         }
     }
 }
@@ -388,6 +390,39 @@ mod tests {
         assert_eq!(remote.index().position(h(4)), Position::Untracked);
         local.apply(&[at(removed(&[3], "STORAGE"), Locality::Local)]);
         assert_eq!(local.index().position(h(2)), Position::Leaf);
+    }
+
+    #[test]
+    fn loading_a_block_back_counts_as_a_use_of_its_edge() {
+        use std::time::Duration;
+
+        let chains = Chains::new(100, storage(Some(Locality::Local)));
+        chains.apply(&[
+            at(stored(None, &[1, 2], "STORAGE"), Locality::Local),
+            at(stored(None, &[3, 4], "STORAGE"), Locality::Local),
+        ]);
+        let (first, second) = (chains.radix_key(h(1)), chains.radix_key(h(3)));
+        assert!(first <= second);
+        std::thread::sleep(Duration::from_millis(5));
+        chains.apply(&[stored(None, &[1, 2], "GPU")]);
+        assert!(
+            chains.radix_key(h(1)) > second,
+            "1-2 was read back after 3-4 was written"
+        );
+        let before = chains.radix_key(h(3));
+        std::thread::sleep(Duration::from_millis(5));
+        chains.apply(&[at(stored(None, &[3, 4], "STORAGE"), Locality::Remote)]);
+        assert_eq!(
+            chains.radix_key(h(3)),
+            before,
+            "the shared tier's copy is not a use of this tier's files"
+        );
+        chains.apply(&[stored(None, &[5], "GPU")]);
+        assert_eq!(
+            chains.radix_key(h(5)),
+            RadixKey::Untracked,
+            "not on disk here"
+        );
     }
 
     #[test]

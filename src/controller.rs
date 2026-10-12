@@ -118,7 +118,7 @@ pub struct Hysteresis {
     emergency: f64,
 }
 
-/// Usage above which chain-aware eviction also takes recently written edges:
+/// Usage above which chain-aware eviction also takes recently used edges:
 /// halfway from the cleanup threshold to the emergency band.
 pub fn pressure_line(cleanup: Percent) -> f64 {
     (cleanup.get() + cleanup.get().max(EMERGENCY_FLOOR)) / 2.0

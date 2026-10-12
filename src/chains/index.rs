@@ -42,7 +42,10 @@ pub enum Store {
     /// The blocks were written to a tier that serves the lookups this tier
     /// misses, so a block here whose parent is only there is still reachable.
     Backing,
-    /// The blocks live elsewhere (GPU, CPU); only their parent links count.
+    /// The blocks were computed into or loaded back to the GPU or CPU tier:
+    /// for a block already on disk here, its prefix was just used.
+    Used,
+    /// Another tier's copy of the blocks; only their parent links count.
     LinksOnly,
 }
 
@@ -63,8 +66,8 @@ struct Node {
     generation: u64,
     /// Full block hash, which names the block's file.
     digest: Option<Arc<[u8]>>,
-    /// When the block was last marked on disk.
-    stored_at: Option<SystemTime>,
+    /// When the block was last written to disk or used from any tier.
+    used_at: Option<SystemTime>,
 }
 
 /// A radix-tree leaf edge: the on-disk blocks from just below the last fork
@@ -74,8 +77,8 @@ struct Node {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafEdge {
     pub blocks: Vec<Descendant>,
-    /// Most recent on-disk mark of any block in the edge.
-    pub newest_store: SystemTime,
+    /// Most recent write or use of any block in the edge.
+    pub newest_use: SystemTime,
 }
 
 /// A block below a subtree root, with its digest if known.
@@ -145,7 +148,7 @@ impl ChainIndex {
             backup: Backup::Missing,
             generation,
             digest: None,
-            stored_at: None,
+            used_at: None,
         })
     }
 
@@ -186,10 +189,13 @@ impl ChainIndex {
         match store {
             Store::OnDisk if newly_on_disk => {
                 n.residence = Residence::OnDisk;
-                n.stored_at = Some(SystemTime::now());
+                n.used_at = Some(SystemTime::now());
+            }
+            Store::Used if n.residence == Residence::OnDisk => {
+                n.used_at = Some(SystemTime::now());
             }
             Store::Backing => n.backup = Backup::Held,
-            Store::OnDisk | Store::LinksOnly => {}
+            Store::OnDisk | Store::Used | Store::LinksOnly => {}
         }
         let residence = n.residence;
         if newly_on_disk {
@@ -243,7 +249,7 @@ impl ChainIndex {
             }
             let oldest_child = self
                 .on_disk_children(leaf)
-                .min_by_key(|c| self.nodes.get(c).and_then(|n| n.stored_at));
+                .min_by_key(|c| self.nodes.get(c).and_then(|n| n.used_at));
             match oldest_child {
                 Some(c) => leaf = c,
                 None => break,
@@ -263,12 +269,12 @@ impl ChainIndex {
         Some(())
     }
 
-    /// The newest on-disk mark on the leaf edge `hash` maps to, without
+    /// The newest write or use on the leaf edge `hash` maps to, without
     /// building the edge.
     pub fn edge_newest(&self, hash: BlockHash, budget: usize) -> Option<SystemTime> {
         let mut newest = None;
         self.walk_edge(hash, budget, |b| {
-            newest = newest.max(self.nodes.get(&b).and_then(|n| n.stored_at));
+            newest = newest.max(self.nodes.get(&b).and_then(|n| n.used_at));
         })?;
         newest
     }
@@ -283,15 +289,15 @@ impl ChainIndex {
     /// ```
     pub fn leaf_edge(&self, hash: BlockHash, budget: usize) -> Option<LeafEdge> {
         let mut blocks = Vec::new();
-        let mut newest_store = None;
+        let mut newest_use = None;
         self.walk_edge(hash, budget, |b| {
-            newest_store = newest_store.max(self.nodes.get(&b).and_then(|n| n.stored_at));
+            newest_use = newest_use.max(self.nodes.get(&b).and_then(|n| n.used_at));
             blocks.push(self.descendant(b));
         })?;
         blocks.reverse();
         Some(LeafEdge {
             blocks,
-            newest_store: newest_store?,
+            newest_use: newest_use?,
         })
     }
 
@@ -644,8 +650,8 @@ mod tests {
         let edge = ix.leaf_edge(h(7), 100).expect("edge");
         assert_eq!(edge.blocks[0].file_name().as_deref(), Some("05.bin"));
         assert_eq!(
-            Some(edge.newest_store),
-            ix.nodes.get(&h(7)).and_then(|n| n.stored_at)
+            Some(edge.newest_use),
+            ix.nodes.get(&h(7)).and_then(|n| n.used_at)
         );
 
         for n in [4, 3] {
@@ -683,7 +689,7 @@ mod tests {
         for n in 1..=7 {
             assert_eq!(
                 ix.edge_newest(h(n), 100),
-                ix.leaf_edge(h(n), 100).map(|e| e.newest_store),
+                ix.leaf_edge(h(n), 100).map(|e| e.newest_use),
                 "block {n}"
             );
         }

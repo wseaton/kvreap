@@ -64,8 +64,11 @@ unshared tail from the last fork down to a leaf.
   never s1 while it has two continuations on disk
 ```
 
-Edges go least recently written first, regardless of atime: a live session's
-first turn is among the oldest files on disk but sorts by its latest turn.
+Edges go least recently used first, regardless of atime: a block counts as
+used when it is written to the tier and whenever vLLM loads or computes it
+again (its GPU and CPU `BlockStored` events), so a session whose prefix is
+read back from disk on every turn stays fresh even though its files are
+old.
 Edges written within the hot threshold wait while usage is below the pressure
 line, halfway from `CLEANUP_THRESHOLD` to the emergency band (91% with the
 defaults), so the sampler looks for finished sessions first; above it,
@@ -162,7 +165,7 @@ live chain). The same counters go to the log every status interval.
   disk either way.
 - Chain-aware eviction runs usage higher than the Python evictor on VAST
   (96.6% peak, 12.9% of the run above the cleanup threshold against 6.6%):
-  below the pressure line it holds back recently written sessions while the
+  below the pressure line it holds back recently used sessions while the
   sampler looks for finished ones. Lower `CLEANUP_THRESHOLD` if the volume's
   quota is hard.
 - kvreap does not publish `BlockRemoved` events for the files it deletes.
