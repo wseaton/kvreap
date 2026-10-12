@@ -42,6 +42,7 @@ KV_MOUNT = "/kv-cache"
 SHARED_KV_MOUNT = "/kv-shared"
 CACHE_DIRECTORY = "kv/model-cache/models"
 KV_EVENTS_PORT = 5557
+COLLECT_ATTEMPTS = 6
 
 Manifest = dict[str, Any]
 Placement = Literal["any", "colocated", "separate"]
@@ -57,11 +58,18 @@ class Cluster:
     context: str
     namespace: str
 
-    def kubectl(self, *args: str, stdin: str | None = None, check: bool = True) -> str:
+    def kubectl(
+        self, *args: str, stdin: str | None = None, check: bool = True, attempts: int = 1, retry_s: float = 10.0
+    ) -> str:
         cmd = ["kubectl", "--context", self.context, "-n", self.namespace, *args]
         res = subprocess.run(cmd, input=stdin, capture_output=True, text=True, check=False)
+        for _ in range(attempts - 1):
+            if res.returncode == 0 or not check:
+                break
+            time.sleep(retry_s)
+            res = subprocess.run(cmd, input=stdin, capture_output=True, text=True, check=False)
         if check and res.returncode != 0:
-            raise RuntimeError(f"{' '.join(cmd)} failed:\n{res.stderr}")
+            raise RuntimeError(f"{' '.join(cmd)} failed after {attempts} attempt(s):\n{res.stderr}")
         return res.stdout
 
     def apply(self, objs: list[Manifest]) -> None:
@@ -818,12 +826,23 @@ def collect(cfg: RunConfig, evictor_pods: dict[str, str], events: dict[str, floa
     out = cfg.out
     out.mkdir(parents=True, exist_ok=True)
     vllm = f"{cfg.run_id}-vllm"
-    c.kubectl("cp", f"{vllm}:{SAMPLES_FILE}", str(out / "vllm-sampler.jsonl"), "-c", "sampler")
-    (out / "vllm.log").write_text(c.kubectl("logs", vllm, "-c", "vllm", "--timestamps"))
+    c.kubectl(
+        "cp", f"{vllm}:{SAMPLES_FILE}", str(out / "vllm-sampler.jsonl"), "-c", "sampler", attempts=COLLECT_ATTEMPTS
+    )
+    (out / "vllm.log").write_text(c.kubectl("logs", vllm, "-c", "vllm", "--timestamps", attempts=COLLECT_ATTEMPTS))
     for role, pod in evictor_pods.items():
-        c.kubectl("cp", f"{pod}:{SAMPLES_FILE}", str(out / f"{role}-sampler.jsonl"), "-c", "sampler")
-        (out / f"{role}.log").write_text(c.kubectl("logs", pod, "-c", "evictor", "--timestamps"))
-    c.kubectl("cp", f"{cfg.run_id}-loadgen:/results", str(out / "loadgen"), "-c", "loadgen")
+        c.kubectl(
+            "cp",
+            f"{pod}:{SAMPLES_FILE}",
+            str(out / f"{role}-sampler.jsonl"),
+            "-c",
+            "sampler",
+            attempts=COLLECT_ATTEMPTS,
+        )
+        (out / f"{role}.log").write_text(
+            c.kubectl("logs", pod, "-c", "evictor", "--timestamps", attempts=COLLECT_ATTEMPTS)
+        )
+    c.kubectl("cp", f"{cfg.run_id}-loadgen:/results", str(out / "loadgen"), "-c", "loadgen", attempts=COLLECT_ATTEMPTS)
     meta = {k: (str(v) if isinstance(v, (Path, Cluster)) else v) for k, v in asdict(cfg).items()}
     meta["events"] = events
     node = "jsonpath={.spec.nodeName}"
@@ -893,7 +912,12 @@ def run(cfg: RunConfig, keep: bool = False) -> None:
         events["load_end"] = time.time()
         time.sleep(cfg.settle_s)
         events["collect"] = time.time()
-        collect(cfg, evictor_pods, events)
+        try:
+            collect(cfg, evictor_pods, events)
+        except Exception:
+            keep = True
+            print(f"[{cfg.variant}] collect failed; leaving the run's pods up to copy results by hand", flush=True)
+            raise
         print(f"[{cfg.variant}] results in {cfg.out}", flush=True)
     finally:
         if not keep:

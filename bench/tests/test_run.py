@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -354,3 +355,36 @@ def test_host_path_evictor_runs_on_vllms_node_with_capacity_bytes() -> None:
     assert term["labelSelector"]["matchLabels"]["kvreap-bench/role"] == "vllm"
     assert evictor_env(c)["CAPACITY_BYTES"] == str(160 * 1024**3)
     assert "CAPACITY_BYTES" not in evictor_env(cfg())
+
+
+def fake_kubectl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_first: int) -> Path:
+    """A `kubectl` on PATH that fails its first `fail_first` calls, then prints its arguments."""
+    count = tmp_path / "calls"
+    count.write_text("0")
+    exe = tmp_path / "bin" / "kubectl"
+    exe.parent.mkdir()
+    exe.write_text(
+        "#!/bin/sh\n"
+        f'n=$(($(cat "{count}") + 1)); echo $n > "{count}"\n'
+        f'if [ $n -le {fail_first} ]; then echo "no space left on device" >&2; exit 1; fi\n'
+        'echo "$@"\n'
+    )
+    exe.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{exe.parent}:{os.environ['PATH']}")
+    return count
+
+
+def test_kubectl_retries_until_it_succeeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    count = fake_kubectl(tmp_path, monkeypatch, fail_first=2)
+    out = Cluster("ctx", "ns").kubectl("cp", "a", "b", attempts=3, retry_s=0)
+    assert out.strip() == "--context ctx -n ns cp a b"
+    assert count.read_text().strip() == "3"
+
+
+def test_kubectl_gives_up_after_its_attempts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    count = fake_kubectl(tmp_path, monkeypatch, fail_first=5)
+    with pytest.raises(RuntimeError, match="after 2 attempt"):
+        Cluster("ctx", "ns").kubectl("cp", "a", "b", attempts=2, retry_s=0)
+    assert count.read_text().strip() == "2"
+    assert Cluster("ctx", "ns").kubectl("get", "x", check=False) == ""
+    assert count.read_text().strip() == "3", "check=False never retries"
